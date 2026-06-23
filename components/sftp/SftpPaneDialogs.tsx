@@ -12,7 +12,7 @@ import {
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { getFileName, getParentPath } from "../../application/state/sftp/utils";
-import { SftpHostPicker } from "./index";
+import { SftpHostPicker } from "./SftpHostPicker";
 import type { Host } from "../../types";
 
 interface SftpPaneDialogsProps {
@@ -61,7 +61,7 @@ interface SftpPaneDialogsProps {
   hostSearch: string;
   setHostSearch: (value: string) => void;
   onConnect: (host: Host | "local") => void;
-  onDisconnect: () => void;
+  onDisconnect: () => Promise<boolean>;
 }
 
 const HostHint: React.FC<{ label?: string }> = ({ label }) =>
@@ -111,6 +111,11 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
   onConnect,
   onDisconnect,
 }) => {
+  // Focus the confirm button when a confirmation dialog opens so Enter confirms it.
+  // These dialogs are opened from a context menu, whose focus-return can otherwise
+  // leave focus outside the dialog, making Enter do nothing.
+  const deleteConfirmButtonRef = React.useRef<HTMLButtonElement>(null);
+  const overwriteConfirmButtonRef = React.useRef<HTMLButtonElement>(null);
   const isSingleDeleteTarget = deleteTargets.length === 1;
   const deletePath = (() => {
     if (isSingleDeleteTarget) {
@@ -225,7 +230,13 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
 
     {/* Overwrite Confirmation Dialog */}
     <Dialog open={showOverwriteConfirm} onOpenChange={setShowOverwriteConfirm}>
-      <DialogContent className="max-w-sm">
+      <DialogContent
+        className="max-w-sm"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          overwriteConfirmButtonRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <HostHint label={hostLabel} />
           <DialogTitle>{t("sftp.overwrite.title")}</DialogTitle>
@@ -241,6 +252,7 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
             {t("common.cancel")}
           </Button>
           <Button
+            ref={overwriteConfirmButtonRef}
             variant="destructive"
             onClick={handleOverwriteConfirm}
           >
@@ -289,7 +301,13 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
     </Dialog>
 
     <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
-      <DialogContent className="max-w-sm">
+      <DialogContent
+        className="max-w-sm"
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          deleteConfirmButtonRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle>
             {t("sftp.deleteConfirm.title", { count: deleteTargets.length })}
@@ -337,6 +355,7 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
             {t("common.cancel")}
           </Button>
           <Button
+            ref={deleteConfirmButtonRef}
             variant="destructive"
             onClick={handleDelete}
             disabled={isDeleting}
@@ -357,13 +376,16 @@ export const SftpPaneDialogs: React.FC<SftpPaneDialogsProps> = ({
       side={side}
       hostSearch={hostSearch}
       onHostSearchChange={setHostSearch}
-      onSelectLocal={() => {
-        onDisconnect();
-        onConnect("local");
+      onSelectLocal={async () => {
+        // Only connect to the new target if the disconnect actually happened.
+        // A cancel on the dirty-editor prompt must keep the user on the
+        // current host instead of silently switching and stranding tabs.
+        const ok = await onDisconnect();
+        if (ok) onConnect("local");
       }}
-      onSelectHost={(host) => {
-        onDisconnect();
-        onConnect(host);
+      onSelectHost={async (host) => {
+        const ok = await onDisconnect();
+        if (ok) onConnect(host);
       }}
     />
   </>

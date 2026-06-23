@@ -14,6 +14,8 @@
 
 import {
   SYNC_CONSTANTS,
+  ONEDRIVE_REAUTH_REQUIRED_MARKER,
+  isOneDriveReauthRequiredMessage,
   type OAuthTokens,
   type ProviderAccount,
   type SyncedFile,
@@ -48,6 +50,35 @@ const ONEDRIVE_SCOPES = [
 ];
 
 const ONEDRIVE_SCOPE = ONEDRIVE_SCOPES.join(' ');
+
+/**
+ * Raised when the OneDrive refresh token can no longer be exchanged for a new
+ * access token (expired / revoked / consent withdrawn). The user must
+ * re-authorize; silent refresh cannot recover. CloudSyncManager detects this to
+ * surface a clear "reconnect" state instead of a raw error.
+ *
+ * The message always carries ONEDRIVE_REAUTH_REQUIRED_MARKER so the condition is
+ * still detectable after the error is re-wrapped (e.g. `new Error(String(err))`)
+ * as it bubbles through the provider-agnostic sync pipeline.
+ */
+export class OneDriveReauthRequiredError extends Error {
+  constructor(message = 'OneDrive session expired, please reconnect.') {
+    super(
+      isOneDriveReauthRequiredMessage(message)
+        ? message
+        : `${ONEDRIVE_REAUTH_REQUIRED_MARKER}: ${message}`
+    );
+    this.name = 'OneDriveReauthRequiredError';
+  }
+}
+
+export const isOneDriveReauthRequiredError = (error: unknown): boolean => {
+  if (error instanceof OneDriveReauthRequiredError) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return isOneDriveReauthRequiredMessage(message);
+};
 
 const isUnauthorizedError = (error: unknown): boolean => {
   const message = error instanceof Error ? error.message : String(error);
@@ -309,41 +340,69 @@ export const validateToken = async (accessToken: string): Promise<boolean> => {
 
 const APP_FOLDER_PATH = '/drive/special/approot';
 
+// Eventual-consistency retry for OneDrive "not found" lookups. The Graph API
+// can briefly 404 a file that was uploaded seconds ago from another device
+// (most commonly when the other device is syncing through the OneDrive
+// desktop client and the change has not yet reached Graph). Treating every
+// 404 as authoritative "cloud is empty" lets a second device proceed to an
+// empty-cloud upload path and overwrite real data (#779). We retry a small
+// bounded number of times with short backoff to flush through that window.
+const NOT_FOUND_RETRIES = 2;
+const NOT_FOUND_BACKOFF_MS = 1500;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+async function retryOnNotFound<T>(
+  fetchOnce: () => Promise<T | null>,
+): Promise<T | null> {
+  let result = await fetchOnce();
+  for (let attempt = 1; attempt <= NOT_FOUND_RETRIES && result === null; attempt++) {
+    await sleep(NOT_FOUND_BACKOFF_MS * attempt);
+    result = await fetchOnce();
+  }
+  return result;
+}
+
 /**
  * Ensure app folder exists and find sync file
  */
 export const findSyncFile = async (accessToken: string): Promise<string | null> => {
-  const bridge = netcattyBridge.get();
-  if (bridge?.onedriveFindSyncFile) {
-    const result = await bridge.onedriveFindSyncFile({
-      accessToken,
-      fileName: SYNC_CONSTANTS.SYNC_FILE_NAME,
-    });
-    return result.fileId || null;
-  }
-  try {
-    const response = await fetch(
-      `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me${APP_FOLDER_PATH}:/${SYNC_CONSTANTS.SYNC_FILE_NAME}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-        },
-      }
-    );
+  const fetchOnce = async (): Promise<string | null> => {
+    const bridge = netcattyBridge.get();
+    if (bridge?.onedriveFindSyncFile) {
+      const result = await bridge.onedriveFindSyncFile({
+        accessToken,
+        fileName: SYNC_CONSTANTS.SYNC_FILE_NAME,
+      });
+      return result.fileId || null;
+    }
+    try {
+      const response = await fetch(
+        `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me${APP_FOLDER_PATH}:/${SYNC_CONSTANTS.SYNC_FILE_NAME}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+          },
+        }
+      );
 
-    if (response.status === 404) {
+      if (response.status === 404) {
+        return null;
+      }
+
+      if (!response.ok) {
+        throw new Error('Failed to find sync file');
+      }
+
+      const item: DriveItem = await response.json();
+      return item.id;
+    } catch {
       return null;
     }
+  };
 
-    if (!response.ok) {
-      throw new Error('Failed to find sync file');
-    }
-
-    const item: DriveItem = await response.json();
-    return item.id;
-  } catch {
-    return null;
-  }
+  return retryOnNotFound(fetchOnce);
 };
 
 /**
@@ -394,39 +453,43 @@ export const downloadSyncFile = async (
   accessToken: string,
   fileId?: string
 ): Promise<SyncedFile | null> => {
-  const bridge = netcattyBridge.get();
-  if (bridge?.onedriveDownloadSyncFile) {
-    const result = await bridge.onedriveDownloadSyncFile({
-      accessToken,
-      fileId,
-      fileName: SYNC_CONSTANTS.SYNC_FILE_NAME,
-    });
-    return (result.syncedFile as SyncedFile | null) || null;
-  }
-  try {
-    // Can use either file ID or path
-    const url = fileId
-      ? `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me/drive/items/${fileId}/content`
-      : `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me${APP_FOLDER_PATH}:/${SYNC_CONSTANTS.SYNC_FILE_NAME}:/content`;
+  const fetchOnce = async (): Promise<SyncedFile | null> => {
+    const bridge = netcattyBridge.get();
+    if (bridge?.onedriveDownloadSyncFile) {
+      const result = await bridge.onedriveDownloadSyncFile({
+        accessToken,
+        fileId,
+        fileName: SYNC_CONSTANTS.SYNC_FILE_NAME,
+      });
+      return (result.syncedFile as SyncedFile | null) || null;
+    }
+    try {
+      // Can use either file ID or path
+      const url = fileId
+        ? `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me/drive/items/${fileId}/content`
+        : `${SYNC_CONSTANTS.ONEDRIVE_GRAPH_API}/me${APP_FOLDER_PATH}:/${SYNC_CONSTANTS.SYNC_FILE_NAME}:/content`;
 
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-      },
-    });
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+        },
+      });
 
-    if (response.status === 404) {
+      if (response.status === 404) {
+        return null;
+      }
+
+      if (!response.ok) {
+        throw new Error('Failed to download sync file');
+      }
+
+      return response.json();
+    } catch {
       return null;
     }
+  };
 
-    if (!response.ok) {
-      throw new Error('Failed to download sync file');
-    }
-
-    return response.json();
-  } catch {
-    return null;
-  }
+  return retryOnNotFound(fetchOnce);
 };
 
 /**
@@ -465,12 +528,58 @@ export class OneDriveAdapter {
   private fileId: string | null = null;
   private account: ProviderAccount | null = null;
   private pkceChallenge: PKCEChallenge | null = null;
+  /**
+   * Invoked whenever the access token is silently refreshed. Lets the owner
+   * (CloudSyncManager) persist the rotated tokens — Microsoft consumer refresh
+   * tokens rotate on every refresh and invalidate the previous one, so without
+   * persisting the new refresh token the stored one eventually goes stale and
+   * forces the user to reconnect (#1189).
+   */
+  private onTokensRefreshed: ((tokens: OAuthTokens) => void) | null = null;
 
   constructor(tokens?: OAuthTokens, fileId?: string) {
     if (tokens) {
       this.tokens = tokens;
     }
     this.fileId = fileId || null;
+  }
+
+  /**
+   * Register a callback that receives refreshed tokens so the caller can
+   * persist them. Passing null removes the callback.
+   */
+  setOnTokensRefreshed(callback: ((tokens: OAuthTokens) => void) | null): void {
+    this.onTokensRefreshed = callback;
+  }
+
+  /**
+   * Refresh the access token using the supplied refresh token, store the
+   * rotated tokens in-memory, and notify the persistence callback. Refresh
+   * failures caused by a dead refresh token are normalized to
+   * OneDriveReauthRequiredError so callers can prompt for reconnect.
+   */
+  private async refreshTokens(refreshToken: string): Promise<OAuthTokens> {
+    let refreshed: OAuthTokens;
+    try {
+      refreshed = await refreshAccessToken(refreshToken);
+    } catch (error) {
+      if (isOneDriveReauthRequiredError(error)) {
+        // Preserve the message (it carries the marker the bridge added) so
+        // downstream layers can still detect this after any re-wrapping.
+        throw new OneDriveReauthRequiredError(
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+      throw error;
+    }
+    this.tokens = refreshed;
+    try {
+      this.onTokensRefreshed?.(refreshed);
+    } catch {
+      // Persistence is best-effort; a failed save must not abort the sync that
+      // triggered the refresh — the fresh tokens still work for this session.
+    }
+    return refreshed;
   }
 
   get isAuthenticated(): boolean {
@@ -530,9 +639,11 @@ export class OneDriveAdapter {
     // Refresh if expired
     if (tokens.expiresAt && Date.now() > tokens.expiresAt - 60000) {
       if (tokens.refreshToken) {
-        this.tokens = await refreshAccessToken(tokens.refreshToken);
+        this.tokens = await this.refreshTokens(tokens.refreshToken);
       } else {
-        throw new Error('Token expired and no refresh token');
+        throw new OneDriveReauthRequiredError(
+          'OneDrive session expired and no refresh token is available, please reconnect.'
+        );
       }
     }
 
@@ -553,9 +664,11 @@ export class OneDriveAdapter {
 
     if (this.tokens.expiresAt && Date.now() > this.tokens.expiresAt - 60000) {
       if (this.tokens.refreshToken) {
-        this.tokens = await refreshAccessToken(this.tokens.refreshToken);
+        this.tokens = await this.refreshTokens(this.tokens.refreshToken);
       } else {
-        throw new Error('Token expired');
+        throw new OneDriveReauthRequiredError(
+          'OneDrive session expired and no refresh token is available, please reconnect.'
+        );
       }
     }
 
@@ -571,8 +684,8 @@ export class OneDriveAdapter {
       return await operation(accessToken);
     } catch (error) {
       if (isUnauthorizedError(error) && this.tokens?.refreshToken) {
-        this.tokens = await refreshAccessToken(this.tokens.refreshToken);
-        return await operation(this.tokens.accessToken);
+        const refreshed = await this.refreshTokens(this.tokens.refreshToken);
+        return await operation(refreshed.accessToken);
       }
       throw error;
     }
@@ -586,6 +699,7 @@ export class OneDriveAdapter {
     this.fileId = null;
     this.account = null;
     this.pkceChallenge = null;
+    this.onTokensRefreshed = null;
   }
 
   /**

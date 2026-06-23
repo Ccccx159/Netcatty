@@ -44,7 +44,6 @@ export default defineConfig(() => {
           output: {
             manualChunks: {
               // Vendor chunks - rarely change, can be cached aggressively
-              'vendor-react': ['react', 'react-dom'],
               'vendor-radix': [
                 '@radix-ui/react-collapsible',
                 '@radix-ui/react-context-menu',
@@ -52,7 +51,6 @@ export default defineConfig(() => {
                 '@radix-ui/react-popover',
                 '@radix-ui/react-scroll-area',
                 '@radix-ui/react-select',
-                '@radix-ui/react-slot',
                 '@radix-ui/react-tabs',
               ],
               'vendor-xterm': [

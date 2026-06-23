@@ -6,34 +6,36 @@
 const os = require("node:os");
 const fs = require("node:fs");
 const net = require("node:net");
+const { randomUUID } = require("node:crypto");
+const { execFile, execFileSync } = require("node:child_process");
 const path = require("node:path");
+const { promisify } = require("node:util");
 const { StringDecoder } = require("node:string_decoder");
 const pty = require("node-pty");
 const { SerialPort } = require("serialport");
+const iconv = require("iconv-lite");
+const ptyProcessTree = require("./ptyProcessTree.cjs");
 
 const sessionLogStreamManager = require("./sessionLogStreamManager.cjs");
 const { detectShellKind } = require("./ai/ptyExec.cjs");
-const { trackSessionIdlePrompt } = require("./ai/shellUtils.cjs");
+const { stripAnsi, trackSessionIdlePrompt } = require("./ai/shellUtils.cjs");
 const { createZmodemSentry } = require("./zmodemHelper.cjs");
 const { discoverShells } = require("./shellDiscovery.cjs");
+const moshHandshake = require("./moshHandshake.cjs");
+const tempDirBridge = require("./tempDirBridge.cjs");
+const { createTelnetAutoLogin } = require("./telnetAutoLogin.cjs");
+const telnetProtocol = require("./telnetProtocol.cjs");
+const { createPtyOutputBuffer } = require("./ptyOutputBuffer.cjs");
+const { enableTcpNoDelay } = require("./tcpNoDelay.cjs");
+const { releaseConnectionRef } = require("./sshConnectionPool.cjs");
+const { normalizeTerminalEncoding, encodeTerminalInput } = require("./terminalEncoding.cjs");
+const { receiveYmodemFiles, sendYmodemCancel, sendYmodemFile } = require("./ymodemTransfer.cjs");
+
+const execFileAsync = promisify(execFile);
 
 // Shared references
 let sessions = null;
 let electronModule = null;
-
-// Map user-facing charset names to Node.js StringDecoder/Buffer encoding names.
-// Falls back to utf8 for unrecognized charsets (StringDecoder only supports a
-// small set; for CJK encodings like GB18030/Big5 we'd need iconv-lite, which
-// is out of scope for this change — utf8 is still the safer default).
-function charsetToNodeEncoding(charset) {
-  if (!charset) return 'utf8';
-  const normalized = String(charset).trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (['utf8', 'utf-8'].includes(normalized)) return 'utf8';
-  if (['latin1', 'iso88591', 'iso-8859-1', 'binary'].includes(normalized)) return 'latin1';
-  if (normalized === 'ascii') return 'ascii';
-  if (['utf16le', 'ucs2'].includes(normalized)) return 'utf16le';
-  return 'utf8';
-}
 
 const DEFAULT_UTF8_LOCALE = "en_US.UTF-8";
 const LOGIN_SHELLS = new Set(["bash", "zsh", "fish", "ksh"]);
@@ -67,51 +69,103 @@ const getLoginShellArgs = (shellPath) => {
 function init(deps) {
   sessions = deps.sessions;
   electronModule = deps.electronModule;
+  cleanupStaleEtTempDirs();
 }
 
 /**
- * Create an 8ms/16KB PTY data buffer for reduced IPC overhead.
- * Mirrors the SSH stream buffering strategy in sshBridge.cjs.
- * @param {Function} sendFn - called with the accumulated string to deliver
- * @returns {{ bufferData: (data: string) => void, flush: () => void }}
+ * Locate an executable on POSIX systems by name.
+ *
+ * macOS GUI Electron apps inherit launchd's minimal PATH
+ * (`/usr/bin:/bin:/usr/sbin:/sbin`), missing Homebrew and other common
+ * package-manager directories. `pty.spawn(name)` then either fails
+ * synchronously with ENOENT or spawns a child that immediately exits
+ * with no useful error surfaced to the renderer (see issue #842 for the
+ * Mosh case).
+ *
+ * Returns the absolute path on success, or null when the binary cannot
+ * be located anywhere we know to look. Win32 callers should keep using
+ * findExecutable() which handles `where.exe` + Windows-specific paths.
  */
-function createPtyBuffer(sendFn) {
-  const FLUSH_INTERVAL = 8;      // ms - flush every 8ms (~120fps equivalent)
-  const MAX_BUFFER_SIZE = 16384; // 16KB - flush immediately if buffer grows too large
+const POSIX_EXTRA_PATH_DIRS = [
+  "/opt/homebrew/bin",
+  "/opt/homebrew/sbin",
+  "/usr/local/bin",
+  "/usr/local/sbin",
+  "/opt/local/bin",
+  "/opt/local/sbin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+];
 
-  let dataBuffer = '';
-  let flushTimeout = null;
+function isExecutableFile(candidate) {
+  try {
+    const st = fs.statSync(candidate);
+    if (!st.isFile()) return false;
+    // Windows has no POSIX execute bit — Node returns mode 0o100666 even for
+    // .exe / .bat / .cmd files, so 0o111 is unreliable there. Treat any
+    // regular file as executable on Win32 and let spawn-time PATHEXT /
+    // extension handling reject non-executables.
+    if (process.platform === "win32") return true;
+    return (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
 
-  const flushBuffer = () => {
-    if (dataBuffer.length > 0) {
-      sendFn(dataBuffer);
-      dataBuffer = '';
+function resolvePosixExecutable(name, opts = {}) {
+  if (process.platform === "win32") return null;
+  if (!name || typeof name !== "string") return null;
+
+  // Already an absolute or relative path: validate as-is.
+  if (name.includes("/")) {
+    return isExecutableFile(name) ? name : null;
+  }
+  if (!/^[a-zA-Z0-9._+-]+$/.test(name)) return null;
+
+  const seen = new Set();
+  const dirs = [];
+
+  // 1. Honor the caller-supplied PATH first so callers that have already
+  //    merged a host-level environmentVariables.PATH override don't see the
+  //    fallback decline a binary that the spawned process would have found.
+  //    Falls back to the main process PATH when no override is provided.
+  const pathOverride = Object.prototype.hasOwnProperty.call(opts, "pathOverride")
+    ? opts.pathOverride
+    : process.env.PATH;
+  for (const dir of (pathOverride || "").split(":")) {
+    if (dir && !seen.has(dir)) {
+      seen.add(dir);
+      dirs.push(dir);
     }
-    flushTimeout = null;
-  };
+  }
 
-  const flush = () => {
-    if (flushTimeout) {
-      clearTimeout(flushTimeout);
-      flushTimeout = null;
+  // 2. Add directories the GUI launcher's PATH typically misses on macOS/Linux.
+  for (const dir of POSIX_EXTRA_PATH_DIRS) {
+    if (!seen.has(dir)) {
+      seen.add(dir);
+      dirs.push(dir);
     }
-    flushBuffer();
-  };
+  }
 
-  const bufferData = (data) => {
-    dataBuffer += data;
-    if (dataBuffer.length >= MAX_BUFFER_SIZE) {
-      if (flushTimeout) {
-        clearTimeout(flushTimeout);
-        flushTimeout = null;
+  // 3. User-scoped install locations (nix-profile, cargo, ~/.local).
+  const home = process.env.HOME;
+  if (home) {
+    for (const sub of [".nix-profile/bin", ".cargo/bin", ".local/bin"]) {
+      const dir = path.join(home, sub);
+      if (!seen.has(dir)) {
+        seen.add(dir);
+        dirs.push(dir);
       }
-      flushBuffer();
-    } else if (!flushTimeout) {
-      flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
     }
-  };
+  }
 
-  return { bufferData, flush };
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**
@@ -130,12 +184,17 @@ function isWindowsAppExecutionAlias(filePath) {
   return !!windowsAppsDir && normalizedPath.startsWith(`${windowsAppsDir}${path.sep}`);
 }
 
-function findExecutable(name) {
+function findExecutable(name, opts = {}) {
   if (process.platform !== "win32") return name;
   
   const { execFileSync } = require("child_process");
   try {
-    const result = execFileSync("where.exe", [name], { encoding: "utf8" });
+    const pathOverride = Object.prototype.hasOwnProperty.call(opts, "pathOverride")
+      ? opts.pathOverride
+      : process.env.PATH;
+    const env = { ...process.env, PATH: pathOverride || "" };
+    const whereExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "where.exe");
+    const result = execFileSync(fs.existsSync(whereExe) ? whereExe : "where.exe", [name], { encoding: "utf8", env });
     const candidates = result
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -150,8 +209,8 @@ function findExecutable(name) {
     console.warn(`Could not find ${name} via where.exe:`, err.message);
   }
   
-  // Fallback to common locations
-  const path = require("node:path");
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return name;
+
   const commonPaths = [];
 
   if (name === "pwsh") {
@@ -249,9 +308,7 @@ const applyLocaleDefaults = (env) => {
  * Start a local terminal session
  */
 function startLocalSession(event, payload) {
-  const sessionId =
-    payload?.sessionId ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sessionId = payload?.sessionId || randomUUID();
   const defaultShell = getDefaultLocalShell();
   // payload.shell may be a discovered shell ID (e.g., "wsl-ubuntu") — resolve it
   let resolvedShell = payload?.shell;
@@ -326,19 +383,26 @@ function startLocalSession(event, payload) {
     _promptTrackTail: "",
   };
   sessions.set(sessionId, session);
+  ptyProcessTree.registerPid(sessionId, proc.pid);
 
-  // Start real-time session log stream if configured
+  // Start real-time session log stream if configured. The token returned
+  // by startStream is captured so the corresponding stopStream below only
+  // tears down THIS stream — a stale exit event from a previous session
+  // that reused this sessionId would no-op instead of killing a freshly
+  // started stream after a "Restart" reconnect (issue #916).
+  let logStreamToken = null;
   if (payload?.sessionLog?.enabled && payload?.sessionLog?.directory) {
-    sessionLogStreamManager.startStream(sessionId, {
+    logStreamToken = sessionLogStreamManager.startStream(sessionId, {
       hostLabel: "Local",
       hostname: "localhost",
       directory: payload.sessionLog.directory,
       format: payload.sessionLog.format || "txt",
+      timestampsEnabled: Boolean(payload.sessionLog.timestampsEnabled),
       startTime: Date.now(),
     });
   }
 
-  const { bufferData: bufferLocalData, flush: flushLocal } = createPtyBuffer((data) => {
+  const { bufferData: bufferLocalData, flush: flushLocal } = createPtyOutputBuffer((data) => {
     const contents = electronModule.webContents.fromId(session.webContentsId);
     contents?.send("netcatty:data", { sessionId, data });
   });
@@ -381,7 +445,8 @@ function startLocalSession(event, payload) {
 
   proc.onExit((evt) => {
     flushLocal();
-    sessionLogStreamManager.stopStream(sessionId);
+    sessionLogStreamManager.stopStream(sessionId, logStreamToken);
+    ptyProcessTree.unregisterPid(sessionId);
     sessions.delete(sessionId);
     const contents = electronModule.webContents.fromId(session.webContentsId);
     // Signal present = killed externally (show disconnected UI).
@@ -397,423 +462,69 @@ function startLocalSession(event, payload) {
 /**
  * Start a Telnet session using native Node.js net module
  */
-async function startTelnetSession(event, options) {
-  const sessionId =
-    options.sessionId ||
-    `telnet-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  const hostname = options.hostname;
-  const port = options.port || 23;
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
-
-  console.log(`[Telnet] Starting connection to ${hostname}:${port}`);
-
-  return new Promise((resolve, reject) => {
-    const socket = new net.Socket();
-    let connected = false;
-
-    // Telnet protocol constants
-    const TELNET = {
-      IAC: 255,
-      DONT: 254,
-      DO: 253,
-      WONT: 252,
-      WILL: 251,
-      SB: 250,
-      SE: 240,
-      ECHO: 1,
-      SUPPRESS_GO_AHEAD: 3,
-      STATUS: 5,
-      TERMINAL_TYPE: 24,
-      NAWS: 31,
-      TERMINAL_SPEED: 32,
-      LINEMODE: 34,
-      NEW_ENVIRON: 39,
-    };
-
-    const sendWindowSize = () => {
-      const buf = Buffer.from([
-        TELNET.IAC, TELNET.SB, TELNET.NAWS,
-        (cols >> 8) & 0xff, cols & 0xff,
-        (rows >> 8) & 0xff, rows & 0xff,
-        TELNET.IAC, TELNET.SE
-      ]);
-      socket.write(buf);
-    };
-
-    const handleTelnetNegotiation = (data) => {
-      const output = [];
-      let i = 0;
-
-      while (i < data.length) {
-        if (data[i] === TELNET.IAC) {
-          if (i + 1 >= data.length) break;
-          
-          const cmd = data[i + 1];
-          
-          if (cmd === TELNET.IAC) {
-            output.push(255);
-            i += 2;
-            continue;
-          }
-
-          if (cmd === TELNET.DO || cmd === TELNET.DONT || cmd === TELNET.WILL || cmd === TELNET.WONT) {
-            if (i + 2 >= data.length) break;
-            
-            const opt = data[i + 2];
-            console.log(`[Telnet] Received: ${cmd === TELNET.DO ? 'DO' : cmd === TELNET.DONT ? 'DONT' : cmd === TELNET.WILL ? 'WILL' : 'WONT'} ${opt}`);
-
-            if (cmd === TELNET.DO) {
-              if (opt === TELNET.NAWS) {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.WILL, opt]));
-                sendWindowSize();
-              } else if (opt === TELNET.TERMINAL_TYPE) {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.WILL, opt]));
-              } else if (opt === TELNET.SUPPRESS_GO_AHEAD) {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.WILL, opt]));
-              } else {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.WONT, opt]));
-              }
-            } else if (cmd === TELNET.WILL) {
-              if (opt === TELNET.ECHO || opt === TELNET.SUPPRESS_GO_AHEAD) {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.DO, opt]));
-              } else {
-                socket.write(Buffer.from([TELNET.IAC, TELNET.DONT, opt]));
-              }
-            } else if (cmd === TELNET.DONT) {
-              socket.write(Buffer.from([TELNET.IAC, TELNET.WONT, opt]));
-            } else if (cmd === TELNET.WONT) {
-              socket.write(Buffer.from([TELNET.IAC, TELNET.DONT, opt]));
-            }
-
-            i += 3;
-            continue;
-          }
-
-          if (cmd === TELNET.SB) {
-            let seIndex = i + 2;
-            while (seIndex < data.length - 1) {
-              if (data[seIndex] === TELNET.IAC && data[seIndex + 1] === TELNET.SE) {
-                break;
-              }
-              seIndex++;
-            }
-
-            if (seIndex < data.length - 1) {
-              const subOpt = data[i + 2];
-              console.log(`[Telnet] Sub-negotiation for option ${subOpt}`);
-              
-              if (subOpt === TELNET.TERMINAL_TYPE && data[i + 3] === 1) {
-                const termType = 'xterm-256color';
-                const response = Buffer.concat([
-                  Buffer.from([TELNET.IAC, TELNET.SB, TELNET.TERMINAL_TYPE, 0]),
-                  Buffer.from(termType),
-                  Buffer.from([TELNET.IAC, TELNET.SE])
-                ]);
-                socket.write(response);
-              }
-              
-              i = seIndex + 2;
-              continue;
-            }
-          }
-
-          i += 2;
-          continue;
-        }
-
-        output.push(data[i]);
-        i++;
-      }
-
-      return Buffer.from(output);
-    };
-
-    const connectTimeout = setTimeout(() => {
-      if (!connected) {
-        console.error(`[Telnet] Connection timeout to ${hostname}:${port}`);
-        socket.destroy();
-        reject(new Error(`Connection timeout to ${hostname}:${port}`));
-      }
-    }, 10000);
-
-    socket.on('connect', () => {
-      connected = true;
-      clearTimeout(connectTimeout);
-      console.log(`[Telnet] Connected to ${hostname}:${port}`);
-
-      const session = {
-        socket,
-        type: 'telnet-native',
-        webContentsId: event.sender.id,
-        cols,
-        rows,
-        flushPendingData: null,
-        lastIdlePrompt: "",
-        lastIdlePromptAt: 0,
-        _promptTrackTail: "",
-      };
-      session.flushPendingData = flushTelnet;
-      sessions.set(sessionId, session);
-
-      // Start real-time session log stream if configured
-      if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-        sessionLogStreamManager.startStream(sessionId, {
-          hostLabel: options.label || hostname,
-          hostname,
-          directory: options.sessionLog.directory,
-          format: options.sessionLog.format || "txt",
-          startTime: Date.now(),
-        });
-      }
-
-      resolve({ sessionId });
-    });
-
-    const telnetDecoder = new StringDecoder(charsetToNodeEncoding(options.charset));
-
-    const telnetWebContentsId = event.sender.id;
-    const { bufferData: bufferTelnetData, flush: flushTelnet } = createPtyBuffer((data) => {
-      const contents = electronModule.webContents.fromId(telnetWebContentsId);
-      contents?.send("netcatty:data", { sessionId, data });
-    });
-
-    const telnetZmodemSentry = createZmodemSentry({
-      sessionId,
-      onData(buf) {
-        const decoded = telnetDecoder.write(buf);
-        if (!decoded) return;
-        const session = sessions.get(sessionId);
-        if (session) trackSessionIdlePrompt(session, decoded);
-        bufferTelnetData(decoded);
-        sessionLogStreamManager.appendData(sessionId, decoded);
-      },
-      writeToRemote(buf) {
-        // Escape 0xFF bytes as 0xFF 0xFF per Telnet spec so binary
-        // ZMODEM data passes through without being treated as IAC.
-        try {
-          let hasFF = false;
-          for (let i = 0; i < buf.length; i++) {
-            if (buf[i] === 0xff) { hasFF = true; break; }
-          }
-          if (hasFF) {
-            const escaped = [];
-            for (let i = 0; i < buf.length; i++) {
-              escaped.push(buf[i]);
-              if (buf[i] === 0xff) escaped.push(0xff);
-            }
-            return socket.write(Buffer.from(escaped));
-          } else {
-            return socket.write(buf);
-          }
-        } catch { return true; }
-      },
-      getWebContents() {
-        return electronModule.webContents.fromId(telnetWebContentsId);
-      },
-      label: "Telnet",
-    });
-    // Attach sentry to session once created (connect callback runs after this)
-    const attachTelnetSentry = () => {
-      const session = sessions.get(sessionId);
-      if (session) session.zmodemSentry = telnetZmodemSentry;
-    };
-    socket.once('connect', attachTelnetSentry);
-
-    socket.on('data', (data) => {
-      const session = sessions.get(sessionId);
-      if (!session) return;
-
-      // Always run Telnet negotiation — even during ZMODEM, the Telnet
-      // layer still escapes 0xFF as IAC IAC and sends control sequences.
-      const cleanData = handleTelnetNegotiation(data);
-      if (cleanData.length > 0) {
-        telnetZmodemSentry.consume(cleanData);
-      }
-    });
-
-    socket.on('error', (err) => {
-      console.error(`[Telnet] Socket error: ${err.message}`);
-      clearTimeout(connectTimeout);
-
-      if (!connected) {
-        reject(new Error(`Failed to connect: ${err.message}`));
-      } else {
-        flushTelnet();
-        sessionLogStreamManager.stopStream(sessionId);
-        const session = sessions.get(sessionId);
-        if (session) {
-          session.zmodemSentry?.cancel();
-          const contents = electronModule.webContents.fromId(session.webContentsId);
-          contents?.send("netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
-        }
-        sessions.delete(sessionId);
-      }
-    });
-
-    socket.on('close', (hadError) => {
-      console.log(`[Telnet] Connection closed${hadError ? ' with error' : ''}`);
-      clearTimeout(connectTimeout);
-
-      flushTelnet();
-      sessionLogStreamManager.stopStream(sessionId);
-      const session = sessions.get(sessionId);
-      if (session) {
-        session.zmodemSentry?.cancel();
-        const contents = electronModule.webContents.fromId(session.webContentsId);
-        contents?.send("netcatty:exit", { sessionId, exitCode: hadError ? 1 : 0, reason: hadError ? "error" : "closed" });
-      }
-      sessions.delete(sessionId);
-    });
-
-    console.log(`[Telnet] Connecting to ${hostname}:${port}...`);
-    socket.connect(port, hostname);
-  });
-}
+const { createTelnetSessionApi } = require("./terminalBridge/telnetSession.cjs");
+const telnetSessionApi = createTelnetSessionApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  net, randomUUID, StringDecoder, iconv, Buffer, console, setTimeout, clearTimeout,
+  normalizeTerminalEncoding, createTelnetAutoLogin, telnetProtocol,
+  createPtyOutputBuffer, sessionLogStreamManager, createZmodemSentry, ptyProcessTree,
+  enableTcpNoDelay, trackSessionIdlePrompt, stripAnsi,
+});
+const { startTelnetSession } = telnetSessionApi;
 
 /**
- * Start a Mosh session using system mosh-client
+ * Resolve Netcatty's bundled bare `mosh-client` binary.
+ *
+ * Returns the absolute path or null.
  */
-async function startMoshSession(event, options) {
-  const sessionId =
-    options.sessionId ||
-    `mosh-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const { createMoshSessionApi } = require("./terminalBridge/moshSession.cjs");
+const moshSessionApi = createMoshSessionApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  os, fs, net, path, pty, iconv, Buffer, StringDecoder, process, console,
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  randomUUID, execFileAsync, ptyProcessTree, sessionLogStreamManager,
+  stripAnsi, trackSessionIdlePrompt, createZmodemSentry, moshHandshake, tempDirBridge,
+  createPtyOutputBuffer, enableTcpNoDelay, normalizeTerminalEncoding,
+  resolvePosixExecutable, findExecutable, isExecutableFile,
+  bundledMoshClient: (...args) => bundledMoshClient(...args),
+});
+const {
+  resolveBareMoshClient,
+  addBundledMoshDllPath,
+  addBundledMoshTerminfoEnv,
+  addBundledMoshRuntimeEnv,
+  buildMoshSshAuthArgs,
+  cleanupMoshAuthTempFiles,
+  startMoshSessionViaHandshake,
+  swapToMoshClient,
+  resolveLangFromCharsetForMosh,
+  startMoshSession,
+} = moshSessionApi;
 
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
-
-  let moshCmd = 'mosh';
-  if (process.platform === 'win32') {
-    moshCmd = findExecutable('mosh') || 'mosh.exe';
-  }
-
-  const args = [];
-  
-  if (options.port && options.port !== 22) {
-    args.push('--ssh=ssh -p ' + options.port);
-  }
-
-  if (options.moshServerPath) {
-    args.push('--server=' + options.moshServerPath);
-  }
-
-  const userHost = options.username 
-    ? `${options.username}@${options.hostname}`
-    : options.hostname;
-  args.push(userHost);
-
-  const resolveLangFromCharset = (charset) => {
-    if (!charset) return 'en_US.UTF-8';
-    const trimmed = String(charset).trim();
-    if (/^utf-?8$/i.test(trimmed) || /^utf8$/i.test(trimmed)) {
-      return 'en_US.UTF-8';
-    }
-    return trimmed;
-  };
-
-  const env = {
-    ...process.env,
-    ...(options.env || {}),
-    TERM: 'xterm-256color',
-    LANG: resolveLangFromCharset(options.charset),
-  };
-
-  if (options.agentForwarding && process.env.SSH_AUTH_SOCK) {
-    env.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
-  }
-
-  try {
-    const proc = pty.spawn(moshCmd, args, {
-      cols,
-      rows,
-      env,
-      cwd: os.homedir(),
-      encoding: null, // Return Buffer for ZMODEM binary support
-    });
-
-    const session = {
-      proc,
-      pty: proc,
-      type: 'mosh',
-      protocol: 'mosh',
-      webContentsId: event.sender.id,
-      hostname: options.hostname || '',
-      username: options.username || '',
-      label: options.label || options.hostname || 'Mosh Session',
-      shellKind: 'posix',
-      shellExecutable: 'remote-shell',
-      flushPendingData: null,
-      lastIdlePrompt: "",
-      lastIdlePromptAt: 0,
-      _promptTrackTail: "",
-    };
-    sessions.set(sessionId, session);
-
-    // Start real-time session log stream if configured
-    if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-      sessionLogStreamManager.startStream(sessionId, {
-        hostLabel: options.label || options.hostname,
-        hostname: options.hostname,
-        directory: options.sessionLog.directory,
-        format: options.sessionLog.format || "txt",
-        startTime: Date.now(),
-      });
-    }
-
-    const { bufferData: bufferMoshData, flush: flushMosh } = createPtyBuffer((data) => {
-      const contents = electronModule.webContents.fromId(session.webContentsId);
-      contents?.send("netcatty:data", { sessionId, data });
-    });
-    session.flushPendingData = flushMosh;
-
-    if (process.platform !== "win32") {
-      const moshDecoder = new StringDecoder("utf8");
-      const moshZmodemSentry = createZmodemSentry({
-        sessionId,
-        onData(buf) {
-          const str = moshDecoder.write(buf);
-          if (!str) return;
-          trackSessionIdlePrompt(session, str);
-          bufferMoshData(str);
-          sessionLogStreamManager.appendData(sessionId, str);
-        },
-        writeToRemote(buf) {
-          try { return proc.write(buf); } catch { return true; }
-        },
-        getWebContents() {
-          return electronModule.webContents.fromId(session.webContentsId);
-        },
-        label: "Mosh",
-      });
-      session.zmodemSentry = moshZmodemSentry;
-
-      proc.onData((data) => {
-        moshZmodemSentry.consume(data);
-      });
-    } else {
-      proc.onData((data) => {
-        trackSessionIdlePrompt(session, data);
-        bufferMoshData(data);
-        sessionLogStreamManager.appendData(sessionId, data);
-      });
-    }
-
-    proc.onExit((evt) => {
-      flushMosh();
-      sessionLogStreamManager.stopStream(sessionId);
-      sessions.delete(sessionId);
-      const contents = electronModule.webContents.fromId(session.webContentsId);
-      // Mosh non-zero exit typically means connection/auth failure — show error UI
-      contents?.send("netcatty:exit", { sessionId, ...evt, reason: evt.exitCode === 0 ? "exited" : "error" });
-    });
-
-    return { sessionId };
-  } catch (err) {
-    console.error("[Mosh] Failed to start mosh session:", err.message);
-    throw err;
-  }
-}
+/**
+ * EternalTerminal session API. `et` is a self-contained client that performs
+ * its own SSH bootstrap + ET protocol handshake, so Netcatty just spawns the
+ * bundled `et` binary as a PTY (no Node handshake wrapper like Mosh needs).
+ */
+const { createEtSessionApi } = require("./terminalBridge/etSession.cjs");
+const etSessionApi = createEtSessionApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  os, fs, path, pty, process, console,
+  randomUUID, execFile, execFileSync, StringDecoder,
+  sessionLogStreamManager, tempDirBridge,
+  createZmodemSentry, trackSessionIdlePrompt, createPtyOutputBuffer,
+  findExecutable,
+  bundledEtClient: (...args) => bundledEtClient(...args),
+});
+const {
+  startEtSession,
+  execOnEtSession,
+  cleanupStaleEtTempDirs,
+  cleanupSessionExternalAuthArtifacts,
+} = etSessionApi;
 
 /**
  * List available serial ports (hardware only)
@@ -841,9 +552,7 @@ async function listSerialPorts() {
  * Note: SerialPort library can open PTY devices directly, they just won't appear in list()
  */
 async function startSerialSession(event, options) {
-  const sessionId =
-    options.sessionId ||
-    `serial-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sessionId = options.sessionId || randomUUID();
 
   const portPath = options.path;
   const baudRate = options.baudRate || 115200;
@@ -855,6 +564,11 @@ async function startSerialSession(event, options) {
   console.log(`[Serial] Starting connection to ${portPath} at ${baudRate} baud`);
 
   return new Promise((resolve, reject) => {
+    // Token for the log stream we open on this connection. Captured here so
+    // the close/error handlers can pass it to stopStream and avoid
+    // tearing down a freshly started stream after a "Restart" reconnect on
+    // the same sessionId (issue #916).
+    let logStreamToken = null;
     try {
       const serialPort = new SerialPort({
         path: portPath,
@@ -877,26 +591,31 @@ async function startSerialSession(event, options) {
 
         console.log(`[Serial] Connected to ${portPath}`);
 
-        const serialEncoding = charsetToNodeEncoding(options.charset);
-        const serialDecoder = new StringDecoder(serialEncoding);
+        const initialSerialEncoding = normalizeTerminalEncoding(options.charset);
+        const serialDecoderRef = { current: iconv.getDecoder(initialSerialEncoding) };
 
         const session = {
           serialPort,
           type: 'serial',
           protocol: 'serial',
           shellKind: 'raw',
-          serialEncoding,
+          encoding: initialSerialEncoding,
+          // Kept for backward compatibility with aiBridge / mcpServerBridge
+          // which read session.serialEncoding for exec calls.
+          serialEncoding: initialSerialEncoding,
+          decoderRef: serialDecoderRef,
           webContentsId: event.sender.id,
         };
         sessions.set(sessionId, session);
 
         // Start real-time session log stream if configured
         if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-          sessionLogStreamManager.startStream(sessionId, {
+          logStreamToken = sessionLogStreamManager.startStream(sessionId, {
             hostLabel: options.label || portPath,
             hostname: portPath,
             directory: options.sessionLog.directory,
             format: options.sessionLog.format || "txt",
+            timestampsEnabled: Boolean(options.sessionLog.timestampsEnabled),
             startTime: Date.now(),
           });
         }
@@ -904,7 +623,7 @@ async function startSerialSession(event, options) {
         const serialZmodemSentry = createZmodemSentry({
           sessionId,
           onData(buf) {
-            const decoded = serialDecoder.write(buf);
+            const decoded = serialDecoderRef.current.write(buf);
             if (!decoded) return;
             const contents = electronModule.webContents.fromId(session.webContentsId);
             contents?.send("netcatty:data", { sessionId, data: decoded });
@@ -921,6 +640,7 @@ async function startSerialSession(event, options) {
         session.zmodemSentry = serialZmodemSentry;
 
         serialPort.on('data', (data) => {
+          if (session.ymodemActive) return;
           // data is already Buffer from serialport — feed to sentry
           serialZmodemSentry.consume(data);
         });
@@ -928,18 +648,22 @@ async function startSerialSession(event, options) {
         serialPort.on('error', (err) => {
           console.error(`[Serial] Port error: ${err.message}`);
           session.zmodemSentry?.cancel();
-          sessionLogStreamManager.stopStream(sessionId);
+          session.ymodemAbortController?.abort();
+          sessionLogStreamManager.stopStream(sessionId, logStreamToken);
           const contents = electronModule.webContents.fromId(session.webContentsId);
           contents?.send("netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
+          ptyProcessTree.unregisterPid(sessionId);
           sessions.delete(sessionId);
         });
 
         serialPort.on('close', () => {
           console.log(`[Serial] Port closed`);
           session.zmodemSentry?.cancel();
-          sessionLogStreamManager.stopStream(sessionId);
+          session.ymodemAbortController?.abort();
+          sessionLogStreamManager.stopStream(sessionId, logStreamToken);
           const contents = electronModule.webContents.fromId(session.webContentsId);
           contents?.send("netcatty:exit", { sessionId, exitCode: 0, reason: "closed" });
+          ptyProcessTree.unregisterPid(sessionId);
           sessions.delete(sessionId);
         });
 
@@ -955,9 +679,31 @@ async function startSerialSession(event, options) {
 /**
  * Write data to a session
  */
+function cancelActiveYmodemSession(session) {
+  if (!session?.ymodemActive) return;
+  void sendYmodemCancel(session.serialPort);
+  session.ymodemAbortController?.abort();
+}
+
+function signalSshInterruptIfNeeded(session, data) {
+  if (data !== '\x03' || !session?.stream || typeof session.stream.signal !== "function") return;
+  try {
+    session.stream.signal("INT");
+  } catch {
+    // Keep the legacy Ctrl+C byte write as the compatibility fallback.
+  }
+}
+
 function writeToSession(event, payload) {
   const session = sessions.get(payload.sessionId);
   if (!session) return;
+
+  if (session.ymodemActive) {
+    if (payload.data === '\x03') {
+      cancelActiveYmodemSession(session);
+    }
+    return;
+  }
 
   // During ZMODEM transfer, block terminal input (Ctrl+C cancels the transfer)
   if (session.zmodemSentry?.isActive()) {
@@ -968,18 +714,148 @@ function writeToSession(event, payload) {
   }
 
   try {
+    if (session.type === 'telnet-native' && !payload.automated) {
+      session.autoLogin?.handleUserInput();
+    }
+
+    // Encode keystrokes with the SAME charset the output path decodes with so
+    // input and output stay symmetric on non-UTF-8 devices (issue #1216).
+    // session.encoding is the normalized iconv identifier; it is only set on
+    // sessions whose output is iconv-decoded (SSH / telnet / serial). Mosh and
+    // local PTY leave it unset, so encodeTerminalInput returns the original
+    // UTF-8 string for them. For UTF-8 it also returns the string unchanged, so
+    // the transport's native string serialization keeps handling that case.
+    sessionLogStreamManager.registerSudoAutofillInput(payload.sessionId, payload.data);
+    const outgoing = encodeTerminalInput(payload.data, session.encoding);
+
     if (session.stream) {
-      session.stream.write(payload.data);
+      signalSshInterruptIfNeeded(session, payload.data);
+      session.stream.write(outgoing);
     } else if (session.proc) {
-      session.proc.write(payload.data);
+      session.proc.write(outgoing);
     } else if (session.socket) {
-      session.socket.write(payload.data);
+      // Telnet only: any 0xFF byte going out the wire must be doubled, or
+      // the peer will treat it as the start of an IAC command sequence and
+      // eat the next byte (RFC 854 §"Data Stream"). UTF-8 keyboard input
+      // never produces 0xFF, but paste of binary content and some legacy
+      // encodings do. Cheap no-op when there is no 0xFF.
+      let wireData = outgoing;
+      if (session.type === 'telnet-native' && session.telnetProtocolActive) {
+        if (typeof wireData === 'string') {
+          wireData = Buffer.from(wireData, 'utf8');
+        }
+        wireData = telnetProtocol.escapeIacForWire(wireData);
+      }
+      session.socket.write(wireData);
     } else if (session.serialPort) {
-      session.serialPort.write(payload.data);
+      session.serialPort.write(outgoing);
     }
   } catch (err) {
     if (err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
       console.warn("Write failed", err);
+    }
+  }
+}
+
+async function sendSerialYmodem(_event, payload) {
+  const session = sessions.get(payload?.sessionId);
+  if (!session || !session.serialPort || session.type !== 'serial') {
+    return { success: false, error: "YMODEM send requires an active serial session" };
+  }
+  if (session.ymodemActive) {
+    return { success: false, error: "A YMODEM transfer is already in progress" };
+  }
+  if (session.zmodemSentry?.isActive()) {
+    return { success: false, error: "Another serial file transfer is already in progress" };
+  }
+  if (!payload?.filePath || typeof payload.filePath !== "string") {
+    return { success: false, error: "No file selected" };
+  }
+
+  const abortController = new AbortController();
+  session.ymodemActive = true;
+  session.ymodemAbortController = abortController;
+
+  try {
+    const result = await sendYmodemFile(session.serialPort, payload.filePath, {
+      abortSignal: abortController.signal,
+      timeoutMs: Number.isFinite(payload.timeoutMs) ? payload.timeoutMs : undefined,
+    });
+    return { success: true, ...result };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      code: error?.code,
+    };
+  } finally {
+    session.ymodemActive = false;
+    session.ymodemAbortController = null;
+  }
+}
+
+async function receiveSerialYmodem(_event, payload) {
+  const session = sessions.get(payload?.sessionId);
+  if (!session || !session.serialPort || session.type !== 'serial') {
+    return { success: false, error: "YMODEM receive requires an active serial session" };
+  }
+  if (session.ymodemActive) {
+    return { success: false, error: "A YMODEM transfer is already in progress" };
+  }
+  if (session.zmodemSentry?.isActive()) {
+    return { success: false, error: "Another serial file transfer is already in progress" };
+  }
+  if (!payload?.destinationDir || typeof payload.destinationDir !== "string") {
+    return { success: false, error: "No destination directory selected" };
+  }
+
+  const abortController = new AbortController();
+  session.ymodemActive = true;
+  session.ymodemAbortController = abortController;
+
+  try {
+    const result = await receiveYmodemFiles(session.serialPort, {
+      destinationDir: payload.destinationDir,
+      abortSignal: abortController.signal,
+      timeoutMs: Number.isFinite(payload.timeoutMs) ? payload.timeoutMs : undefined,
+    });
+    return { success: true, ...result };
+  } catch (error) {
+    if (error?.code !== "YMODEM_CANCELLED" && error?.code !== "YMODEM_REMOTE_CANCELLED") {
+      await sendYmodemCancel(session.serialPort);
+    }
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      code: error?.code,
+    };
+  } finally {
+    session.ymodemActive = false;
+    session.ymodemAbortController = null;
+  }
+}
+
+/**
+ * Pause or resume a session's source stream for output back-pressure.
+ * The renderer asks for this when its write backlog crosses a watermark, so a
+ * flooding source can't outrun the terminal renderer. Works across session
+ * kinds: ssh2 channel (stream), node-pty (proc), telnet socket, serial port —
+ * all expose pause()/resume().
+ */
+function setSessionFlowPaused(event, payload) {
+  const session = sessions.get(payload.sessionId);
+  if (!session) return;
+  const target = session.stream || session.proc || session.socket || session.serialPort;
+  if (!target) return;
+  try {
+    if (payload.paused) {
+      target.pause?.();
+    } else {
+      target.resume?.();
+    }
+  } catch (err) {
+    if (err?.code !== 'EPIPE' && err?.code !== 'ERR_STREAM_DESTROYED') {
+      console.warn("Flow control toggle failed", err);
     }
   }
 }
@@ -990,6 +866,8 @@ function writeToSession(event, payload) {
 function resizeSession(event, payload) {
   const session = sessions.get(payload.sessionId);
   if (!session) return;
+  if (Number.isFinite(payload.cols)) session.cols = payload.cols;
+  if (Number.isFinite(payload.rows)) session.rows = payload.rows;
   
   try {
     if (session.stream) {
@@ -999,14 +877,19 @@ function resizeSession(event, payload) {
     } else if (session.socket && session.type === 'telnet-native') {
       session.cols = payload.cols;
       session.rows = payload.rows;
-      const TELNET = { IAC: 255, SB: 250, SE: 240, NAWS: 31 };
-      const buf = Buffer.from([
-        TELNET.IAC, TELNET.SB, TELNET.NAWS,
-        (payload.cols >> 8) & 0xff, payload.cols & 0xff,
-        (payload.rows >> 8) & 0xff, payload.rows & 0xff,
-        TELNET.IAC, TELNET.SE
-      ]);
-      session.socket.write(buf);
+      // Only push a NAWS update once the peer has activated the protocol;
+      // sending an IAC sequence to a raw-TCP server would corrupt its stream.
+      if (session.telnetProtocolActive) {
+        const colsByte = Buffer.from([
+          (payload.cols >> 8) & 0xff, payload.cols & 0xff,
+          (payload.rows >> 8) & 0xff, payload.rows & 0xff,
+        ]);
+        session.socket.write(Buffer.concat([
+          Buffer.from([telnetProtocol.IAC, telnetProtocol.SB, telnetProtocol.OPT.NAWS]),
+          telnetProtocol.escapeIacForWire(colsByte),
+          Buffer.from([telnetProtocol.IAC, telnetProtocol.SE]),
+        ]));
+      }
     }
   } catch (err) {
     if (err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
@@ -1021,29 +904,90 @@ function resizeSession(event, payload) {
 function closeSession(event, payload) {
   const session = sessions.get(payload.sessionId);
   if (!session) return;
+  session.closed = true;
   
   try {
+    cancelActiveYmodemSession(session);
     session.zmodemSentry?.cancel();
     session.flushPendingData?.();
+    cleanupSessionExternalAuthArtifacts(session);
     if (session.stream) {
+      // Snapshot multiplexing state *before* closing the channel: closing the
+      // stream can synchronously fire its "close" handler, which nulls
+      // session.connRef (and may already release the shared connection). Reading
+      // session.connRef afterwards would then wrongly fall into the legacy path
+      // and end the shared connection a second time.
+      const isMultiplexed = !!session.connRef;
+      // Always close this session's own shell channel.
       session.stream.close();
-      session.conn?.end();
+      if (isMultiplexed) {
+        // Multiplexed SSH shell (issue #1204): several tabs may share one
+        // authenticated connection. Closing this tab must only tear the shared
+        // transport (and jump-host chain) down once the last channel is gone,
+        // so route teardown through the reference-counted descriptor instead of
+        // ending the connection directly. releaseConnectionRef is idempotent and
+        // ends the chain connections itself when the count reaches zero — so it
+        // is safe even if the stream "close" handler above already released.
+        releaseConnectionRef(session);
+      } else {
+        // Legacy / non-multiplexed path: this session owns its connection.
+        session.conn?.end();
+        if (session.chainConnections) {
+          for (const c of session.chainConnections) {
+            try { c.end(); } catch {}
+          }
+        }
+      }
     } else if (session.proc) {
       session.proc.kill();
+      // Mosh sessions may also carry a companion ssh2 connection opened
+      // lazily for host-info stats (issue #1198). ET can use the same pattern.
+      // Close companions here to avoid leaking them.
+      try { session.moshStatsConn?.end(); } catch { /* ignore */ }
+      try { session.etStatsConn?.end(); } catch { /* ignore */ }
     } else if (session.socket) {
       session.socket.destroy();
     } else if (session.serialPort) {
       session.serialPort.close();
-    }
-    if (session.chainConnections) {
+    } else if (session.chainConnections) {
+      // Non-stream session still carrying a jump-host chain (defensive).
       for (const c of session.chainConnections) {
         try { c.end(); } catch {}
       }
     }
   } catch (err) {
     console.warn("Close failed", err);
+  } finally {
+    cleanupMoshAuthTempFiles(session.moshAuthTempFiles);
   }
+  ptyProcessTree.unregisterPid(payload.sessionId);
   sessions.delete(payload.sessionId);
+}
+
+/**
+ * Set terminal decoder encoding for an active telnet or serial session.
+ * SSH sessions are handled by sshBridge's own setEncoding IPC — this one
+ * only responds to sessions that carry a decoderRef (telnet + serial).
+ */
+function setSessionEncoding(_event, { sessionId, encoding }) {
+  const session = sessions?.get(sessionId);
+  if (!session || !session.decoderRef) {
+    return { ok: false, encoding: encoding || 'utf-8' };
+  }
+  const enc = normalizeTerminalEncoding(encoding);
+  if (!iconv.encodingExists(enc)) {
+    return { ok: false, encoding: enc };
+  }
+  session.encoding = enc;
+  // Keep serialEncoding mirror in sync so aiBridge / mcpServerBridge exec
+  // calls pick up the new encoding too.
+  if (session.type === 'serial') {
+    session.serialEncoding = enc;
+  }
+  // iconv stateful decoders carry partial-byte state from the previous
+  // encoding, so swap in a fresh decoder rather than reconfiguring.
+  session.decoderRef.current = iconv.getDecoder(enc);
+  return { ok: true, encoding: enc };
 }
 
 /**
@@ -1053,81 +997,110 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:local:start", startLocalSession);
   ipcMain.handle("netcatty:telnet:start", startTelnetSession);
   ipcMain.handle("netcatty:mosh:start", startMoshSession);
+  ipcMain.handle("netcatty:et:start", startEtSession);
   ipcMain.handle("netcatty:serial:start", startSerialSession);
   ipcMain.handle("netcatty:serial:list", listSerialPorts);
+  ipcMain.handle("netcatty:serial:ymodem-send", sendSerialYmodem);
+  ipcMain.handle("netcatty:serial:ymodem-receive", receiveSerialYmodem);
   ipcMain.handle("netcatty:local:defaultShell", getDefaultShell);
   ipcMain.handle("netcatty:local:validatePath", validatePath);
   ipcMain.handle("netcatty:shells:discover", () => discoverShells());
+  ipcMain.handle("netcatty:terminal:setEncoding", setSessionEncoding);
   ipcMain.on("netcatty:write", writeToSession);
   ipcMain.on("netcatty:resize", resizeSession);
+  ipcMain.on("netcatty:flow", setSessionFlowPaused);
   ipcMain.on("netcatty:close", closeSession);
 }
 
 /**
  * Get the default shell for the current platform
  */
-function getDefaultShell() {
-  return getDefaultLocalShell();
+const { createPathValidationApi } = require("./terminalBridge/pathValidation.cjs");
+const pathValidationApi = createPathValidationApi({
+  getDefaultLocalShell, expandHomePath, path, fs, process, console, findExecutable,
+});
+const { getDefaultShell, validatePath } = pathValidationApi;
+
+/**
+ * Locate the mosh-client binary bundled by electron-builder via
+ * `extraResources` (see electron-builder.config.cjs and
+ * .github/workflows/build-mosh-binaries.yml).
+ *
+ * Returns an absolute path when the binary is on disk, otherwise null.
+ * In dev / non-packaged runs the path is computed against the project
+ * root so the helper is testable without packaging the app.
+ *
+ * Note this returns the network-protocol `mosh-client`, not the `mosh`
+ * wrapper script. Netcatty drives the SSH bootstrap itself and then
+ * launches this bundled client directly.
+ */
+function bundledMoshClient(opts = {}) {
+  const isWin = (opts.platform || process.platform) === "win32";
+  const basename = isWin ? "mosh-client.exe" : "mosh-client";
+
+  // Packaged: <Resources>/mosh/mosh-client[.exe]
+  const resourcesPath = opts.resourcesPath || process.resourcesPath;
+  if (resourcesPath) {
+    const packaged = path.join(resourcesPath, "mosh", basename);
+    if (fs.existsSync(packaged) && isExecutableFile(packaged)) return packaged;
+  }
+
+  // Dev fallback: resources/mosh/<platform-arch>/mosh-client[.exe] under
+  // the project root. Useful for `npm run start` after running
+  // `npm run fetch:mosh` locally.
+  const projectRoot = opts.projectRoot || path.resolve(__dirname, "..", "..");
+  const platform = opts.platform || process.platform;
+  const arch = opts.arch || process.arch;
+  const candidates = [];
+  if (platform === "darwin") {
+    candidates.push(path.join(projectRoot, "resources", "mosh", "darwin-universal", basename));
+  } else {
+    candidates.push(path.join(projectRoot, "resources", "mosh", `${platform}-${arch}`, basename));
+  }
+  for (const c of candidates) {
+    if (fs.existsSync(c) && isExecutableFile(c)) return c;
+  }
+  return null;
 }
 
 /**
- * Validate a path - check if it exists and whether it's a file or directory
- * @param {object} event - IPC event
- * @param {object} payload - Contains { path: string, type?: 'file' | 'directory' | 'any' }
- * @returns {{ exists: boolean, isFile: boolean, isDirectory: boolean }}
+ * Locate the EternalTerminal `et` client bundled by electron-builder via
+ * `extraResources` (see electron-builder.config.cjs and
+ * .github/workflows/build-et-binaries.yml).
+ *
+ * Returns an absolute path when the binary is on disk, otherwise null. In
+ * dev / non-packaged runs the path is computed against the project root so
+ * the helper is testable without packaging the app.
+ *
+ * `et` is a self-contained client that performs its own SSH bootstrap and
+ * EternalTerminal protocol handshake; Netcatty just spawns it as a PTY.
  */
-function validatePath(event, payload) {
-  const targetPath = payload?.path;
-  const type = payload?.type || 'any';
-  if (!targetPath) {
-    return { exists: false, isFile: false, isDirectory: false };
+function bundledEtClient(opts = {}) {
+  const isWin = (opts.platform || process.platform) === "win32";
+  const basename = isWin ? "et.exe" : "et";
+
+  // Packaged: <Resources>/et/et[.exe]
+  const resourcesPath = opts.resourcesPath || process.resourcesPath;
+  if (resourcesPath) {
+    const packaged = path.join(resourcesPath, "et", basename);
+    if (fs.existsSync(packaged) && isExecutableFile(packaged)) return packaged;
   }
-  
-  try {
-    // Resolve path (handle ~, etc.)
-    let resolvedPath = expandHomePath(targetPath);
-    resolvedPath = path.resolve(resolvedPath);
-    
-    if (fs.existsSync(resolvedPath)) {
-      const stat = fs.statSync(resolvedPath);
-      return {
-        exists: true,
-        isFile: stat.isFile(),
-        isDirectory: stat.isDirectory(),
-      };
-    }
-    
-    // If type is 'file' and path doesn't exist, try to resolve via PATH (for executables like cmd.exe, powershell.exe)
-    if (type === 'file') {
-      const resolvedExecutable = findExecutable(targetPath);
-      // findExecutable returns the original name if not found, so check if it actually resolves to a real path
-      if (resolvedExecutable !== targetPath && fs.existsSync(resolvedExecutable)) {
-        const stat = fs.statSync(resolvedExecutable);
-        return {
-          exists: true,
-          isFile: stat.isFile(),
-          isDirectory: stat.isDirectory(),
-        };
-      }
-      // Also try with .exe extension on Windows if not already present
-      if (process.platform === 'win32' && !targetPath.toLowerCase().endsWith('.exe')) {
-        const withExe = findExecutable(targetPath + '.exe');
-        if (withExe !== targetPath + '.exe' && fs.existsSync(withExe)) {
-          const stat = fs.statSync(withExe);
-          return {
-            exists: true,
-            isFile: stat.isFile(),
-            isDirectory: stat.isDirectory(),
-          };
-        }
-      }
-    }
-    
-    return { exists: false, isFile: false, isDirectory: false };
-  } catch (err) {
-    console.warn(`[Terminal] Error validating path "${targetPath}":`, err.message);
-    return { exists: false, isFile: false, isDirectory: false };
+
+  // Dev fallback: resources/et/<platform-arch>/et[.exe] under the project
+  // root. Useful for `npm run start` after running `npm run fetch:et` locally.
+  const projectRoot = opts.projectRoot || path.resolve(__dirname, "..", "..");
+  const platform = opts.platform || process.platform;
+  const arch = opts.arch || process.arch;
+  const candidates = [];
+  if (platform === "darwin") {
+    candidates.push(path.join(projectRoot, "resources", "et", "darwin-universal", basename));
+  } else {
+    candidates.push(path.join(projectRoot, "resources", "et", `${platform}-${arch}`, basename));
   }
+  for (const c of candidates) {
+    if (fs.existsSync(c) && isExecutableFile(c)) return c;
+  }
+  return null;
 }
 
 /**
@@ -1138,6 +1111,8 @@ function cleanupAllSessions() {
   for (const [sessionId, session] of sessions) {
     try {
       session.zmodemSentry?.cancel();
+      cancelActiveYmodemSession(session);
+      cleanupSessionExternalAuthArtifacts(session);
       if (session.stream) {
         session.stream.close();
         session.conn?.end();
@@ -1148,6 +1123,10 @@ function cleanupAllSessions() {
         } catch (e) {
           // Ignore errors during cleanup
         }
+        // Tear down a Mosh stats companion ssh2 connection if one was opened
+        // (issue #1198), and the equivalent ET companion when present.
+        try { session.moshStatsConn?.end(); } catch (e) { /* ignore */ }
+        try { session.etStatsConn?.end(); } catch (e) { /* ignore */ }
       } else if (session.socket) {
         session.socket.destroy();
       } else if (session.serialPort) {
@@ -1166,6 +1145,9 @@ function cleanupAllSessions() {
       // Ignore cleanup errors
     }
   }
+  for (const [sessionId] of sessions) {
+    ptyProcessTree.unregisterPid(sessionId);
+  }
   sessions.clear();
 }
 
@@ -1176,10 +1158,22 @@ module.exports = {
   startLocalSession,
   startTelnetSession,
   startMoshSession,
+  bundledMoshClient,
+  resolveBareMoshClient,
+  addBundledMoshDllPath,
+  addBundledMoshTerminfoEnv,
+  addBundledMoshRuntimeEnv,
+  startEtSession,
+  execOnEtSession,
+  bundledEtClient,
   startSerialSession,
+  sendSerialYmodem,
+  receiveSerialYmodem,
   listSerialPorts,
   writeToSession,
+  setSessionEncoding,
   resizeSession,
+  setSessionFlowPaused,
   closeSession,
   cleanupAllSessions,
   getDefaultShell,

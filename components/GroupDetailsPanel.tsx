@@ -1,40 +1,39 @@
 import {
   Check,
-  ChevronRight,
   Eye,
   EyeOff,
-  FileKey,
-  FolderOpen,
   Globe,
-  Key,
-  Link2,
   MoreHorizontal,
   Palette,
   Plus,
   Settings2,
-  Shield,
-  TerminalSquare,
   Trash2,
-  Variable,
-  X,
 } from "lucide-react";
 import React, { useCallback, useMemo, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { customThemeStore } from "../application/state/customThemeStore";
 import { resolveGroupDefaults, resolveGroupTerminalThemeId } from "../domain/groupConfig";
-import { cn } from "../lib/utils";
+import {
+  formatProxyConfigEndpoint,
+  formatProxyConfigType,
+  isCompleteProxyConfig,
+  normalizeManualProxyConfig,
+} from "../domain/proxyProfiles";
 import {
   EnvVar,
   GroupConfig,
   Host,
   Identity,
   ProxyConfig,
+  ProxyProfile,
   SSHKey,
 } from "../types";
 import ThemeSelectPanel from "./ThemeSelectPanel";
 import {
   ChainPanel,
   EnvVarsPanel,
+  HostDetailsSection,
+  HostDetailsSettingRow,
   ProxyPanel,
 } from "./host-details";
 import {
@@ -42,15 +41,14 @@ import {
   AsidePanelContent,
   type AsidePanelLayout,
 } from "./ui/aside-panel";
-import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
-import { Card } from "./ui/card";
 import { Combobox } from "./ui/combobox";
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
 import { Input } from "./ui/input";
-import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { TerminalFontSelect } from "./settings/TerminalFontSelect";
 import { useAvailableFonts } from "../application/state/fontStore";
+import { toast } from "./ui/toast";
+import { GroupSshSettingsSection } from "./GroupSshSettingsSection";
 
 type SubPanel = "none" | "proxy" | "chain" | "env-vars" | "theme-select";
 
@@ -59,6 +57,7 @@ interface GroupDetailsPanelProps {
   config: GroupConfig | undefined;
   availableKeys: SSHKey[];
   identities: Identity[];
+  proxyProfiles?: ProxyProfile[];
   allHosts: Host[];
   groups: string[];
   terminalThemeId: string;
@@ -74,6 +73,7 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
   config,
   availableKeys,
   identities: _identities,
+  proxyProfiles = [],
   allHosts,
   groups,
   terminalThemeId,
@@ -105,9 +105,10 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
     c.protocol === 'ssh' ||
     c.port !== undefined || !!c.username || !!c.password || !!c.identityFileId ||
     c.agentForwarding !== undefined || c.authMethod !== undefined || !!c.identityId ||
-    !!c.proxyConfig || !!c.hostChain || !!c.startupCommand || c.legacyAlgorithms !== undefined || c.backspaceBehavior !== undefined ||
+    !!c.proxyProfileId || !!c.proxyConfig || !!c.hostChain || !!c.startupCommand || c.legacyAlgorithms !== undefined || c.skipEcdsaHostKey !== undefined || c.algorithms !== undefined || c.backspaceBehavior !== undefined ||
     (c.environmentVariables && c.environmentVariables.length > 0) ||
     c.moshEnabled !== undefined || !!c.moshServerPath ||
+    c.etEnabled !== undefined || c.etPort !== undefined ||
     (c.identityFilePaths && c.identityFilePaths.length > 0);
   const hasTelnetFields = (c: Partial<GroupConfig>) =>
     c.telnetPort !== undefined || !!c.telnetUsername || !!c.telnetPassword || c.telnetEnabled === true;
@@ -121,6 +122,7 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
   // Password visibility state
   const [showPassword, setShowPassword] = useState(false);
   const [showTelnetPassword, setShowTelnetPassword] = useState(false);
+  const [showAlgorithmOverrides, setShowAlgorithmOverrides] = useState(false);
   const [addProtocolOpen, setAddProtocolOpen] = useState(false);
 
   // Credential selection state
@@ -132,6 +134,16 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
   // Environment variables state
   const [newEnvName, setNewEnvName] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
+  const selectedProxyProfile = useMemo(
+    () => proxyProfiles.find((profile) => profile.id === form.proxyProfileId),
+    [form.proxyProfileId, proxyProfiles],
+  );
+  const hasMissingProxyProfile = Boolean(form.proxyProfileId && !selectedProxyProfile);
+  const proxySummaryLabel = hasMissingProxyProfile
+    ? t("hostDetails.proxyPanel.missingSaved")
+    : selectedProxyProfile
+      ? selectedProxyProfile.label
+      : `${formatProxyConfigType(form.proxyConfig)} ${formatProxyConfigEndpoint(form.proxyConfig)}`;
 
   const update = <K extends keyof GroupConfig>(key: K, value: GroupConfig[K] | undefined) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -155,13 +167,18 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
       delete next.agentForwarding;
       delete next.startupCommand;
       delete next.legacyAlgorithms;
+      delete next.skipEcdsaHostKey;
+      delete next.algorithms;
       delete next.backspaceBehavior;
+      delete next.proxyProfileId;
       delete next.proxyConfig;
       delete next.hostChain;
       delete next.environmentVariables;
       delete next.protocol;
       delete next.moshEnabled;
       delete next.moshServerPath;
+      delete next.etEnabled;
+      delete next.etPort;
       return next;
     });
   };
@@ -182,24 +199,35 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
   // Proxy helpers
   const updateProxyConfig = useCallback(
     (field: keyof ProxyConfig, value: string | number) => {
-      setForm((prev) => ({
-        ...prev,
-        proxyConfig: {
-          type: prev.proxyConfig?.type || "http",
-          host: prev.proxyConfig?.host || "",
-          port: prev.proxyConfig?.port || 8080,
-          ...prev.proxyConfig,
-          [field]: value,
-        },
-      }));
+      setForm((prev) => {
+        const { proxyProfileId: _proxyProfileId, ...rest } = prev;
+        return {
+          ...rest,
+          proxyConfig: {
+            type: prev.proxyConfig?.type || "http",
+            host: prev.proxyConfig?.host || "",
+            port: prev.proxyConfig?.port || 8080,
+            ...prev.proxyConfig,
+            [field]: value,
+          },
+        };
+      });
     },
     [],
   );
 
   const clearProxyConfig = useCallback(() => {
     setForm((prev) => {
-      const { proxyConfig: _proxyConfig, ...rest } = prev;
+      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
       return rest;
+    });
+  }, []);
+
+  const selectProxyProfile = useCallback((profileId: string | undefined) => {
+    setForm((prev) => {
+      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
+      if (!profileId) return rest;
+      return { ...rest, proxyProfileId: profileId };
     });
   }, []);
 
@@ -284,6 +312,36 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
     if (!parentGroup || groupConfigs.length === 0) return terminalThemeId;
     return resolveGroupTerminalThemeId(resolveGroupDefaults(parentGroup, groupConfigs), terminalThemeId);
   }, [groupConfigs, parentGroup, terminalThemeId]);
+
+  // Effective `legacyAlgorithms` for this group, considering inheritance
+  // from the parent chain. Used by the algorithm-overrides editor so the
+  // seed reflects what hosts in this group would actually advertise — if
+  // the parent group already turned legacy mode on, the editor should
+  // include legacy algorithms in its default list even when this group
+  // itself hasn't set the flag.
+  const inheritedLegacyAlgorithms = useMemo(() => {
+    if (!parentGroup || groupConfigs.length === 0) return false;
+    return !!resolveGroupDefaults(parentGroup, groupConfigs).legacyAlgorithms;
+  }, [groupConfigs, parentGroup]);
+
+  // Same idea for the algorithm-override lists themselves: surface what
+  // this group would inherit from its parent so the editor can warn that
+  // a local Reset falls back to the parent's lists, not NetCatty's
+  // defaults.
+  const inheritedAlgorithmOverrides = useMemo(() => {
+    if (!parentGroup || groupConfigs.length === 0) return undefined;
+    return resolveGroupDefaults(parentGroup, groupConfigs).algorithms;
+  }, [groupConfigs, parentGroup]);
+
+  // And for the per-flag toggles below — if the parent already turned
+  // a flag on, the runtime applies it to hosts in this group via
+  // `applyGroupDefaults`, so the local toggle must reflect that. Without
+  // this, a child group would show the flag as off while connections
+  // still negotiated with it.
+  const inheritedSkipEcdsaHostKey = useMemo(() => {
+    if (!parentGroup || groupConfigs.length === 0) return false;
+    return !!resolveGroupDefaults(parentGroup, groupConfigs).skipEcdsaHostKey;
+  }, [groupConfigs, parentGroup]);
   const effectiveThemeId = form.themeOverride === false
     ? inheritedThemeId
     : (form.theme || inheritedThemeId);
@@ -295,6 +353,19 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
     if (!trimmedName) return;
     if (trimmedName.includes('/') || trimmedName.includes('\\')) {
       setNameError(t("vault.groups.errors.invalidChars"));
+      return;
+    }
+    const normalizedProxyConfig = normalizeManualProxyConfig(form.proxyConfig);
+    if (normalizedProxyConfig && !isCompleteProxyConfig(normalizedProxyConfig)) {
+      toast.error(
+        normalizedProxyConfig.host ? t("proxyProfiles.error.port") : t("hostDetails.proxyPanel.error.required"),
+      );
+      setActiveSubPanel("proxy");
+      return;
+    }
+    if (sshEnabled && hasMissingProxyProfile) {
+      toast.error(t("hostDetails.proxyPanel.missingSaved"));
+      setActiveSubPanel("proxy");
       return;
     }
     setNameError(null);
@@ -319,12 +390,17 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
         ...(form.agentForwarding !== undefined && { agentForwarding: form.agentForwarding }),
         ...(form.startupCommand !== undefined && { startupCommand: form.startupCommand }),
         ...(form.legacyAlgorithms !== undefined && { legacyAlgorithms: form.legacyAlgorithms }),
+        ...(form.skipEcdsaHostKey !== undefined && { skipEcdsaHostKey: form.skipEcdsaHostKey }),
+        ...(form.algorithms !== undefined && { algorithms: form.algorithms }),
         ...(form.backspaceBehavior !== undefined && { backspaceBehavior: form.backspaceBehavior }),
-        ...(form.proxyConfig !== undefined && { proxyConfig: form.proxyConfig }),
+        ...(form.proxyProfileId !== undefined && { proxyProfileId: form.proxyProfileId }),
+        ...(normalizedProxyConfig !== undefined && { proxyConfig: normalizedProxyConfig }),
         ...(form.hostChain !== undefined && { hostChain: form.hostChain }),
         ...(form.environmentVariables !== undefined && { environmentVariables: form.environmentVariables }),
         ...(form.moshEnabled !== undefined && { moshEnabled: form.moshEnabled }),
         ...(form.moshServerPath !== undefined && { moshServerPath: form.moshServerPath }),
+        ...(form.etEnabled !== undefined && { etEnabled: form.etEnabled }),
+        ...(form.etPort !== undefined && { etPort: form.etPort }),
       }),
       // Only include Telnet fields if Telnet section is enabled
       ...(telnetEnabled && {
@@ -360,7 +436,10 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
     return (
       <ProxyPanel
         proxyConfig={form.proxyConfig}
+        proxyProfiles={proxyProfiles}
+        selectedProxyProfileId={form.proxyProfileId}
         onUpdateProxy={updateProxyConfig}
+        onSelectProxyProfile={selectProxyProfile}
         onClearProxy={clearProxyConfig}
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
@@ -464,13 +543,10 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
     >
       <AsidePanelContent>
         {/* General Section */}
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Settings2 size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("vault.groups.details.general")}
-            </p>
-          </div>
+        <HostDetailsSection
+          icon={<Settings2 size={14} className="text-muted-foreground" />}
+          title={t("vault.groups.details.general")}
+        >
           <Input
             placeholder={t("vault.groups.field.name")}
             value={groupName}
@@ -490,440 +566,40 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
             placeholder={t("vault.groups.details.parentGroup")}
             className="w-full"
           />
-        </Card>
+        </HostDetailsSection>
 
-        {/* SSH Section (if enabled) */}
-        {sshEnabled && (
-          <Card className="p-3 space-y-3 bg-card border-border/80 overflow-hidden">
-            <div className="flex items-center gap-2">
-              <TerminalSquare size={14} className="text-muted-foreground" />
-              <p className="text-xs font-semibold flex-1">
-                {t("vault.groups.details.ssh")}
-              </p>
-              <Dropdown>
-                <DropdownTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-6 w-6">
-                    <MoreHorizontal size={14} />
-                  </Button>
-                </DropdownTrigger>
-                <DropdownContent align="end" className="min-w-[160px]">
-                  <button
-                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-secondary rounded-md transition-colors"
-                    onClick={removeSsh}
-                  >
-                    <Trash2 size={14} />
-                    {t("vault.groups.details.removeProtocol")}
-                  </button>
-                </DropdownContent>
-              </Dropdown>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <div className="flex-1 min-w-0 h-10 flex items-center gap-2 bg-secondary/70 border border-border/70 rounded-md px-3">
-                <span className="text-xs text-muted-foreground">SSH on</span>
-                <div className="ml-auto w-1/2 min-w-0 flex items-center gap-2 justify-end">
-                  <Input
-                    type="number"
-                    placeholder="22"
-                    value={form.port ?? ""}
-                    onChange={(e) =>
-                      update("port", e.target.value ? Number(e.target.value) : undefined)
-                    }
-                    className="h-8 flex-1 min-w-0 text-center"
-                  />
-                  <span className="text-xs text-muted-foreground">
-                    {t("hostDetails.port")}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <Input
-              placeholder={t("hostDetails.username.placeholder")}
-              value={form.username || ""}
-              onChange={(e) => update("username", e.target.value || undefined)}
-              className="h-10"
-            />
-
-            <div className="relative">
-              <Input
-                placeholder={t("hostDetails.password.placeholder")}
-                type={showPassword ? "text" : "password"}
-                value={form.password || ""}
-                onChange={(e) => update("password", e.target.value || undefined)}
-                className="h-10 pr-10"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
-
-            {/* Selected credential display */}
-            {form.identityFileId && (
-              <div className="flex items-center gap-2 p-2 rounded-md bg-secondary/50 border border-border/60">
-                {form.authMethod === "certificate" ? (
-                  <Shield size={14} className="text-primary" />
-                ) : (
-                  <Key size={14} className="text-primary" />
-                )}
-                <span className="text-sm flex-1 truncate">
-                  {availableKeys.find((k) => k.id === form.identityFileId)?.label || "Key"}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6"
-                  onClick={() => {
-                    update("identityFileId", undefined);
-                    update("authMethod", undefined);
-                    setSelectedCredentialType(null);
-                  }}
-                >
-                  <X size={12} />
-                </Button>
-              </div>
-            )}
-
-            {/* Local key file paths display */}
-            {!form.identityFileId && form.identityFilePaths && form.identityFilePaths.length > 0 && (
-              <div className="space-y-1">
-                {form.identityFilePaths.map((keyPath, idx) => (
-                  <div key={idx} className="flex items-center gap-2 h-8 px-2 rounded-md bg-secondary/50 border border-border/60" style={{ maxWidth: '100%' }}>
-                    <FileKey size={12} className="text-muted-foreground shrink-0" />
-                    <span className="text-xs font-mono truncate" style={{ maxWidth: '320px' }}>{keyPath}</span>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-5 w-5 shrink-0"
-                      onClick={() => {
-                        const paths = (form.identityFilePaths || []).filter((_, i) => i !== idx);
-                        update("identityFilePaths", paths.length > 0 ? paths : undefined);
-                        if (paths.length === 0) update("authMethod", undefined);
-                      }}
-                    >
-                      <X size={10} />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Credential type selection with inline popover - hidden when credential is selected */}
-            {!form.identityFileId &&
-              !selectedCredentialType && (
-                <Popover
-                  open={credentialPopoverOpen}
-                  onOpenChange={setCredentialPopoverOpen}
-                >
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors py-1"
-                    >
-                      <Plus size={12} />
-                      <span>{t("hostDetails.credential.keyCertificate")}</span>
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    className="w-[200px] p-1"
-                    align="start"
-                    sideOffset={4}
-                  >
-                    <div className="space-y-0.5">
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("key");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <Key size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.key")}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("certificate");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <Shield size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.certificate")}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("localKeyFile");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <FileKey size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.localKeyFile")}
-                        </span>
-                      </button>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              )}
-
-            {/* Key selection combobox - appears after selecting "Key" type */}
-            {selectedCredentialType === "key" &&
-              !form.identityFileId && (
-                <div className="flex items-center gap-1">
-                  <Combobox
-                    options={keysByCategory.key.map((k) => ({
-                      value: k.id,
-                      label: k.label,
-                      sublabel: `${k.type}${k.keySize ? ` ${k.keySize}` : ""}`,
-                      icon: <Key size={14} className="text-muted-foreground" />,
-                    }))}
-                    value={form.identityFileId}
-                    onValueChange={(val) => {
-                      update("identityFileId", val);
-                      update("authMethod", "key");
-                      setSelectedCredentialType(null);
-                    }}
-                    placeholder={t("hostDetails.keys.search")}
-                    emptyText={t("hostDetails.keys.empty")}
-                    icon={<Key size={14} className="text-muted-foreground" />}
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSelectedCredentialType(null)}
-                  >
-                    <X size={14} />
-                  </Button>
-                </div>
-              )}
-
-            {/* Certificate selection combobox - appears after selecting "Certificate" type */}
-            {selectedCredentialType === "certificate" &&
-              !form.identityFileId && (
-                <div className="flex items-center gap-1">
-                  <Combobox
-                    options={keysByCategory.certificate.map((k) => ({
-                      value: k.id,
-                      label: k.label,
-                      icon: (
-                        <Shield size={14} className="text-muted-foreground" />
-                      ),
-                    }))}
-                    value={form.identityFileId}
-                    onValueChange={(val) => {
-                      update("identityFileId", val);
-                      update("authMethod", "certificate");
-                      setSelectedCredentialType(null);
-                    }}
-                    placeholder={t("hostDetails.certs.search")}
-                    emptyText={t("hostDetails.certs.empty")}
-                    icon={
-                      <Shield size={14} className="text-muted-foreground" />
-                    }
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSelectedCredentialType(null)}
-                  >
-                    <X size={14} />
-                  </Button>
-                </div>
-              )}
-
-            {/* Local key file path input - appears after selecting "Local Key File" type */}
-            {!form.identityFileId && selectedCredentialType === "localKeyFile" && (
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-1 w-full">
-                  <input
-                    type="text"
-                    className="flex-1 w-0 h-8 px-2 text-xs font-mono bg-background border border-border/60 rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
-                    placeholder={t("hostDetails.credential.localKeyFilePlaceholder")}
-                    value={newKeyFilePath}
-                    onChange={(e) => setNewKeyFilePath(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && newKeyFilePath.trim()) {
-                        e.preventDefault();
-                        const paths = [...(form.identityFilePaths || []), newKeyFilePath.trim()];
-                        update("identityFilePaths", paths);
-                        update("identityFileId", undefined);
-                        update("authMethod", "key");
-                        setNewKeyFilePath("");
-                      }
-                    }}
-                  />
-                  <Button
-                    variant="secondary"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    title={t("hostDetails.credential.browseKeyFile")}
-                    onClick={async () => {
-                      const bridge = (window as unknown as { netcatty?: NetcattyBridge }).netcatty;
-                      if (!bridge?.selectFile) return;
-                      const filePath = await bridge.selectFile(
-                        "Select SSH Private Key",
-                        undefined,
-                        [{ name: "All Files", extensions: ["*"] }]
-                      );
-                      if (filePath) {
-                        const paths = [...(form.identityFilePaths || []), filePath];
-                        update("identityFilePaths", paths);
-                        update("identityFileId", undefined);
-                        update("authMethod", "key");
-                      }
-                    }}
-                  >
-                    <FolderOpen size={14} />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSelectedCredentialType(null)}
-                  >
-                    <X size={14} />
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            <ToggleRow
-              label={t("hostDetails.agentForwarding")}
-              enabled={!!form.agentForwarding}
-              onToggle={() => update("agentForwarding", !form.agentForwarding)}
-            />
-
-            {/* Startup Command */}
-            <Input
-              placeholder={t("hostDetails.startupCommand.placeholder")}
-              value={form.startupCommand || ""}
-              onChange={(e) => update("startupCommand", e.target.value || undefined)}
-              className="h-10"
-            />
-
-            {/* Legacy Algorithms */}
-            <ToggleRow
-              label={t("hostDetails.legacyAlgorithms")}
-              enabled={!!form.legacyAlgorithms}
-              onToggle={() => update("legacyAlgorithms", !form.legacyAlgorithms)}
-            />
-
-            {/* Backspace behavior */}
-            <div className="flex items-center justify-between">
-              <p className="text-xs text-muted-foreground">{t("hostDetails.backspaceBehavior")}</p>
-              <select
-                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                value={form.backspaceBehavior ?? ""}
-                onChange={(e) => update("backspaceBehavior", e.target.value || undefined)}
-              >
-                <option value="">{t("hostDetails.backspaceBehavior.default")}</option>
-                <option value="ctrl-h">^H (0x08)</option>
-              </select>
-            </div>
-
-            {/* Proxy */}
-            <button
-              type="button"
-              className="w-full flex items-center justify-between p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer"
-              onClick={() => setActiveSubPanel("proxy")}
-            >
-              <div className="flex items-center gap-2">
-                <Globe size={14} className="text-muted-foreground" />
-                <span className="text-sm">{t("hostDetails.proxy")}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                {form.proxyConfig?.host && (
-                  <Badge variant="secondary" className="text-xs">
-                    {form.proxyConfig.type?.toUpperCase()} {form.proxyConfig.host}:{form.proxyConfig.port}
-                  </Badge>
-                )}
-                <ChevronRight size={14} className="text-muted-foreground" />
-              </div>
-            </button>
-
-            {/* Host Chaining */}
-            <button
-              type="button"
-              className="w-full flex items-center justify-between p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer"
-              onClick={() => setActiveSubPanel("chain")}
-            >
-              <div className="flex items-center gap-2">
-                <Link2 size={14} className="text-muted-foreground" />
-                <span className="text-sm">{t("hostDetails.jumpHosts")}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                {chainedHosts.length > 0 && (
-                  <Badge variant="secondary" className="text-xs">
-                    {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
-                  </Badge>
-                )}
-                <ChevronRight size={14} className="text-muted-foreground" />
-              </div>
-            </button>
-
-            {/* Environment Variables */}
-            <button
-              type="button"
-              className="w-full flex items-center justify-between p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer"
-              onClick={() => setActiveSubPanel("env-vars")}
-            >
-              <div className="flex items-center gap-2">
-                <Variable size={14} className="text-muted-foreground" />
-                <span className="text-sm">{t("hostDetails.envVars")}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                {(form.environmentVariables?.length || 0) > 0 && (
-                  <Badge variant="secondary" className="text-xs">
-                    {form.environmentVariables!.length}
-                  </Badge>
-                )}
-                <ChevronRight size={14} className="text-muted-foreground" />
-              </div>
-            </button>
-
-            {/* Mosh */}
-            <ToggleRow
-              label="Mosh"
-              enabled={!!form.moshEnabled}
-              onToggle={() => update("moshEnabled", !form.moshEnabled)}
-            />
-            {form.moshEnabled && (
-              <Input
-                placeholder={t("hostDetails.moshServerPath") || "mosh-server path"}
-                value={form.moshServerPath || ""}
-                onChange={(e) => update("moshServerPath", e.target.value || undefined)}
-                className="h-10"
-              />
-            )}
-          </Card>
-        )}
+        <GroupSshSettingsSection
+          sshEnabled={sshEnabled}
+          t={t}
+          removeSsh={removeSsh}
+          form={form}
+          update={update}
+          showPassword={showPassword}
+          setShowPassword={setShowPassword}
+          availableKeys={availableKeys}
+          setSelectedCredentialType={setSelectedCredentialType}
+          selectedCredentialType={selectedCredentialType}
+          credentialPopoverOpen={credentialPopoverOpen}
+          setCredentialPopoverOpen={setCredentialPopoverOpen}
+          keysByCategory={keysByCategory}
+          newKeyFilePath={newKeyFilePath}
+          setNewKeyFilePath={setNewKeyFilePath}
+          inheritedLegacyAlgorithms={inheritedLegacyAlgorithms}
+          inheritedSkipEcdsaHostKey={inheritedSkipEcdsaHostKey}
+          showAlgorithmOverrides={showAlgorithmOverrides}
+          setShowAlgorithmOverrides={setShowAlgorithmOverrides}
+          inheritedAlgorithmOverrides={inheritedAlgorithmOverrides}
+          proxySummaryLabel={proxySummaryLabel}
+          setActiveSubPanel={setActiveSubPanel}
+          chainedHosts={chainedHosts}
+        />
 
         {/* Telnet Section (if enabled) */}
         {telnetEnabled && (
-          <Card className="p-3 space-y-3 bg-card border-border/80">
-            <div className="flex items-center gap-2">
-              <Globe size={14} className="text-muted-foreground" />
-              <p className="text-xs font-semibold flex-1">
-                {t("vault.groups.details.telnet")}
-              </p>
+          <HostDetailsSection
+            icon={<Globe size={14} className="text-muted-foreground" />}
+            title={t("vault.groups.details.telnet")}
+            action={
               <Dropdown>
                 <DropdownTrigger asChild>
                   <Button variant="ghost" size="icon" className="h-6 w-6">
@@ -940,7 +616,8 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
                   </button>
                 </DropdownContent>
               </Dropdown>
-            </div>
+            }
+          >
 
             <div className="flex items-center gap-2">
               <div className="flex-1 min-w-0 h-10 flex items-center gap-2 bg-secondary/70 border border-border/70 rounded-md px-3">
@@ -984,34 +661,28 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
                 {showTelnetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
-          </Card>
+          </HostDetailsSection>
         )}
 
         {/* Charset & Appearance — only when at least one protocol is added */}
         {(sshEnabled || telnetEnabled) && (<>
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Globe size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("vault.groups.details.advanced")}
-            </p>
-          </div>
+        <HostDetailsSection
+          icon={<Globe size={14} className="text-muted-foreground" />}
+          title={t("vault.groups.details.advanced")}
+        >
           <Input
             placeholder="UTF-8"
             value={form.charset || ""}
             onChange={(e) => update("charset", e.target.value || undefined)}
             className="h-10"
           />
-        </Card>
+        </HostDetailsSection>
 
         {/* Appearance Section */}
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Palette size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("vault.groups.details.appearance")}
-            </p>
-          </div>
+        <HostDetailsSection
+          icon={<Palette size={14} className="text-muted-foreground" />}
+          title={t("vault.groups.details.appearance")}
+        >
 
           <button
             type="button"
@@ -1088,21 +759,23 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
           )}
 
           {/* Font Size */}
-          <Input
-            type="number"
-            placeholder={String(terminalFontSize)}
-            value={form.fontSize ?? ""}
-            onChange={(e) => {
-              const val = e.target.value ? parseInt(e.target.value) : undefined;
-              setForm((prev) => ({
-                ...prev,
-                fontSize: val,
-                fontSizeOverride: val !== undefined ? true : undefined,
-              }));
-            }}
-            className="h-10"
-          />
-        </Card>
+          <HostDetailsSettingRow label="Font Size">
+            <Input
+              type="number"
+              placeholder={String(terminalFontSize)}
+              value={form.fontSize ?? ""}
+              onChange={(e) => {
+                const val = e.target.value ? parseInt(e.target.value) : undefined;
+                setForm((prev) => ({
+                  ...prev,
+                  fontSize: val,
+                  fontSizeOverride: val !== undefined ? true : undefined,
+                }));
+              }}
+              className="h-8 w-24 text-center"
+            />
+          </HostDetailsSettingRow>
+        </HostDetailsSection>
         </>)}
 
         {/* Add Protocol Button — always at the bottom */}
@@ -1136,31 +809,6 @@ const GroupDetailsPanel: React.FC<GroupDetailsPanelProps> = ({
         )}
       </AsidePanelContent>
     </AsidePanel>
-  );
-};
-
-// --- Internal Components ---
-
-interface ToggleRowProps {
-  label: string;
-  enabled: boolean;
-  onToggle: () => void;
-}
-
-const ToggleRow: React.FC<ToggleRowProps> = ({ label, enabled, onToggle }) => {
-  const { t } = useI18n();
-  return (
-    <div className="flex items-center justify-between h-10 px-3 rounded-md border border-border/70 bg-secondary/70">
-      <span className="text-sm">{label}</span>
-      <Button
-        variant={enabled ? "secondary" : "ghost"}
-        size="sm"
-        className={cn("h-8 min-w-[72px]", enabled && "bg-primary/20")}
-        onClick={onToggle}
-      >
-        {enabled ? t("common.enabled") : t("common.disabled")}
-      </Button>
-    </div>
   );
 };
 

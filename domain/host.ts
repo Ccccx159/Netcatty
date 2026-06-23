@@ -1,4 +1,36 @@
-import { Host } from './models';
+import { Host, TerminalSettings } from './models';
+import { sanitizeHostIconFields } from './hostIcon';
+import { migrateDeprecatedFontOverride } from '../infrastructure/config/fonts';
+
+export type HostLabelRenameResult =
+  | { ok: true; changed: true; hosts: Host[] }
+  | { ok: true; changed: false; reason: 'unchanged' | 'missing'; hosts: Host[] }
+  | { ok: false; changed: false; reason: 'required'; hosts: Host[] };
+
+export function applyHostLabelRename(
+  hosts: Host[],
+  hostId: string,
+  rawLabel: string,
+): HostLabelRenameResult {
+  const nextLabel = rawLabel.trim();
+  if (!nextLabel) {
+    return { ok: false, changed: false, reason: 'required', hosts };
+  }
+
+  let found = false;
+  let changed = false;
+  const nextHosts = hosts.map((host) => {
+    if (host.id !== hostId) return host;
+    found = true;
+    if (host.label === nextLabel) return host;
+    changed = true;
+    return { ...host, label: nextLabel };
+  });
+
+  if (!found) return { ok: true, changed: false, reason: 'missing', hosts };
+  if (!changed) return { ok: true, changed: false, reason: 'unchanged', hosts };
+  return { ok: true, changed: true, hosts: nextHosts };
+}
 
 export const LINUX_DISTRO_OPTIONS = [
   'linux',
@@ -15,6 +47,8 @@ export const LINUX_DISTRO_OPTIONS = [
   'almalinux',
   'oracle',
   'kali',
+  'alinux',
+  'openeuler',
 ] as const;
 
 /**
@@ -33,6 +67,7 @@ export const NETWORK_DEVICE_OPTIONS = [
   'fortinet',
   'paloalto',
   'zyxel',
+  'ruijie',
 ] as const;
 
 export type NetworkDeviceVendor = typeof NETWORK_DEVICE_OPTIONS[number];
@@ -53,6 +88,13 @@ export const normalizeDistroId = (value?: string) => {
   if (v.includes('almalinux')) return 'almalinux';
   if (v.includes('oracle')) return 'oracle';
   if (v.includes('kali')) return 'kali';
+  if (v.includes('openeuler') || v.includes('open euler')) return 'openeuler';
+  // Alibaba Cloud Linux: os-release ID is `alinux` (older branding: Aliyun
+  // Linux / `aliyun`). Must come before the generic `linux` fallback because
+  // 'alinux'.includes('linux') is true and would otherwise resolve to 'linux'.
+  if (v.includes('alinux') || v.includes('aliyun') || v.includes('alibaba cloud')) {
+    return 'alinux';
+  }
   // Network device vendor IDs may arrive here after detection — preserve them.
   if ((NETWORK_DEVICE_OPTIONS as readonly string[]).includes(v)) return v;
   if (v === 'linux' || v.includes('linux')) return 'linux';
@@ -77,7 +119,7 @@ export const normalizeDistroId = (value?: string) => {
  * plain `OpenSSH_*` with no distinct vendor marker.
  */
 export const detectVendorFromSshVersion = (softwareVersion?: string): '' | NetworkDeviceVendor => {
-  const s = (softwareVersion || '').trim();
+  const s = (softwareVersion || '').trim().replace(/^SSH-(?:2\.0|1\.99)-/i, '');
   if (!s) return '';
 
   // Cisco family — IOS, IOS XA, Wireless LAN Controller
@@ -96,6 +138,7 @@ export const detectVendorFromSshVersion = (softwareVersion?: string): '' | Netwo
   if (/^NetScreen\b/.test(s)) return 'juniper';
 
   // Huawei VRP and related products
+  if (s === '-') return 'huawei';
   if (/^HUAWEI[-_]/i.test(s)) return 'huawei';
   if (/^VRP-/i.test(s)) return 'huawei';
 
@@ -116,6 +159,9 @@ export const detectVendorFromSshVersion = (softwareVersion?: string): '' | Netwo
   // ZyXEL ZyWALL
   if (/^Zyxel\s*SSH/i.test(s)) return 'zyxel';
 
+  // Ruijie RGOS
+  if (/^RGOS_SSH\b/i.test(s)) return 'ruijie';
+
   return '';
 };
 
@@ -133,6 +179,24 @@ export const classifyDistroId = (distroId?: string): DeviceClass => {
   if ((LINUX_DISTRO_OPTIONS as readonly string[]).includes(v)) return 'linux-like';
   return 'other';
 };
+
+/**
+ * Decide whether it is safe to run the post-connect `pwd` probe that
+ * discovers the session's working directory. The probe opens an extra exec
+ * channel running a POSIX-shell script; strict network-device CLIs such as
+ * Huawei VRP respond by closing the whole SSH session (#1043), so it must be
+ * skipped for them.
+ *
+ * `isNetworkDevice` covers hosts we already classified (a reconnect, or an
+ * explicit `deviceType: 'network'`). On a brand-new host that field is not
+ * populated yet, so we also inspect the SSH server identification banner —
+ * captured for free at handshake — which identifies most vendors directly.
+ */
+export const shouldProbeSessionCwd = (opts: {
+  isNetworkDevice: boolean;
+  remoteSshVersion?: string;
+}): boolean =>
+  !opts.isNetworkDevice && !detectVendorFromSshVersion(opts.remoteSshVersion);
 
 export const getEffectiveHostDistro = (
   host?: Pick<Host, 'distro' | 'manualDistro' | 'distroMode'> | null,
@@ -153,6 +217,106 @@ export const formatHostPort = (hostname: string, port?: number | null): string =
   return `${display}:${port}`;
 };
 
+export const resolveTelnetUsername = (
+  host: Pick<Host, 'telnetUsername' | 'username'>,
+): string | undefined =>
+  host.telnetUsername !== undefined
+    ? host.telnetUsername.trim()
+    : host.username?.trim();
+
+export const resolveTelnetPassword = (
+  host: Pick<Host, 'telnetPassword' | 'password'>,
+): string | undefined =>
+  host.telnetPassword !== undefined
+    ? host.telnetPassword
+    : host.password;
+
+export const resolveTelnetPort = (
+  host: Pick<Host, 'protocol' | 'telnetPort' | 'port'>,
+): number => {
+  if (host.telnetPort !== undefined && host.telnetPort !== null) return host.telnetPort;
+  if (host.protocol === 'telnet' && host.port !== undefined && host.port !== null) {
+    return host.port;
+  }
+  return 23;
+};
+
+export const normalizePrimaryTelnetState = (host: Host): Host =>
+  host.protocol === 'telnet' && !host.telnetEnabled
+    ? { ...host, telnetEnabled: true }
+    : host;
+
+export const migrateHostsFromLegacyLineTimestamps = (
+  hosts: Host[],
+  legacyEnabled: boolean,
+): Host[] => {
+  if (!legacyEnabled) return hosts;
+  let changed = false;
+  const migrated = hosts.map((host) => {
+    if (host.showLineTimestamps !== undefined) return host;
+    changed = true;
+    return { ...host, showLineTimestamps: true };
+  });
+  return changed ? migrated : hosts;
+};
+
+export const preserveConcurrentHostLineTimestampUpdate = ({
+  draft,
+  openedHost,
+  latestHost,
+}: {
+  draft: Host;
+  openedHost?: Host | null;
+  latestHost?: Host | null;
+}): Host => {
+  if (!openedHost || !latestHost) return draft;
+  if (draft.id !== openedHost.id || draft.id !== latestHost.id) return draft;
+  if (draft.showLineTimestamps !== openedHost.showLineTimestamps) return draft;
+  if (latestHost.showLineTimestamps === openedHost.showLineTimestamps) return draft;
+  return { ...draft, showLineTimestamps: latestHost.showLineTimestamps };
+};
+
+export const upsertHostById = (hosts: Host[], host: Host): Host[] => {
+  const hostExists = hosts.some((entry) => entry.id === host.id);
+  return hostExists
+    ? hosts.map((entry) => (entry.id === host.id ? host : entry))
+    : [...hosts, host];
+};
+
+export interface ResolvedKeepalive {
+  interval: number; // Seconds; 0 = disabled
+  countMax: number; // Unanswered keepalives before declaring dead
+  source: 'host' | 'global';
+}
+
+/**
+ * Decide which SSH keepalive values to apply to a connection. A host can opt
+ * into its own values via `keepaliveOverride === true` — useful when a
+ * specific device (older router / switch / NOKIA / ALCATEL SSH stack) doesn't
+ * reply to keepalive@openssh.com and the global aggressive setting would
+ * cause the session to be declared dead after a handful of unanswered probes.
+ * When the override is off (the default), the host inherits the global
+ * TerminalSettings values which are tuned for cloud / NAT'd hosts.
+ *
+ * Each field falls back independently: a host can override only the interval
+ * while still inheriting the global countMax, and vice versa.
+ */
+export const resolveHostKeepalive = (
+  host: Pick<Host, 'keepaliveOverride' | 'keepaliveInterval' | 'keepaliveCountMax'>,
+  globalSettings: Pick<TerminalSettings, 'keepaliveInterval' | 'keepaliveCountMax'>,
+): ResolvedKeepalive => {
+  const globalInterval = globalSettings.keepaliveInterval;
+  const globalCountMax = globalSettings.keepaliveCountMax;
+  if (host.keepaliveOverride !== true) {
+    return { interval: globalInterval, countMax: globalCountMax, source: 'global' };
+  }
+  return {
+    interval: host.keepaliveInterval ?? globalInterval,
+    countMax: host.keepaliveCountMax ?? globalCountMax,
+    source: 'host',
+  };
+};
+
 export const sanitizeHost = (host: Host): Host => {
   const cleanHostname = (host.hostname || '').split(/\s+/)[0];
   const cleanDistro = normalizeDistroId(host.distro);
@@ -163,11 +327,21 @@ export const sanitizeHost = (host: Host): Host => {
       : host.distroMode === 'auto'
         ? 'auto'
         : undefined;
+  const cleanHostIcon = sanitizeHostIconFields(host);
+  const migrated = migrateDeprecatedFontOverride(host);
+  const cleanNotes = host.notes?.trim() || undefined;
   return {
-    ...host,
+    ...migrated,
     hostname: cleanHostname,
     distro: cleanDistro,
     distroMode: cleanDistroMode,
     manualDistro: cleanManualDistro || undefined,
+    iconMode: undefined,
+    iconId: undefined,
+    iconColorMode: undefined,
+    iconColor: undefined,
+    iconColorCustom: undefined,
+    ...cleanHostIcon,
+    notes: cleanNotes,
   };
 };

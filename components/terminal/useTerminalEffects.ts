@@ -1,0 +1,1141 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps */
+import { useRef } from 'react';
+import { resolveFontWeightBold } from '../../lib/fontWeightAvailability';
+import { resolveXTermScrollback } from '../../infrastructure/config/xtermPerformance';
+import { shouldInterceptMouseTrackingContextMenu } from './runtime/middleClickBehavior';
+
+type TerminalEffectsContext = Record<string, any>;
+
+type SelectionOverlayPosition = {
+  left: number;
+  top: number;
+} | null;
+
+const areSelectionOverlayPositionsEqual = (
+  a: SelectionOverlayPosition,
+  b: SelectionOverlayPosition,
+): boolean => {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.left === b.left && a.top === b.top;
+};
+
+export function resolveSelectionOverlayPosition(term: any, container: HTMLElement | null): SelectionOverlayPosition {
+  if (!container || !term?.getSelectionPosition || !term.getSelection()) return null;
+
+  const range = term.getSelectionPosition();
+  if (!range) return null;
+
+  const start = range.start;
+  const end = range.end;
+  const startsBeforeEnd =
+    start.y < end.y
+    || (start.y === end.y && start.x <= end.x);
+  const top = startsBeforeEnd ? start : end;
+  const bottom = startsBeforeEnd ? end : start;
+  const viewportY = term.buffer?.active?.viewportY ?? 0;
+  const row = top.y - viewportY;
+  const rows = Math.max(1, term.rows ?? 1);
+  const cols = Math.max(1, term.cols ?? 1);
+
+  if (row < 0 || row >= rows) return null;
+
+  const screen = container.querySelector<HTMLElement>(".xterm-screen") ?? container;
+  const screenRect = screen.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const cellWidth = screen.clientWidth / cols;
+  const cellHeight = screen.clientHeight / rows;
+  const spansRows = top.y !== bottom.y;
+  const rightCol = spansRows ? cols : Math.max(top.x, bottom.x);
+  const containerOffsetLeft = container.offsetLeft ?? 0;
+  const containerOffsetTop = container.offsetTop ?? 0;
+  const selectionRight = containerOffsetLeft + screenRect.left - containerRect.left + Math.min(cols, rightCol) * cellWidth;
+  const selectionTop = containerOffsetTop + screenRect.top - containerRect.top + row * cellHeight;
+
+  return {
+    left: Math.max(140, Math.min(selectionRight + 8, container.clientWidth - 8)),
+    top: Math.max(36, Math.min(selectionTop - 8, container.clientHeight - 8)),
+  };
+}
+
+export function useTerminalEffects(ctx: TerminalEffectsContext) {
+  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, captureTerminalLogData, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, host, hotkeySchemeRef, identities, inWorkspace, isBootActiveRef, isBroadcastEnabledRef, isComposeBarOpen, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, onBroadcastInputRef, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onSnippetExecutorChange, onTerminalCwdChange, onTerminalFontSizeChange, paneLayoutKey, pendingAuthRef, pendingOutputScrollRef, prepareRestoredReconnect, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setHasSelection, setIsCancelling, setIsDisconnectedDialogDismissed, setIsSearchOpen, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setSelectionOverlayPosition, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, onSnippetShortkeyRef, snippetsRef, status, statusRef, sudoAutofillRef, t, teardown, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalSettings, terminalSettingsRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState } = ctx;
+
+  // Remember the last layout we successfully refit while visible so revisiting
+  // the same workspace tab does not replay expensive force-fit/WebGL recovery.
+  const lastCommittedVisibleLayoutKeyRef = useRef<string | null>(null);
+  const lastWebglRecoveryLayoutKeyRef = useRef<string | null>(null);
+  const hiddenAtRef = useRef<number | null>(null);
+
+
+  useEffect(() => {
+    if (xtermRuntimeRef.current) {
+      // Merge global rules with host-level rules
+      const globalRules = terminalSettings?.keywordHighlightRules ?? [];
+      const hostRules = host?.keywordHighlightRules ?? [];
+
+      const globalEnabled = terminalSettings?.keywordHighlightEnabled ?? false;
+      // Host-level toggle: undefined = inherit global, true/false = explicit override
+      const hostEnabled = host?.keywordHighlightEnabled;
+
+      // Global and host-level highlights are independent:
+      // global toggle controls global rules, host toggle controls host-specific rules
+      const effectiveGlobalEnabled = globalEnabled;
+      const effectiveHostEnabled = hostEnabled ?? false;
+
+      const mergedRules = [
+        ...(effectiveGlobalEnabled ? globalRules : []),
+        ...(effectiveHostEnabled ? hostRules : [])
+      ];
+      const isEnabled = effectiveGlobalEnabled || effectiveHostEnabled;
+
+      xtermRuntimeRef.current.keywordHighlighter.setRules(mergedRules, isEnabled);
+    }
+  }, [
+    terminalSettings?.keywordHighlightEnabled,
+    terminalSettings?.keywordHighlightRules,
+    host?.keywordHighlightEnabled,
+    host?.keywordHighlightRules
+  ]);
+
+
+  // Work around xterm.js WebGL renderer bug: glyphs rendered via the constructor
+  // look different from dynamically-set ones. After text appears on screen (status
+  // becomes "connected"), do a fontWeight round-trip to normalize the rendering.
+  useEffect(() => {
+    if (status !== 'connected' || fontWeightFixupDoneRef.current || !termRef.current) return;
+    fontWeightFixupDoneRef.current = true;
+    const timer = setTimeout(() => {
+      if (!termRef.current) return;
+      // Re-read the current weight at fire time to avoid stale closures
+      const w = termRef.current.options.fontWeight;
+      if (w === 'normal' || w === 400) return;
+      termRef.current.options.fontWeight = 'normal';
+      termRef.current.options.fontWeight = w;
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [status]);
+
+
+  useEffect(() => {
+    clearTerminalCwd();
+    return clearTerminalCwd;
+  }, [clearTerminalCwd, host.id]);
+
+
+  useEffect(() => {
+    if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
+      return;
+    }
+    if (status !== "connected" || !sessionRef.current || knownCwdRef.current) return;
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      const id = sessionRef.current;
+      if (!id) return;
+      try {
+        // The pwd probe opens an extra POSIX-shell exec channel, which strict
+        // network-device CLIs like Huawei VRP answer by closing the whole
+        // session (#1043). Skip it for known network devices; for a brand-new
+        // host (distro not classified yet on the first connect) consult the
+        // SSH banner, which is captured for free at handshake time.
+        const info = await terminalBackend.getSessionRemoteInfo?.(id);
+        if (cancelled || id !== sessionRef.current) return;
+        if (!shouldProbeSessionCwd({ isNetworkDevice, remoteSshVersion: info?.remoteSshVersion })) {
+          return;
+        }
+        const result = await terminalBackend.getSessionPwd(id);
+        if (!cancelled && !terminalCwdTracker.getRendererCwd() && result.success && result.cwd) {
+          const cwd = terminalCwdTracker.setRendererCwd(result.cwd);
+          knownCwdRef.current = cwd;
+          onTerminalCwdChange?.(sessionId, cwd ?? null);
+        }
+      } catch {
+        // Best effort only.
+      }
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [host.protocol, status, terminalBackend, terminalCwdTracker, isNetworkDevice]);
+
+
+  useEffect(() => {
+    if (!isVisible) {
+      autocompleteCloseRef.current?.();
+    }
+  }, [isVisible]);
+
+  useEffect(() => {
+    if (zmodem.active) {
+      zmodemToastedRef.current = false;
+      return;
+    }
+    if (zmodemToastedRef.current) return;
+    if (zmodem.error) {
+      zmodemToastedRef.current = true;
+      toast.error(zmodem.error, 'ZMODEM');
+    } else if (zmodem.filename) {
+      zmodemToastedRef.current = true;
+      toast.success(
+        `${zmodem.transferType === 'upload' ? 'Uploaded' : 'Downloaded'}: ${zmodem.filename}`,
+        'ZMODEM',
+      );
+    }
+  }, [zmodem.active, zmodem.error, zmodem.filename, zmodem.transferType]);
+
+
+  useEffect(() => {
+    if (!error) {
+      lastToastedErrorRef.current = null;
+      return;
+    }
+    if (lastToastedErrorRef.current === error) return;
+    lastToastedErrorRef.current = error;
+    toast.error(error, t("terminal.connectionErrorTitle"));
+  }, [error, t]);
+
+
+  useEffect(() => {
+    const dispose = terminalBackend.onHostKeyVerification?.((request) => {
+      if (request.sessionId !== sessionId) return;
+
+      setPendingHostKeyRequestId(request.requestId);
+      setPendingHostKeyInfo(toHostKeyInfo(request));
+      setNeedsHostKeyVerification(true);
+      setError(null);
+      setProgressLogs((prev) => [
+        ...prev,
+        request.status === 'changed'
+          ? `Host key changed for ${request.hostname}. Waiting for confirmation...`
+          : `Host key verification required for ${request.hostname}.`,
+      ]);
+    });
+
+    return () => {
+      dispose?.();
+    };
+  }, [sessionId, terminalBackend]);
+
+
+  useEffect(() => {
+    let disposed = false;
+    isBootActiveRef.current = true;
+    terminalDataCapturedRef.current = false;
+    connectionLogBufferRef.current.reset();
+    terminalLogSanitizerRef.current = createReplaySafeTerminalLogSanitizer();
+    setError(null);
+    hasConnectedRef.current = false;
+    pendingOutputScrollRef.current = false;
+    setProgressLogs([]);
+    setShowLogs(false);
+    setIsCancelling(false);
+    setIsDisconnectedDialogDismissed(false);
+    promptLineBreakStateRef.current = createPromptLineBreakState();
+
+    const boot = async () => {
+      try {
+        if (disposed || !containerRef.current) return;
+
+        const runtime = createXTermRuntime({
+          container: containerRef.current,
+          host,
+          fontFamilyId,
+          resolvedFontFamily,
+          fontSize,
+          terminalTheme: effectiveTheme,
+          terminalSettingsRef,
+          terminalBackend,
+          sessionRef,
+          hotkeySchemeRef,
+          disableTerminalFontZoomRef,
+          keyBindingsRef,
+          onHotkeyActionRef,
+          onTerminalFontSizeChange,
+          isBroadcastEnabledRef,
+          onBroadcastInputRef,
+          snippetsRef,
+          onSnippetShortkeyRef,
+          sessionId,
+          statusRef,
+          onCommandExecuted,
+          onCommandSubmitted,
+          commandBufferRef,
+          promptLineBreakStateRef,
+          sudoAutofillRef,
+          setIsSearchOpen,
+          // Serial-specific options
+          serialLocalEcho: serialConfig?.localEcho,
+          serialLineMode: serialConfig?.lineMode,
+          serialLineBufferRef,
+          onTerminalLogData: captureTerminalLogData,
+          onCwdChange: (cwd: string) => {
+            terminalCwdTracker.setRendererCwd(cwd);
+            knownCwdRef.current = cwd;
+            onTerminalCwdChange?.(sessionId, cwd);
+          },
+          onOsc52ReadRequest: handleOsc52ReadRequest,
+          // Autocomplete integration
+          onAutocompleteKeyEvent: (e: KeyboardEvent) => autocompleteKeyEventRef.current?.(e) ?? true,
+          onAutocompleteInput: (data: string) => autocompleteInputRef.current?.(data),
+          terminalContextActionsRef,
+          isRestoringSelectionRef,
+          // Defer WebGL context creation for panes that mount hidden (e.g. the
+          // background tabs of a batch connect) until they first become visible.
+          initiallyVisible: isVisible,
+        });
+
+        if (disposed) {
+          runtime.dispose();
+          return;
+        }
+
+        xtermRuntimeRef.current = runtime;
+        termRef.current = runtime.term;
+        fitAddonRef.current = runtime.fitAddon;
+        serializeAddonRef.current = runtime.serializeAddon;
+        searchAddonRef.current = runtime.searchAddon;
+        // xterm boots asynchronously; ResizeObserver may have already run without
+        // fitAddon and will not re-attach until isVisible/isResizing changes.
+        setTimeout(() => {
+          if (disposed) return;
+          safeFit({ force: true, requireVisible: true });
+        }, 0);
+
+        // Apply merged keyword highlight rules immediately after runtime creation
+        // This fixes a timing issue where the useEffect for keyword highlighting
+        // runs before the runtime is created, causing host-level rules to be missed
+        const globalRules = terminalSettingsRef.current?.keywordHighlightRules ?? [];
+        const hostRules = host?.keywordHighlightRules ?? [];
+        const globalEnabled = terminalSettingsRef.current?.keywordHighlightEnabled ?? false;
+        const hostEnabled = host?.keywordHighlightEnabled;
+        const effectiveGlobalEnabled = globalEnabled;
+        const effectiveHostEnabled = hostEnabled ?? false;
+        const mergedRules = [
+          ...(effectiveGlobalEnabled ? globalRules : []),
+          ...(effectiveHostEnabled ? hostRules : [])
+        ];
+        const isEnabled = effectiveGlobalEnabled || effectiveHostEnabled;
+        runtime.keywordHighlighter.setRules(mergedRules, isEnabled);
+
+        const term = runtime.term;
+        const restoredReconnect = restoreState === "restored-disconnected";
+        if (restoredReconnect) {
+          prepareRestoredReconnect?.();
+        }
+        const setBackendConnectingStatus = () => {
+          if (restoredReconnect) {
+            updateStatus("connecting");
+          } else {
+            setStatus("connecting");
+          }
+        };
+
+        if (!shouldStartTerminalBackend()) {
+          isBootActiveRef.current = false;
+          return;
+        }
+
+        if (host.protocol === "serial") {
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing serial connection..."]);
+          await sessionStarters.startSerial(term);
+          if (disposed) return;
+        } else if (host.protocol === "local" || host.hostname === "localhost") {
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing local shell..."]);
+          await sessionStarters.startLocal(term);
+          if (disposed) return;
+        } else if (host.protocol === "telnet") {
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing Telnet connection..."]);
+          await sessionStarters.startTelnet(term);
+          if (disposed) return;
+        } else if (host.moshEnabled) {
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing Mosh connection..."]);
+          await sessionStarters.startMosh(term);
+          if (disposed) return;
+        } else if (host.etEnabled) {
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing EternalTerminal connection..."]);
+          await sessionStarters.startEt(term);
+          if (disposed) return;
+        } else {
+          const resolvedAuth = resolveHostAuth({ host, keys, identities });
+          const hasPassword = !!resolvedAuth.password;
+          const hasKey = !!resolvedAuth.keyId;
+          const hasPendingAuth = pendingAuthRef.current;
+
+          if (
+            !hasPassword &&
+            !hasKey &&
+            !hasPendingAuth &&
+            !resolvedAuth.username
+          ) {
+            auth.setNeedsAuth(true);
+            setStatus("disconnected");
+            return;
+          }
+
+          setBackendConnectingStatus();
+          setProgressLogs(["Initializing secure channel..."]);
+          await sessionStarters.startSSH(term);
+          if (disposed) return;
+        }
+      } catch (err) {
+        if (disposed) return;
+        logger.error("Failed to initialize terminal", err);
+        setError(err instanceof Error ? err.message : String(err));
+        updateStatus("disconnected");
+      }
+    };
+
+    boot();
+
+    return () => {
+      disposed = true;
+      isBootActiveRef.current = false;
+      if (!terminalDataCapturedRef.current && serializeAddonRef.current) {
+        try {
+          const terminalData = serializeAddonRef.current.serialize();
+          logger.info("[Terminal] Capturing data on unmount", { sessionId, dataLength: terminalData.length });
+          handleTerminalDataCaptureOnce(sessionId, terminalData);
+        } catch (err) {
+          logger.warn("Failed to serialize terminal data on unmount:", err);
+        }
+      }
+      teardown();
+    };
+     
+  }, [handleTerminalDataCaptureOnce, host.id, sessionId]);
+
+
+  // Connection timeline and timeout visuals
+  useEffect(() => {
+    if (status !== "connecting" || auth.needsAuth) return;
+
+    // Local terminal and serial connections don't need timeout/progress UI
+    if (isLocalConnection || isSerialConnection) return;
+
+    setTimeLeft(CONNECTION_TIMEOUT / 1000);
+    const countdown = setInterval(() => {
+      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+
+    const timeout = setTimeout(() => {
+      setError("Connection timed out. Please try again.");
+      updateStatus("disconnected");
+      setProgressLogs((prev) => [...prev, "Connection timed out."]);
+    }, CONNECTION_TIMEOUT);
+
+    setProgressValue(5);
+    const prog = setInterval(() => {
+      setProgressValue((prev) => {
+        if (prev >= 95) return prev;
+        const remaining = 95 - prev;
+        const increment = Math.max(1, remaining * 0.15);
+        return Math.min(95, prev + increment);
+      });
+    }, 200);
+
+    return () => {
+      clearInterval(countdown);
+      clearTimeout(timeout);
+      clearInterval(prog);
+    };
+     
+  }, [status, auth.needsAuth, host.protocol, host.hostname]);
+
+
+  useEffect(() => {
+    if (status === "connecting") {
+      setIsDisconnectedDialogDismissed(false);
+    }
+  }, [status]);
+
+
+  // Sync xterm theme before browser paint and force the renderer to catch up so
+  // split panes do not visibly repaint one after another.
+  useLayoutEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = {
+      ...effectiveTheme.colors,
+      selectionBackground: effectiveTheme.colors.selection,
+      scrollbarSliderBackground: effectiveTheme.colors.foreground + '33',
+      scrollbarSliderHoverBackground: effectiveTheme.colors.foreground + '66',
+      scrollbarSliderActiveBackground: effectiveTheme.colors.foreground + '80',
+    };
+    forceSyncRenderAfterResize(term);
+  }, [effectiveTheme]);
+
+
+  // Keep font-size sync separate from terminalSettings so unrelated setting
+  // updates (or focus/layout re-renders) do not reset a wheel/Ctrl zoom that
+  // has not yet propagated into React props.
+  useEffect(() => {
+    if (!termRef.current) return;
+    termRef.current.options.fontSize = effectiveFontSize;
+    xtermRuntimeRef.current?.clearTextureAtlas();
+    if (isVisibleRef.current) {
+      setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+    } else {
+      lastFittedSizeRef.current = null;
+    }
+  }, [effectiveFontSize]);
+
+  useEffect(() => {
+    if (!termRef.current) return;
+    termRef.current.options.fontFamily = resolvedFontFamily;
+
+    if (terminalSettings) {
+      applyUserCursorPreference(termRef.current, terminalSettings);
+      termRef.current.options.scrollback = resolveXTermScrollback(terminalSettings.scrollback);
+      termRef.current.options.fontWeight = effectiveFontWeight as
+        | 100
+        | 200
+        | 300
+        | 400
+        | 500
+        | 600
+        | 700
+        | 800
+        | 900;
+      const resolvedFontWeightBold = resolveFontWeightBold({
+        fontFamilyCss: termRef.current?.options.fontFamily || "",
+        normalWeight: effectiveFontWeight,
+        desiredBoldWeight: terminalSettings.fontWeightBold,
+        fontSize: effectiveFontSize,
+      });
+
+      termRef.current.options.fontWeightBold = resolvedFontWeightBold as
+        | 100
+        | 200
+        | 300
+        | 400
+        | 500
+        | 600
+        | 700
+        | 800
+        | 900;
+      termRef.current.options.lineHeight = 1 + terminalSettings.linePadding / 10;
+      termRef.current.options.drawBoldTextInBrightColors =
+        terminalSettings.drawBoldInBrightColors;
+      termRef.current.options.minimumContrastRatio =
+        terminalSettings.minimumContrastRatio;
+      termRef.current.options.smoothScrollDuration =
+        terminalSettings.smoothScrolling
+          ? XTERM_PERFORMANCE_CONFIG.rendering.smoothScrollDuration
+          : 0;
+      termRef.current.options.scrollOnUserInput =
+        shouldEnableNativeUserInputAutoScroll(terminalSettings);
+      const altKeyOpts = terminalAltKeyOptions(terminalSettings.altAsMeta);
+      termRef.current.options.macOptionIsMeta = altKeyOpts.macOptionIsMeta;
+      termRef.current.options.altClickMovesCursor = altKeyOpts.altClickMovesCursor;
+      termRef.current.options.wordSeparator = terminalSettings.wordSeparators;
+      termRef.current.options.ignoreBracketedPasteMode = terminalSettings.disableBracketedPaste ?? false;
+    }
+
+    // Changing the font can leave the WebGL renderer drawing stale glyphs from
+    // the old metrics (xterm.js #3280), surfacing as garbled text (issue #1049).
+    // Clear the texture atlas so glyphs re-rasterize with the new font.
+    xtermRuntimeRef.current?.clearTextureAtlas();
+
+    if (isVisibleRef.current) {
+      setTimeout(() => safeFit({ force: true, requireVisible: true }), 50);
+    } else {
+      lastFittedSizeRef.current = null;
+    }
+  }, [effectiveFontSize, effectiveFontWeight, resolvedFontFamily, terminalSettings]);
+
+
+  const runImmediateRefit = (options?: { force?: boolean }) => {
+    const force = options?.force === true;
+    if (force) {
+      lastFittedSizeRef.current = null;
+    }
+    safeFit({ force, requireVisible: true });
+    if (force && typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        safeFit({ force: true, requireVisible: true });
+      });
+    }
+  };
+
+  const layoutRecoveryTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+
+  const clearLayoutRecoveryTimers = () => {
+    for (const timerId of layoutRecoveryTimersRef.current) {
+      clearTimeout(timerId);
+    }
+    layoutRecoveryTimersRef.current = [];
+  };
+
+  // Re-fit after the app returns from the background, macOS fullscreen toggles,
+  // or other layout changes that do not reliably fire window.resize /
+  // ResizeObserver (common after App Nap / GPU context eviction).
+  const scheduleLayoutRecoveryRefit = (delaysMs: number[] = [0, 100, 350]) => {
+    clearLayoutRecoveryTimers();
+    for (const delayMs of delaysMs) {
+      const timerId = setTimeout(() => {
+        layoutRecoveryTimersRef.current = layoutRecoveryTimersRef.current.filter((id) => id !== timerId);
+        if (!isVisibleRef.current) return;
+        runImmediateRefit({ force: true });
+      }, delayMs);
+      layoutRecoveryTimersRef.current.push(timerId);
+    }
+  };
+
+  const shouldRefitImmediatelyOnShow = () => (
+    !inWorkspace || isFocusMode || isFocused
+  );
+
+  const shouldRecoverWebglOnShow = () => shouldRefitImmediatelyOnShow();
+
+  const layoutAlreadyCommitted = () => (
+    lastCommittedVisibleLayoutKeyRef.current === paneLayoutKey
+  );
+
+  const commitVisibleLayout = () => {
+    lastCommittedVisibleLayoutKeyRef.current = paneLayoutKey;
+  };
+
+  // Refit synchronously when a split pane becomes visible or its bounds change.
+  // Tab switches move hidden panes off-screen without resizing xterm; becoming
+  // visible again does not always fire ResizeObserver, leaving a gap below content.
+  // Skip during split-divider drag — refit runs once when isResizing becomes false.
+  // In multi-split workspaces only the focused pane refits on tab switch; other
+  // visible panes defer so N terminals don't block the main thread together.
+  // Revisiting the same layout key (A→B→A) uses a cheap non-force fit only.
+  useLayoutEffect(() => {
+    if (!isVisible || isResizing) return;
+    if (!shouldRefitImmediatelyOnShow()) return;
+
+    if (layoutAlreadyCommitted()) {
+      safeFit({ requireVisible: true });
+      return;
+    }
+
+    commitVisibleLayout();
+    runImmediateRefit({ force: true });
+  }, [isVisible, paneLayoutKey, isResizing, inWorkspace, isFocusMode, isFocused]);
+
+  // Defer refit for non-focused split panes that became visible on a tab switch.
+  useEffect(() => {
+    if (!isVisible || isResizing || shouldRefitImmediatelyOnShow()) return;
+    if (layoutAlreadyCommitted()) return;
+
+    let cancelled = false;
+    const runDeferred = () => {
+      if (cancelled || !isVisibleRef.current) return;
+      if (lastCommittedVisibleLayoutKeyRef.current === paneLayoutKey) return;
+      safeFit({ requireVisible: true });
+      commitVisibleLayout();
+    };
+
+    if (typeof requestIdleCallback === 'function') {
+      const idleId = requestIdleCallback(runDeferred, { timeout: 250 });
+      return () => {
+        cancelled = true;
+        cancelIdleCallback(idleId);
+      };
+    }
+
+    const timerId = setTimeout(runDeferred, 120);
+    return () => {
+      cancelled = true;
+      clearTimeout(timerId);
+    };
+  }, [isVisible, paneLayoutKey, isResizing, inWorkspace, isFocusMode, isFocused]);
+
+  useLayoutEffect(() => {
+    if (isVisible) return;
+    if (hiddenAtRef.current === null) {
+      hiddenAtRef.current = Date.now();
+    }
+  }, [isVisible]);
+
+  useEffect(() => {
+    if (!isVisible || !shouldRecoverWebglOnShow()) return;
+
+    const hiddenMs = hiddenAtRef.current
+      ? Date.now() - hiddenAtRef.current
+      : Number.POSITIVE_INFINITY;
+    hiddenAtRef.current = null;
+
+    if (
+      lastWebglRecoveryLayoutKeyRef.current === paneLayoutKey
+      && hiddenMs < 3000
+    ) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      lastWebglRecoveryLayoutKeyRef.current = paneLayoutKey;
+      // A pane that mounted hidden deferred its WebGL renderer; create it now
+      // that it's visible (no-op if already active or WebGL is disabled).
+      xtermRuntimeRef.current?.ensureWebglRenderer();
+      // Recover the WebGL renderer now that this tab is visible again. Hidden
+      // panes stay mounted off-screen (visibility:hidden) so each keeps a live
+      // WebGL context; creating another terminal's context — or the GPU dropping
+      // a non-composited off-screen canvas — can leave this terminal's drawing
+      // buffer corrupted ("花屏", issue #1063). Because a hidden pane keeps its
+      // dimensions, becoming visible triggers no resize and therefore no redraw,
+      // so the corruption persists until the user resizes the window. Force the
+      // same recovery a resize performs: clear the texture atlas (no-op on the
+      // DOM renderer) and synchronously repaint every row.
+      xtermRuntimeRef.current?.clearTextureAtlas();
+      runImmediateRefit({ force: true });
+      const visibleTerm = termRef.current;
+      if (visibleTerm) forceSyncRenderAfterResize(visibleTerm);
+      if (pendingOutputScrollRef.current) {
+        termRef.current?.scrollToBottom();
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(() => {
+            termRef.current?.scrollToBottom();
+          });
+        }
+        pendingOutputScrollRef.current = false;
+      }
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [isVisible, paneLayoutKey, inWorkspace, isFocusMode, isFocused]);
+
+
+  useEffect(() => {
+    let cancelled = false;
+    const waitForFonts = async () => {
+      try {
+        const fontFaceSet = document.fonts as FontFaceSet | undefined;
+        if (!fontFaceSet?.ready) return;
+        await fontFaceSet.ready;
+        if (cancelled) return;
+
+        // Ensure bundled Nerd Font icon fallbacks are loaded at the terminal's
+        // cell size. Shell prompts can arrive before these faces finish loading
+        // on cold start (Linux), leaving Powerline glyphs cached as tofu (#1363).
+        try {
+          await fontFaceSet.load(`${effectiveFontSize}px "Symbols Nerd Font Mono"`);
+        } catch (err) {
+          logger.warn("Nerd Font preload failed", err);
+        }
+        if (cancelled) return;
+
+        const term = termRef.current as {
+          cols: number;
+          rows: number;
+          renderer?: { remeasureFont?: () => void };
+        } | null;
+        const fitAddon = fitAddonRef.current;
+        try {
+          term?.renderer?.remeasureFont?.();
+        } catch (err) {
+          logger.warn("Font remeasure failed", err);
+        }
+
+        // remeasureFont does not invalidate cells rasterized before fonts were ready.
+        xtermRuntimeRef.current?.clearTextureAtlas();
+        const visibleTerm = termRef.current;
+        if (visibleTerm) {
+          forceSyncRenderAfterResize(visibleTerm);
+        }
+
+        try {
+          fitAddon?.fit();
+        } catch (err) {
+          logger.warn("Fit after fonts ready failed", err);
+        }
+
+        if (terminalSettings && termRef.current) {
+          const resolvedBold = resolveFontWeightBold({
+            fontFamilyCss: termRef.current.options?.fontFamily || "",
+            normalWeight: effectiveFontWeight,
+            desiredBoldWeight: terminalSettings.fontWeightBold,
+            fontSize: effectiveFontSize,
+          });
+          termRef.current.options.fontWeightBold = resolvedBold as
+            | 100
+            | 200
+            | 300
+            | 400
+            | 500
+            | 600
+            | 700
+            | 800
+            | 900;
+        }
+
+        const id = sessionRef.current;
+        if (id && term) {
+          try {
+            resizeSession(id, term.cols, term.rows);
+          } catch (err) {
+            logger.warn("Resize session after fonts ready failed", err);
+          }
+        }
+      } catch (err) {
+        logger.warn("Waiting for fonts failed", err);
+      }
+    };
+
+    waitForFonts();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveFontSize, effectiveFontWeight, resizeSession, terminalSettings]);
+
+
+  useEffect(() => {
+    if (!isVisible || !containerRef.current) return;
+
+    let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const observer = new ResizeObserver(() => {
+      if (deferTerminalResizeRef?.current || !isVisibleRef.current) return;
+      if (!fitAddonRef.current) return;
+      if (resizeTimeout) {
+        clearTimeout(resizeTimeout);
+      }
+      resizeTimeout = setTimeout(() => {
+        safeFit({ requireVisible: true });
+      }, 250);
+    });
+
+    observer.observe(containerRef.current);
+    return () => {
+      if (resizeTimeout) clearTimeout(resizeTimeout);
+      observer.disconnect();
+    };
+  }, [isVisible, isResizing]);
+
+  useLayoutEffect(() => {
+    if (isResizing) {
+      prevIsResizingRef.current = true;
+      return;
+    }
+    if (!prevIsResizingRef.current || !isVisible) {
+      prevIsResizingRef.current = isResizing;
+      return;
+    }
+    prevIsResizingRef.current = isResizing;
+    lastFittedSizeRef.current = null;
+    safeFit({ force: true, requireVisible: true });
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        safeFit({ force: true, requireVisible: true });
+        const term = termRef.current;
+        if (term) forceSyncRenderAfterResize(term);
+      });
+    }
+  }, [isResizing, isVisible]);
+
+
+  useEffect(() => {
+    if (!isVisible || !fitAddonRef.current) return;
+    // Fit twice: once after initial layout (100ms) and again after layout settles
+    // (350ms) to handle race conditions during split operations where the container
+    // dimensions may not be final on the first pass.
+    const timer1 = setTimeout(() => {
+      safeFit({ requireVisible: true });
+    }, 100);
+    const timer2 = setTimeout(() => {
+      safeFit({ force: true, requireVisible: true });
+    }, 350);
+    return () => { clearTimeout(timer1); clearTimeout(timer2); };
+  }, [inWorkspace, isVisible]);
+
+
+  // When search bar opens/closes, re-fit terminal and maintain scroll position
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || !fitAddonRef.current) return;
+    const buffer = term.buffer.active;
+    const wasAtBottom = buffer.viewportY >= buffer.baseY;
+    const prevViewportY = buffer.viewportY;
+    const timer = setTimeout(() => {
+      safeFit({ force: true, requireVisible: true });
+      requestAnimationFrame(() => {
+        if (wasAtBottom) {
+          term.scrollToBottom();
+        } else {
+          term.scrollToLine(prevViewportY);
+        }
+      });
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [isSearchOpen]);
+
+  // When compose bar opens/closes, re-fit terminal and maintain scroll position
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term || !fitAddonRef.current) return;
+    const buffer = term.buffer.active;
+    const wasAtBottom = buffer.viewportY >= buffer.baseY;
+    const prevViewportY = buffer.viewportY;
+    const timer = setTimeout(() => {
+      safeFit({ force: true, requireVisible: true });
+      requestAnimationFrame(() => {
+        safeFit({ force: true, requireVisible: true });
+        if (wasAtBottom) {
+          term.scrollToBottom();
+        } else {
+          term.scrollToLine(prevViewportY);
+        }
+      });
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [isComposeBarOpen]);
+
+
+  useEffect(() => {
+    const shouldAutoFocus = isVisible && termRef.current && (!inWorkspace || isFocusMode);
+    if (shouldAutoFocus) {
+      const timer = setTimeout(() => {
+        termRef.current?.focus();
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [isVisible, inWorkspace, isFocusMode]);
+
+
+  useEffect(() => {
+    if (isFocused && termRef.current && isVisible) {
+      const timer = setTimeout(() => {
+        termRef.current?.focus();
+      }, 10);
+      return () => clearTimeout(timer);
+    }
+  }, [isFocused, isVisible, sessionId]);
+
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+
+    let overlayRafId: number | null = null;
+    let copyTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastHasSelection: boolean | null = null;
+    let lastOverlayPosition: SelectionOverlayPosition = null;
+    const requestFrame = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 0) as unknown as number;
+    const cancelFrame = typeof cancelAnimationFrame === "function"
+      ? cancelAnimationFrame
+      : (id: number) => clearTimeout(id);
+
+    const publishSelectionOverlayPosition = () => {
+      overlayRafId = null;
+      const nextPosition = resolveSelectionOverlayPosition(term, containerRef.current);
+      if (areSelectionOverlayPositionsEqual(lastOverlayPosition, nextPosition)) return;
+      lastOverlayPosition = nextPosition;
+      setSelectionOverlayPosition?.(nextPosition);
+    };
+
+    const scheduleSelectionOverlayPosition = () => {
+      if (overlayRafId !== null) return;
+      overlayRafId = requestFrame(publishSelectionOverlayPosition);
+    };
+
+    const onSelectionChange = () => {
+      const selection = term.getSelection();
+      const hasText = !!selection && selection.length > 0;
+      if (lastHasSelection !== hasText) {
+        lastHasSelection = hasText;
+        setHasSelection(hasText);
+      }
+      scheduleSelectionOverlayPosition();
+
+      if (copyTimer) {
+        clearTimeout(copyTimer);
+        copyTimer = null;
+      }
+
+      if (hasText && terminalSettings?.copyOnSelect && !isRestoringSelectionRef.current) {
+        copyTimer = setTimeout(() => {
+          navigator.clipboard.writeText(selection).catch((err) => {
+            logger.warn("Copy on select failed:", err);
+          });
+        }, 80);
+      }
+    };
+
+    const selectionDisposable = term.onSelectionChange(onSelectionChange);
+    const scrollDisposable = term.onScroll?.(scheduleSelectionOverlayPosition);
+    const resizeDisposable = term.onResize?.(scheduleSelectionOverlayPosition);
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(scheduleSelectionOverlayPosition);
+    if (containerRef.current) {
+      resizeObserver?.observe(containerRef.current);
+    }
+    scheduleSelectionOverlayPosition();
+    return () => {
+      if (overlayRafId !== null) {
+        cancelFrame(overlayRafId);
+      }
+      if (copyTimer) {
+        clearTimeout(copyTimer);
+      }
+      selectionDisposable.dispose();
+      scrollDisposable?.dispose();
+      resizeDisposable?.dispose();
+      resizeObserver?.disconnect();
+    };
+  }, [terminalSettings?.copyOnSelect, isSearchOpen, isVisible, isResizing]);
+
+
+  // Track whether the terminal application has enabled mouse tracking
+  // (e.g. tmux with `set -g mouse on`, vim with `set mouse=a`).
+  // When mouse tracking is active, disable Netcatty's context menu to avoid
+  // conflicting with the application's own mouse handling.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+
+    const disposable = term.onWriteParsed(() => {
+      const tracking = term.modes.mouseTrackingMode !== 'none';
+      if (tracking !== mouseTrackingRef.current) {
+        mouseTrackingRef.current = tracking;
+        setHasMouseTracking(tracking);
+      }
+    });
+
+    // Set initial state
+    const initial = term.modes.mouseTrackingMode !== 'none';
+    mouseTrackingRef.current = initial;
+    setHasMouseTracking(initial);
+
+    return () => disposable.dispose();
+  }, [sessionId]);
+
+
+  // Prevent xterm.js's built-in rightClickHandler and right-button mouseup
+  // from interfering with tmux/vim popup menus when mouse tracking is active.
+  // - contextmenu: xterm.js calls textarea.select() which steals focus
+  // - mouseup (button 2): tmux interprets the right-button release as a
+  //   dismiss action, closing the popup menu immediately after it appears
+  // Both are intercepted at the capture phase before xterm.js's own listeners.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const handleContextMenuCapture = (e: MouseEvent) => {
+      if (!shouldInterceptMouseTrackingContextMenu({
+        event: e,
+        mouseTracking: mouseTrackingRef.current,
+        status: statusRef.current,
+      })) {
+        return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation();
+
+      // stopImmediatePropagation blocks the event from reaching React's
+      // bubble-phase root listener, so the onContextMenu handler in
+      // TerminalContextMenu (which dispatches paste / select-word) never
+      // fires inside a mouse-tracking TUI. Without dispatching the user's
+      // chosen action here, right-click paste silently stops working in
+      // opencode, tmux with `mouse on`, vim with `set mouse=a`, etc. (#941).
+      // Middle-click still works because its auxclick listener lives in
+      // createXTermRuntime and isn't gated by mouseTracking.
+      const behavior = terminalSettingsRef.current?.rightClickBehavior;
+      if (behavior === 'paste') {
+        void terminalContextActionsRef.current?.onPaste?.();
+      } else if (behavior === 'select-word') {
+        terminalContextActionsRef.current?.onSelectWord?.();
+      }
+      // 'context-menu' is intentionally not handled — Radix opens the
+      // menu via its own pointerdown listener, which our capture handler
+      // does not intercept.
+    };
+
+    const handleMouseUpCapture = (e: MouseEvent) => {
+      if (e.button === 2 && mouseTrackingRef.current && statusRef.current === 'connected') {
+        e.stopImmediatePropagation();
+      }
+    };
+
+    el.addEventListener('contextmenu', handleContextMenuCapture, true);
+    el.addEventListener('mouseup', handleMouseUpCapture, true);
+    return () => {
+      el.removeEventListener('contextmenu', handleContextMenuCapture, true);
+      el.removeEventListener('mouseup', handleMouseUpCapture, true);
+    };
+  }, [sessionId]);
+
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    let resizeTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const handler = () => {
+      if (!isVisibleRef.current) return;
+      if (resizeTimeout) {
+        clearTimeout(resizeTimeout);
+      }
+      resizeTimeout = setTimeout(() => {
+        safeFit({ requireVisible: true });
+      }, 250);
+    };
+
+    window.addEventListener("resize", handler);
+    return () => {
+      if (resizeTimeout) clearTimeout(resizeTimeout);
+      window.removeEventListener("resize", handler);
+    };
+  }, [isVisible]);
+
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    // App resume / refocus only needs a GPU+fit recovery on the active pane;
+    // non-focused split panes already refit when focused (see shouldRefitImmediatelyOnShow).
+    const shouldRecoverOnAppResume = () => (
+      !inWorkspace || isFocusMode || isFocused
+    );
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!shouldRecoverOnAppResume()) return;
+      scheduleLayoutRecoveryRefit();
+    };
+
+    const handleWindowFocus = () => {
+      if (!shouldRecoverOnAppResume()) return;
+      scheduleLayoutRecoveryRefit();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleWindowFocus);
+
+    // Fullscreen changes layout for every visible pane.
+    const unsubscribeFullscreen = terminalBackend.onWindowFullScreenChanged?.((isFullscreen) => {
+      scheduleLayoutRecoveryRefit(isFullscreen ? [0, 150, 400] : [0, 100, 300]);
+    });
+
+    return () => {
+      clearLayoutRecoveryTimers();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleWindowFocus);
+      unsubscribeFullscreen?.();
+    };
+  }, [isVisible, inWorkspace, isFocusMode, isFocused, terminalBackend]);
+
+
+  // Only register the snippet executor once the terminal session is ready.
+  // Before that, TerminalLayer falls back to raw writeToSession which is the
+  // correct path for sessions that are still connecting.
+  useEffect(() => {
+    if (status !== "connected") {
+      onSnippetExecutorChange?.(sessionId, null);
+      return;
+    }
+    onSnippetExecutorChange?.(sessionId, executeSnippetCommand);
+    return () => onSnippetExecutorChange?.(sessionId, null);
+  }, [executeSnippetCommand, onSnippetExecutorChange, sessionId, status]);
+}

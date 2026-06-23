@@ -1,4 +1,6 @@
-import React, { useCallback } from "react";
+import React, { memo, useCallback } from "react";
+import { applyCustomCssToDocument } from "../../../lib/customCss";
+import { DebouncedTextarea } from "../DebouncedTextarea";
 import { Check, Monitor, Moon, Palette, Sun } from "lucide-react";
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { DARK_UI_THEMES, LIGHT_UI_THEMES } from "../../../infrastructure/config/uiThemes";
@@ -7,10 +9,9 @@ import { SUPPORTED_UI_LOCALES } from "../../../infrastructure/config/i18n";
 import { cn } from "../../../lib/utils";
 import { SectionHeader, SettingsTabContent, SettingRow, Toggle, Select } from "../settings-ui";
 import { FontSelect } from "../FontSelect";
-import { STORAGE_KEY_SHOW_RECENT_HOSTS } from "../../../infrastructure/config/storageKeys";
-import { useStoredBoolean } from "../../../application/state/useStoredBoolean";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../ui/tooltip";
 
-export default function SettingsAppearanceTab(props: {
+function SettingsAppearanceTab(props: {
   theme: "dark" | "light" | "system";
   setTheme: (theme: "dark" | "light" | "system") => void;
   lightUiThemeId: string;
@@ -27,6 +28,16 @@ export default function SettingsAppearanceTab(props: {
   setUiLanguage: (language: string) => void;
   customCSS: string;
   setCustomCSS: (css: string) => void;
+  showRecentHosts: boolean;
+  setShowRecentHosts: (enabled: boolean) => void;
+  showOnlyUngroupedHostsInRoot: boolean;
+  setShowOnlyUngroupedHostsInRoot: (enabled: boolean) => void;
+  showSftpTab: boolean;
+  setShowSftpTab: (enabled: boolean) => void;
+  showHostTreeSidebar: boolean;
+  setShowHostTreeSidebar: (enabled: boolean) => void;
+  windowOpacity: number;
+  setWindowOpacity: (opacity: number) => void;
 }) {
   const { t } = useI18n();
   const availableUIFonts = useAvailableUIFonts();
@@ -47,12 +58,23 @@ export default function SettingsAppearanceTab(props: {
     setUiLanguage,
     customCSS,
     setCustomCSS,
+    showRecentHosts,
+    setShowRecentHosts,
+    showOnlyUngroupedHostsInRoot,
+    setShowOnlyUngroupedHostsInRoot,
+    showSftpTab,
+    setShowSftpTab,
+    showHostTreeSidebar,
+    setShowHostTreeSidebar,
+    windowOpacity,
+    setWindowOpacity,
   } = props;
 
-  const [showRecentHosts, setShowRecentHosts] = useStoredBoolean(
-    STORAGE_KEY_SHOW_RECENT_HOSTS,
-    true,
-  );
+  const WINDOW_OPACITY_PRESETS = [
+    { label: '100%', value: 1 },
+    { label: '85%', value: 0.85 },
+    { label: '70%', value: 0.7 },
+  ] as const;
 
   const getHslStyle = useCallback((hsl: string) => ({ backgroundColor: `hsl(${hsl})` }), []);
 
@@ -117,20 +139,23 @@ export default function SettingsAppearanceTab(props: {
   ) => (
     <div className="flex flex-wrap gap-2 justify-end">
       {options.map((preset) => (
-        <button
-          key={preset.id}
-          onClick={() => onChange(preset.id)}
-          className={cn(
-            "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm border border-border/70",
-            value === preset.id
-              ? "ring-2 ring-offset-2 ring-foreground scale-110"
-              : "hover:scale-105",
-          )}
-          style={getHslStyle(preset.tokens.background)}
-          title={preset.name}
-        >
-          {value === preset.id && <Check className="text-white drop-shadow-md" size={10} />}
-        </button>
+        <Tooltip key={preset.id}>
+          <TooltipTrigger asChild>
+            <button
+              onClick={() => onChange(preset.id)}
+              className={cn(
+                "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm border border-border/70",
+                value === preset.id
+                  ? "ring-2 ring-offset-2 ring-foreground scale-110"
+                  : "hover:scale-105",
+              )}
+              style={getHslStyle(preset.tokens.background)}
+            >
+              {value === preset.id && <Check className="text-white drop-shadow-md" size={10} />}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{preset.name}</TooltipContent>
+        </Tooltip>
       ))}
     </div>
   );
@@ -160,6 +185,48 @@ export default function SettingsAppearanceTab(props: {
             onChange={(v) => setUiFontFamilyId(v)}
             className="w-48"
           />
+        </SettingRow>
+      </div>
+
+      <SectionHeader title={t("settings.appearance.windowOpacity")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          label={t("settings.appearance.windowOpacity")}
+          description={t("settings.appearance.windowOpacity.desc")}
+        >
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={50}
+                max={100}
+                step={5}
+                value={Math.round(windowOpacity * 100)}
+                onChange={(e) => setWindowOpacity(Number(e.target.value) / 100)}
+                className="w-28 accent-primary"
+              />
+              <span className="text-sm text-muted-foreground w-10 text-right tabular-nums">
+                {Math.round(windowOpacity * 100)}%
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {WINDOW_OPACITY_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => setWindowOpacity(preset.value)}
+                  className={cn(
+                    "px-2.5 py-1 rounded-md text-xs font-medium transition-colors border",
+                    windowOpacity === preset.value
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-muted/50 text-muted-foreground border-border hover:text-foreground",
+                  )}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </SettingRow>
       </div>
 
@@ -207,42 +274,49 @@ export default function SettingsAppearanceTab(props: {
             <div className="text-sm font-medium">{t("settings.appearance.accentColor.custom")}</div>
             <div className="flex flex-wrap gap-2">
               {ACCENT_COLORS.map((c) => (
-                <button
-                  key={c.name}
-                  onClick={() => setCustomAccent(c.value)}
-                  className={cn(
-                    "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm",
-                    customAccent === c.value
-                      ? "ring-2 ring-offset-2 ring-foreground scale-110"
-                      : "hover:scale-105",
-                  )}
-                  style={getHslStyle(c.value)}
-                  title={c.name}
-                >
-                  {customAccent === c.value && <Check className="text-white drop-shadow-md" size={10} />}
-                </button>
+                <Tooltip key={c.name}>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={() => setCustomAccent(c.value)}
+                      className={cn(
+                        "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm",
+                        customAccent === c.value
+                          ? "ring-2 ring-offset-2 ring-foreground scale-110"
+                          : "hover:scale-105",
+                      )}
+                      style={getHslStyle(c.value)}
+                    >
+                      {customAccent === c.value && <Check className="text-white drop-shadow-md" size={10} />}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{c.name}</TooltipContent>
+                </Tooltip>
               ))}
-              <label
-                className={cn(
-                  "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm cursor-pointer",
-                  "bg-gradient-to-br from-pink-500 via-purple-500 to-blue-500",
-                  !ACCENT_COLORS.some((c) => c.value === customAccent)
-                    ? "ring-2 ring-offset-2 ring-foreground scale-110"
-                    : "hover:scale-105",
-                )}
-                title={t("settings.appearance.customColor")}
-              >
-                <input
-                  type="color"
-                  className="sr-only"
-                  onChange={(e) => setCustomAccent(hexToHsl(e.target.value))}
-                />
-                {!ACCENT_COLORS.some((c) => c.value === customAccent) ? (
-                  <Check className="text-white drop-shadow-md" size={10} />
-                ) : (
-                  <Palette size={12} className="text-white drop-shadow-md" />
-                )}
-              </label>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <label
+                    className={cn(
+                      "w-6 h-6 rounded-full flex items-center justify-center transition-all shadow-sm cursor-pointer",
+                      "bg-gradient-to-br from-pink-500 via-purple-500 to-blue-500",
+                      !ACCENT_COLORS.some((c) => c.value === customAccent)
+                        ? "ring-2 ring-offset-2 ring-foreground scale-110"
+                        : "hover:scale-105",
+                    )}
+                  >
+                    <input
+                      type="color"
+                      className="sr-only"
+                      onChange={(e) => setCustomAccent(hexToHsl(e.target.value))}
+                    />
+                    {!ACCENT_COLORS.some((c) => c.value === customAccent) ? (
+                      <Check className="text-white drop-shadow-md" size={10} />
+                    ) : (
+                      <Palette size={12} className="text-white drop-shadow-md" />
+                    )}
+                  </label>
+                </TooltipTrigger>
+                <TooltipContent>{t("settings.appearance.customColor")}</TooltipContent>
+              </Tooltip>
             </div>
           </div>
         )}
@@ -269,6 +343,27 @@ export default function SettingsAppearanceTab(props: {
         >
           <Toggle checked={showRecentHosts} onChange={setShowRecentHosts} />
         </SettingRow>
+        <SettingRow
+          label={t('settings.vault.showOnlyUngroupedHostsInRoot')}
+          description={t('settings.vault.showOnlyUngroupedHostsInRootDesc')}
+        >
+          <Toggle
+            checked={showOnlyUngroupedHostsInRoot}
+            onChange={setShowOnlyUngroupedHostsInRoot}
+          />
+        </SettingRow>
+        <SettingRow
+          label={t('settings.vault.showSftpTab')}
+          description={t('settings.vault.showSftpTabDesc')}
+        >
+          <Toggle checked={showSftpTab} onChange={setShowSftpTab} />
+        </SettingRow>
+        <SettingRow
+          label={t('settings.vault.showHostTreeSidebar')}
+          description={t('settings.vault.showHostTreeSidebarDesc')}
+        >
+          <Toggle checked={showHostTreeSidebar} onChange={setShowHostTreeSidebar} />
+        </SettingRow>
       </div>
 
       <SectionHeader title={t("settings.appearance.customCss")} />
@@ -276,9 +371,10 @@ export default function SettingsAppearanceTab(props: {
         <p className="text-xs text-muted-foreground">
           {t("settings.appearance.customCss.desc")}
         </p>
-        <textarea
+        <DebouncedTextarea
           value={customCSS}
-          onChange={(e) => setCustomCSS(e.target.value)}
+          onCommit={setCustomCSS}
+          onDraftChange={applyCustomCssToDocument}
           placeholder={t("settings.appearance.customCss.placeholder")}
           className="w-full h-32 px-3 py-2 text-xs font-mono bg-muted/50 border border-border rounded-lg resize-y focus:outline-none focus:ring-2 focus:ring-primary/50"
           spellCheck={false}
@@ -287,3 +383,5 @@ export default function SettingsAppearanceTab(props: {
     </SettingsTabContent>
   );
 }
+
+export default memo(SettingsAppearanceTab);

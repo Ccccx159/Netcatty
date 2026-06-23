@@ -1,75 +1,26 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   FileConflict,
-  SftpFileEntry,
+  FileConflictAction,
   SftpFilenameEncoding,
   TransferDirection,
   TransferStatus,
   TransferTask,
 } from "../../../domain/models";
+import {
+  canReplaceSftpConflict,
+  describeSftpExistingKind,
+  describeSftpIncomingKind,
+  getSftpConflictTypeKey,
+} from "../../../domain/sftpConflict";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import { logger } from "../../../lib/logger";
 import { SftpPane } from "./types";
+import { useSftpDirectoryTransferOps } from "./transferDirectoryOps";
+import { useSftpTransferConflictOps } from "./transferConflictOps";
+import { useSftpTransferTaskOps } from "./transferTaskOps";
+import type { TransferResult, UseSftpTransfersParams, UseSftpTransfersResult } from "./useSftpTransfers.types";
 import { getParentPath, joinPath } from "./utils";
-import { localStorageAdapter } from "../../../infrastructure/persistence/localStorageAdapter";
-import { STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY } from "../../../infrastructure/config/storageKeys";
-
-interface UseSftpTransfersParams {
-  getActivePane: (side: "left" | "right") => SftpPane | null;
-  getPaneByConnectionId: (connectionId: string) => SftpPane | null;
-  getTabByConnectionId: (connectionId: string) => { side: "left" | "right"; tabId: string; pane: SftpPane } | null;
-  updateTab: (side: "left" | "right", tabId: string, updater: (pane: SftpPane) => SftpPane) => void;
-  refresh: (side: "left" | "right", options?: { tabId?: string }) => Promise<void>;
-  clearCacheForConnection: (connectionId: string) => void;
-  sftpSessionsRef: React.MutableRefObject<Map<string, string>>;
-  connectionCacheKeyMapRef: React.MutableRefObject<Map<string, string>>;
-  listLocalFiles: (path: string) => Promise<SftpFileEntry[]>;
-  listRemoteFiles: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<SftpFileEntry[]>;
-  handleSessionError: (side: "left" | "right", error: Error) => void;
-}
-
-interface UseSftpTransfersResult {
-  transfers: TransferTask[];
-  conflicts: FileConflict[];
-  activeTransfersCount: number;
-  startTransfer: (
-    sourceFiles: { name: string; isDirectory: boolean }[],
-    sourceSide: "left" | "right",
-    targetSide: "left" | "right",
-    options?: {
-      sourcePane?: SftpPane;
-      sourcePath?: string;
-      sourceConnectionId?: string;
-      targetPath?: string;
-      onTransferComplete?: (result: TransferResult) => void | Promise<void>;
-    },
-  ) => Promise<TransferResult[]>;
-  downloadToLocal: (params: {
-    fileName: string;
-    sourcePath: string;
-    targetPath: string;
-    sftpId: string;
-    connectionId: string;
-    sourceEncoding?: SftpFilenameEncoding;
-    isDirectory: boolean;
-    totalBytes?: number;
-  }) => Promise<TransferStatus>;
-  addExternalUpload: (task: TransferTask) => void;
-  updateExternalUpload: (taskId: string, updates: Partial<TransferTask>) => void;
-  cancelTransfer: (transferId: string) => Promise<void>;
-  isTransferCancelled: (transferId: string) => boolean;
-  retryTransfer: (transferId: string) => Promise<void>;
-  clearCompletedTransfers: () => void;
-  dismissTransfer: (transferId: string) => void;
-  resolveConflict: (conflictId: string, action: "replace" | "skip" | "duplicate") => Promise<void>;
-}
-
-interface TransferResult {
-  id: string;
-  fileName: string;
-  originalFileName?: string;
-  status: TransferStatus;
-}
 
 export const useSftpTransfers = ({
   getActivePane,
@@ -96,6 +47,7 @@ export const useSftpTransfers = ({
   const conflictsRef = useRef(conflicts);
   conflictsRef.current = conflicts;
   const completionHandlersRef = useRef<Map<string, (result: TransferResult) => void | Promise<void>>>(new Map());
+  const conflictDefaultsRef = useRef<Map<string, FileConflictAction>>(new Map());
 
   const clearCancelledTask = useCallback((taskId: string) => {
     cancelledTasksRef.current.delete(taskId);
@@ -122,434 +74,36 @@ export const useSftpTransfers = ({
     [],
   );
 
-  const getEntrySize = useCallback((entry: SftpFileEntry): number => {
-    if (typeof entry.size === "string") {
-      const parsed = parseInt(entry.size, 10);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-    }
-    return typeof entry.size === "number" && entry.size > 0 ? entry.size : 0;
-  }, []);
-
-  const MAX_SYMLINK_DEPTH = 32;
-
-  const estimateDirectoryBytes = useCallback(
-    async (
-      sourcePath: string,
-      sourceSftpId: string | null,
-      sourceIsLocal: boolean,
-      sourceEncoding: SftpFilenameEncoding,
-      rootTaskId: string,
-      symlinkDepth = 0,
-      followSymlinks = false,
-    ): Promise<number> => {
-      const estT0 = performance.now();
-      if (cancelledTasksRef.current.has(rootTaskId)) {
-        throw new Error("Transfer cancelled");
-      }
-
-      const files = sourceIsLocal
-        ? await listLocalFiles(sourcePath)
-        : sourceSftpId
-          ? await listRemoteFiles(sourceSftpId, sourcePath, sourceEncoding)
-          : null;
-
-      if (!files) {
-        throw new Error("No source connection");
-      }
-
-      let totalBytes = 0;
-      const subdirs: { entry: SftpFileEntry; nextDepth: number }[] = [];
-
-      for (const file of files) {
-        if (file.name === ".." || file.name === ".") continue;
-
-        if (file.type === "directory") {
-          subdirs.push({ entry: file, nextDepth: symlinkDepth });
-        } else if (followSymlinks && file.type === "symlink" && file.linkTarget === "directory") {
-          if (symlinkDepth < MAX_SYMLINK_DEPTH) {
-            subdirs.push({ entry: file, nextDepth: symlinkDepth + 1 });
-          }
-          // Skip at max depth — consistent with transferDirectory
-        } else {
-          totalBytes += getEntrySize(file);
-        }
-      }
-
-      if (subdirs.length > 0) {
-        if (cancelledTasksRef.current.has(rootTaskId)) {
-          throw new Error("Transfer cancelled");
-        }
-
-        const subResults = await Promise.all(
-          subdirs.map(({ entry: subdir, nextDepth }) =>
-            estimateDirectoryBytes(
-              joinPath(sourcePath, subdir.name),
-              sourceSftpId,
-              sourceIsLocal,
-              sourceEncoding,
-              rootTaskId,
-              nextDepth,
-              followSymlinks,
-            ),
-          ),
-        );
-        totalBytes += subResults.reduce((sum, size) => sum + size, 0);
-      }
-
-      logger.debug(`[SFTP:perf] estimateDirectoryBytes ${sourcePath} = ${totalBytes} — ${(performance.now() - estT0).toFixed(0)}ms`);
-      return totalBytes;
-    },
-    [getEntrySize, listLocalFiles, listRemoteFiles],
+  const conflictDefaultKey = useCallback(
+    (batchId: string | undefined, isDirectory: boolean, existingType?: "file" | "directory" | "symlink") =>
+      `${batchId ?? "global"}:${getSftpConflictTypeKey(isDirectory, existingType)}`,
+    [],
   );
 
-  const transferFile = async (
-    task: TransferTask,
-    sourceSftpId: string | null,
-    targetSftpId: string | null,
-    sourceIsLocal: boolean,
-    targetIsLocal: boolean,
-    sourceEncoding: SftpFilenameEncoding,
-    targetEncoding: SftpFilenameEncoding,
-    rootTaskId: string, // The original top-level task ID for cancellation checking
-    sameHost?: boolean,
-    onStreamProgress?: (transferred: number, total: number, speed: number) => void,
-  ): Promise<void> => {
-    // Check if task or root task was cancelled before starting
-    if (cancelledTasksRef.current.has(task.id) || cancelledTasksRef.current.has(rootTaskId)) {
-      throw new Error("Transfer cancelled");
-    }
+  const buildReplaceTypeMismatchError = useCallback(
+    (isDirectory: boolean, existingType: "file" | "directory" | "symlink" | undefined, targetPath: string) =>
+      `Cannot replace existing ${describeSftpExistingKind(existingType)} with ${describeSftpIncomingKind(isDirectory)}: ${targetPath}`,
+    [],
+  );
 
-    return new Promise((resolve, reject) => {
-      const options = {
-        transferId: task.id,
-        sourcePath: task.sourcePath,
-        targetPath: task.targetPath,
-        sourceType: sourceIsLocal ? ("local" as const) : ("sftp" as const),
-        targetType: targetIsLocal ? ("local" as const) : ("sftp" as const),
-        sourceSftpId: sourceSftpId || undefined,
-        targetSftpId: targetSftpId || undefined,
-        totalBytes: task.totalBytes || undefined,
-        sourceEncoding: sourceIsLocal ? undefined : sourceEncoding,
-        targetEncoding: targetIsLocal ? undefined : targetEncoding,
-        sameHost: sameHost || undefined,
-      };
+  const { completeCancelledTask, cancelBackendTransfers, markBatchStopped } = useSftpTransferTaskOps({
+    cancelledTasksRef,
+    activeChildIdsRef,
+    transfersRef,
+    completionHandlersRef,
+    setConflicts,
+    setTransfers,
+  });
 
-      let lastProgressUpdate = 0;
-      const onProgress = (
-        transferred: number,
-        total: number,
-        speed: number,
-      ) => {
-        // Bubble up streaming progress to parent (for directory transfers)
-        onStreamProgress?.(transferred, total, speed);
+  const { statTargetPath, getDuplicateTarget, deleteTargetPath } = useSftpTransferConflictOps();
 
-        // Throttle state updates to at most once per 100ms
-        const now = Date.now();
-        if (now - lastProgressUpdate < 100 && transferred < total) return;
-        lastProgressUpdate = now;
-
-        setTransfers((prev) =>
-          prev.map((t) => {
-            if (t.id !== task.id) return t;
-            if (t.status === "cancelled") return t;
-            const normalizedTotal = total > 0 ? total : t.totalBytes;
-            // Clamp to [previous, total] — the backend normalizes progress
-            // but we guard against any non-monotonic edge cases.
-            const normalizedTransferred = Math.max(
-              t.transferredBytes,
-              Math.min(transferred, normalizedTotal > 0 ? normalizedTotal : transferred),
-            );
-            return {
-              ...t,
-              transferredBytes: normalizedTransferred,
-              totalBytes: normalizedTotal,
-              speed: Number.isFinite(speed) && speed > 0 ? speed : 0,
-            };
-          }),
-        );
-      };
-
-      const onComplete = () => {
-        resolve();
-      };
-
-      const onError = (error: string) => {
-        reject(new Error(error));
-      };
-
-      netcattyBridge.require().startStreamTransfer!(
-        options,
-        onProgress,
-        onComplete,
-        onError,
-      ).catch(reject);
-    });
-  };
-
-  const getTransferConcurrency = () => {
-    const stored = localStorageAdapter.readNumber(STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY);
-    return stored != null && stored >= 1 && stored <= 16 ? stored : 4;
-  };
-
-  /** Recursively count all files under a directory (for progress display). */
-  const countDirectoryFiles = async (
-    sourcePath: string,
-    sourceSftpId: string | null,
-    sourceIsLocal: boolean,
-    sourceEncoding: SftpFilenameEncoding,
-    rootTaskId: string,
-    symlinkDepth = 0,
-    followSymlinks = false,
-  ): Promise<number> => {
-    if (cancelledTasksRef.current.has(rootTaskId)) return 0;
-
-    const files = sourceIsLocal
-      ? await listLocalFiles(sourcePath)
-      : sourceSftpId
-        ? await listRemoteFiles(sourceSftpId, sourcePath, sourceEncoding)
-        : null;
-    if (!files) return 0;
-
-    let count = 0;
-    const subdirPromises: Promise<number>[] = [];
-    for (const file of files) {
-      if (file.name === ".." || file.name === ".") continue;
-      if (file.type === "directory") {
-        subdirPromises.push(
-          countDirectoryFiles(joinPath(sourcePath, file.name), sourceSftpId, sourceIsLocal, sourceEncoding, rootTaskId, symlinkDepth, followSymlinks),
-        );
-      } else if (followSymlinks && file.type === "symlink" && file.linkTarget === "directory") {
-        // Only recurse if within depth limit; skip entirely at max depth
-        // (consistent with transferDirectory which also skips these)
-        if (symlinkDepth < MAX_SYMLINK_DEPTH) {
-          subdirPromises.push(
-            countDirectoryFiles(joinPath(sourcePath, file.name), sourceSftpId, sourceIsLocal, sourceEncoding, rootTaskId, symlinkDepth + 1, followSymlinks),
-          );
-        }
-      } else {
-        count++;
-      }
-    }
-    if (subdirPromises.length > 0) {
-      const subCounts = await Promise.all(subdirPromises);
-      count += subCounts.reduce((a, b) => a + b, 0);
-    }
-    return count;
-  };
-
-  /** Returns number of failed child file transfers */
-  const transferDirectory = async (
-    task: TransferTask,
-    sourceSftpId: string | null,
-    targetSftpId: string | null,
-    sourceIsLocal: boolean,
-    targetIsLocal: boolean,
-    sourceEncoding: SftpFilenameEncoding,
-    targetEncoding: SftpFilenameEncoding,
-    rootTaskId: string, // The original top-level task ID for cancellation checking
-    sameHost?: boolean,
-    symlinkDepth = 0,
-    followSymlinks = false, // Only true for downloadToLocal — uploads/copies treat symlinks as files
-  ) => {
-    // Check if task or root task was cancelled before starting
-    if (cancelledTasksRef.current.has(task.id) || cancelledTasksRef.current.has(rootTaskId)) {
-      throw new Error("Transfer cancelled");
-    }
-
-    let totalErrors = 0;
-
-    if (targetIsLocal) {
-      try {
-        await netcattyBridge.get()?.mkdirLocal?.(task.targetPath);
-      } catch (mkdirErr: unknown) {
-        const isEEXIST = mkdirErr instanceof Error && mkdirErr.message.includes("EEXIST");
-        if (!isEEXIST) throw mkdirErr;
-        // EEXIST: verify the existing path is actually a directory, not a file
-        const stat = await netcattyBridge.get()?.statLocal?.(task.targetPath);
-        if (stat && stat.type !== 'directory') {
-          throw new Error(`Target path exists as a file: ${task.targetPath}`);
-        }
-      }
-    } else if (targetSftpId) {
-      await netcattyBridge.get()?.mkdirSftp(targetSftpId, task.targetPath, targetEncoding);
-    }
-
-    let files: SftpFileEntry[];
-    if (sourceIsLocal) {
-      files = await listLocalFiles(task.sourcePath);
-    } else if (sourceSftpId) {
-      files = await listRemoteFiles(sourceSftpId, task.sourcePath, sourceEncoding);
-    } else {
-      throw new Error("No source connection");
-    }
-
-    // Filter both "." and ".." — some SFTP servers include "." in readdir
-    const filtered = files.filter((f) => f.name !== ".." && f.name !== ".");
-    // Separate directories from files.
-    // Symlink directories are only followed when followSymlinks is true
-    // (downloadToLocal). Uploads/copies treat symlinks as regular entries
-    // to preserve existing behavior and avoid expanding symlinked trees.
-    const dirs: SftpFileEntry[] = [];
-    const regularFiles: SftpFileEntry[] = [];
-    for (const f of filtered) {
-      if (f.type === "directory") {
-        dirs.push(f);
-      } else if (followSymlinks && f.type === "symlink" && f.linkTarget === "directory") {
-        if (symlinkDepth < MAX_SYMLINK_DEPTH) {
-          dirs.push(f);
-        } else {
-          // Count as an error so the parent task is marked failed
-          totalErrors++;
-          logger.warn(`[SFTP] Skipping symlink directory at max depth: ${joinPath(task.sourcePath, f.name)}`);
-        }
-      } else {
-        regularFiles.push(f);
-      }
-    }
-
-    // Process subdirectories sequentially to avoid unbounded concurrent SFTP
-    // requests from nested Promise.all + worker pools across the tree.
-    // File-level concurrency within each directory is still governed by
-    // getTransferConcurrency().
-    for (const dir of dirs) {
-      if (cancelledTasksRef.current.has(task.id) || cancelledTasksRef.current.has(rootTaskId)) {
-        throw new Error("Transfer cancelled");
-      }
-
-      const childTask: TransferTask = {
-        ...task,
-        id: crypto.randomUUID(),
-        fileName: dir.name,
-        originalFileName: dir.name,
-        sourcePath: joinPath(task.sourcePath, dir.name),
-        targetPath: joinPath(task.targetPath, dir.name),
-        isDirectory: true,
-        progressMode: "files",
-        parentTaskId: task.id,
-      };
-
-      const isSymlink = dir.type === "symlink";
-      const subdirErrors = await transferDirectory(
-        childTask,
-        sourceSftpId,
-        targetSftpId,
-        sourceIsLocal,
-        targetIsLocal,
-        sourceEncoding,
-        targetEncoding,
-        rootTaskId,
-        sameHost,
-        isSymlink ? symlinkDepth + 1 : symlinkDepth,
-        followSymlinks,
-      );
-      totalErrors += subdirErrors;
-    }
-
-    // Transfer files in parallel with concurrency limit
-    if (regularFiles.length > 0) {
-      let fileIndex = 0;
-      const errors: Error[] = [];
-
-      const worker = async () => {
-        while (fileIndex < regularFiles.length) {
-          if (cancelledTasksRef.current.has(task.id) || cancelledTasksRef.current.has(rootTaskId)) {
-            throw new Error("Transfer cancelled");
-          }
-
-          const idx = fileIndex++;
-          const file = regularFiles[idx];
-          const fileId = crypto.randomUUID();
-          const fileSize = getEntrySize(file);
-
-          // Track child ID outside React state for immediate cancellation visibility
-          if (!activeChildIdsRef.current.has(rootTaskId)) {
-            activeChildIdsRef.current.set(rootTaskId, new Set());
-          }
-          activeChildIdsRef.current.get(rootTaskId)!.add(fileId);
-
-          const childTask: TransferTask = {
-            ...task,
-            id: fileId,
-            fileName: file.name,
-            originalFileName: file.name,
-            sourcePath: joinPath(task.sourcePath, file.name),
-            targetPath: joinPath(task.targetPath, file.name),
-            isDirectory: false,
-            progressMode: "bytes",
-            parentTaskId: rootTaskId,
-            totalBytes: fileSize,
-            // Inherit retryable from parent — downloadToLocal sets retryable: false
-            // because "local" targetConnectionId can't be resolved by retryTransfer
-            retryable: task.retryable,
-          };
-
-          // Register child in transfers array so UI can render it
-          setTransfers((prev) => [...prev, {
-            ...childTask,
-            status: "transferring" as TransferStatus,
-            transferredBytes: 0,
-            speed: 0,
-            startTime: Date.now(),
-          }]);
-
-          try {
-            await transferFile(
-              childTask,
-              sourceSftpId,
-              targetSftpId,
-              sourceIsLocal,
-              targetIsLocal,
-              sourceEncoding,
-              targetEncoding,
-              rootTaskId,
-              sameHost,
-            );
-
-            activeChildIdsRef.current.get(rootTaskId)?.delete(fileId);
-            // Mark child as completed & update parent file count
-            setTransfers((prev) => {
-              const updated = prev.map((t) => {
-                if (t.id === fileId) {
-                  return { ...t, status: "completed" as TransferStatus, endTime: Date.now(), transferredBytes: t.totalBytes };
-                }
-                if (t.id === rootTaskId) {
-                  return { ...t, transferredBytes: t.transferredBytes + 1 };
-                }
-                return t;
-              });
-              return updated;
-            });
-          } catch (err) {
-            activeChildIdsRef.current.get(rootTaskId)?.delete(fileId);
-            // Mark child as failed
-            setTransfers((prev) =>
-              prev.map((t) =>
-                t.id === fileId
-                  ? { ...t, status: "failed" as TransferStatus, error: err instanceof Error ? err.message : String(err) }
-                  : t,
-              ),
-            );
-            if (err instanceof Error && err.message === "Transfer cancelled") throw err;
-            errors.push(err instanceof Error ? err : new Error(String(err)));
-          }
-        }
-      };
-
-      const concurrency = getTransferConcurrency();
-      const workers = Array.from(
-        { length: Math.min(concurrency, regularFiles.length) },
-        () => worker(),
-      );
-      await Promise.all(workers);
-
-      totalErrors += errors.length;
-      if (errors.length > 0) {
-        logger.debug?.("[SFTP] Some files in directory transfer failed", errors);
-      }
-    }
-
-    return totalErrors;
-  };
+  const { estimateDirectoryBytes, transferFile, countDirectoryFiles, transferDirectory } = useSftpDirectoryTransferOps({
+    cancelledTasksRef,
+    activeChildIdsRef,
+    setTransfers,
+    listLocalFiles,
+    listRemoteFiles,
+  });
 
   const processTransfer = async (
     task: TransferTask,
@@ -557,6 +111,10 @@ export const useSftpTransfers = ({
     targetPane: SftpPane,
     targetSide: "left" | "right",
   ): Promise<TransferStatus> => {
+    if (cancelledTasksRef.current.has(task.id)) {
+      return "cancelled";
+    }
+
     const updateTask = (updates: Partial<TransferTask>) => {
       setTransfers((prev) =>
         prev.map((t) => (t.id === task.id ? { ...t, ...updates } : t)),
@@ -676,7 +234,7 @@ export const useSftpTransfers = ({
 
       // Run size discovery and conflict check in parallel
       const conflictCheckPromise = (async (): Promise<FileConflict | null> => {
-        if (task.skipConflictCheck || task.isDirectory || !targetPane.connection) return null;
+        if (task.skipConflictCheck || !targetPane.connection) return null;
 
         const sourceStat: { size: number; mtime: number } | null =
           (task.totalBytes > 0 || task.sourceLastModified)
@@ -684,30 +242,45 @@ export const useSftpTransfers = ({
             : null;
 
         try {
-          let existingStat: { size: number; mtime: number } | null = null;
-
-          if (targetPane.connection.isLocal) {
-            const stat = await netcattyBridge.get()?.statLocal?.(task.targetPath);
-            if (stat) {
-              existingStat = { size: stat.size, mtime: stat.lastModified || Date.now() };
-            }
-          } else if (targetSftpId) {
-            const stat = await netcattyBridge.get()?.statSftp?.(
-              targetSftpId,
-              task.targetPath,
-              targetEncoding,
-            );
-            if (stat) {
-              existingStat = { size: stat.size, mtime: stat.lastModified || Date.now() };
-            }
-          }
+          const existingStat = await statTargetPath(targetPane, targetSftpId, task.targetPath, targetEncoding);
 
           if (existingStat) {
+            const applyToAllCount = task.batchId
+              ? await (async () => {
+                  const candidates = transfersRef.current.filter((candidate) =>
+                    candidate.batchId === task.batchId &&
+                    candidate.isDirectory === task.isDirectory &&
+                    !candidate.parentTaskId &&
+                    candidate.status !== "completed" &&
+                    candidate.status !== "cancelled",
+                  );
+                  const matches = await Promise.all(candidates.map(async (candidate) => {
+                    if (candidate.id === task.id) return true;
+                    try {
+                      const candidateStat = await statTargetPath(
+                        targetPane,
+                        targetSftpId,
+                        candidate.targetPath,
+                        targetEncoding,
+                      );
+                      return candidateStat?.type === existingStat.type;
+                    } catch {
+                      return false;
+                    }
+                  }));
+                  return Math.max(1, matches.filter(Boolean).length);
+                })()
+              : 1;
+
             return {
               transferId: task.id,
+              batchId: task.batchId,
               fileName: task.fileName,
               sourcePath: task.sourcePath,
               targetPath: task.targetPath,
+              isDirectory: task.isDirectory,
+              existingType: existingStat.type,
+              applyToAllCount,
               existingSize: existingStat.size,
               newSize: sourceStat?.size || task.totalBytes || 0,
               existingModified: existingStat.mtime,
@@ -729,6 +302,56 @@ export const useSftpTransfers = ({
       const conflict = await conflictCheckPromise;
 
       if (conflict) {
+        const defaultAction = conflictDefaultsRef.current.get(
+          conflictDefaultKey(task.batchId, task.isDirectory, conflict.existingType),
+        );
+        if (defaultAction) {
+          if (defaultAction === "stop") {
+            await markBatchStopped(task);
+            return "cancelled";
+          }
+
+          if (defaultAction === "skip") {
+            cancelledTasksRef.current.add(task.id);
+            updateTask({ status: "cancelled", endTime: Date.now() });
+            await completeCancelledTask(task);
+            return "cancelled";
+          }
+
+          if (defaultAction === "replace" && !canReplaceSftpConflict(task.isDirectory, conflict.existingType)) {
+            updateTask({
+              status: "failed",
+              endTime: Date.now(),
+              error: buildReplaceTypeMismatchError(task.isDirectory, conflict.existingType, task.targetPath),
+              retryable: false,
+            });
+            return "failed";
+          }
+
+          const duplicateTarget = defaultAction === "duplicate"
+            ? await getDuplicateTarget(task, targetPane, targetSftpId, targetEncoding)
+            : null;
+          const updatedTask: TransferTask = {
+            ...task,
+            ...(duplicateTarget
+              ? {
+                  fileName: duplicateTarget.fileName,
+                  targetPath: duplicateTarget.targetPath,
+                }
+              : null),
+            skipConflictCheck: true,
+            replaceExistingTarget: defaultAction === "replace",
+          };
+          setTransfers((prev) =>
+            prev.map((t) =>
+              t.id === task.id
+                ? { ...updatedTask, status: "pending" as TransferStatus }
+                : t,
+            ),
+          );
+          return processTransfer(updatedTask, sourcePane, targetPane, targetSide);
+        }
+
         setConflicts((prev) => [...prev, conflict]);
         updateTask({
           status: "pending",
@@ -740,6 +363,10 @@ export const useSftpTransfers = ({
       logger.debug(`[SFTP:perf] starting actual transfer — file=${task.fileName} isDir=${task.isDirectory} — ${(performance.now() - t0).toFixed(0)}ms since start`);
 
       let dirPartialFailure = false;
+
+      if (task.replaceExistingTarget) {
+        await deleteTargetPath(task, targetPane, targetSftpId, targetEncoding);
+      }
 
       // Same-host exec-based paths are only safe for UTF-8 compatible encodings.
       // "auto" is allowed here — the backend resolves it to the actual encoding
@@ -814,6 +441,10 @@ export const useSftpTransfers = ({
           task.id, // rootTaskId - this is the top-level task
           sameHost,
         );
+      }
+
+      if (cancelledTasksRef.current.has(task.id)) {
+        throw new Error("Transfer cancelled");
       }
 
       const finalStatus: TransferStatus = dirPartialFailure ? "failed" : "completed";
@@ -940,6 +571,7 @@ export const useSftpTransfers = ({
       const sourcePath = options?.sourcePath ?? sourcePane.connection.currentPath;
       const targetPath = options?.targetPath ?? targetPane.connection.currentPath;
       const sourceConnectionId = options?.sourceConnectionId ?? sourcePane.connection.id;
+      const batchId = crypto.randomUUID();
 
       const newTasks: TransferTask[] = [];
 
@@ -965,6 +597,7 @@ export const useSftpTransfers = ({
 
         newTasks.push({
           id: crypto.randomUUID(),
+          batchId,
           fileName: file.name,
           originalFileName: file.name,
           sourcePath: joinPath(sourcePath, file.name),
@@ -1032,37 +665,10 @@ export const useSftpTransfers = ({
 
       setConflicts((prev) => prev.filter((c) => c.transferId !== transferId));
 
-      if (netcattyBridge.get()?.cancelTransfer) {
-        // Cancel parent and all active child streams at the backend.
-        // Use activeChildIdsRef for immediate visibility (not subject to
-        // React state batching delays like transfersRef).
-        const idsToCancel = [transferId];
-        const trackedChildren = activeChildIdsRef.current.get(transferId);
-        if (trackedChildren) {
-          for (const childId of trackedChildren) {
-            idsToCancel.push(childId);
-            cancelledTasksRef.current.add(childId);
-          }
-        }
-        // Also check rendered state as fallback for transfers started
-        // via other paths (e.g. startTransfer/processTransfer)
-        const currentTransfers = transfersRef.current;
-        for (const t of currentTransfers) {
-          if (t.parentTaskId === transferId && (t.status === "transferring" || t.status === "pending") && !idsToCancel.includes(t.id)) {
-            idsToCancel.push(t.id);
-          }
-        }
-        await Promise.all(
-          idsToCancel.map((id) =>
-            netcattyBridge.get()!.cancelTransfer!(id).catch((err) => {
-              logger.warn("Failed to cancel transfer at backend:", err);
-            }),
-          ),
-        );
-      }
+      await cancelBackendTransfers([transferId]);
 
     },
-    [],
+    [cancelBackendTransfers],
   );
 
   const retryTransfer = useCallback(
@@ -1155,79 +761,157 @@ export const useSftpTransfers = ({
   }, []);
 
   const resolveConflict = useCallback(
-    async (conflictId: string, action: "replace" | "skip" | "duplicate") => {
+    async (conflictId: string, action: FileConflictAction, applyToAll = false) => {
       const conflict = conflictsRef.current.find((c) => c.transferId === conflictId);
       if (!conflict) return;
 
-      setConflicts((prev) => prev.filter((c) => c.transferId !== conflictId));
-
       const task = transfersRef.current.find((t) => t.id === conflictId);
-      if (!task) return;
+      if (!task) {
+        setConflicts((prev) => prev.filter((c) => c.transferId !== conflictId));
+        return;
+      }
+
+      const selectedConflictKey = conflictDefaultKey(conflict.batchId, conflict.isDirectory, conflict.existingType);
+      const affectedConflicts = applyToAll
+        ? conflictsRef.current.filter((candidate) =>
+            conflictDefaultKey(candidate.batchId, candidate.isDirectory, candidate.existingType) === selectedConflictKey,
+          )
+        : [conflict];
+      const affectedConflictIds = new Set(affectedConflicts.map((candidate) => candidate.transferId));
+      const affectedTasks = affectedConflicts
+        .map((candidate) => transfersRef.current.find((transfer) => transfer.id === candidate.transferId))
+        .filter((candidate): candidate is TransferTask => Boolean(candidate));
+      const affectedConflictById = new Map<string, FileConflict>(
+        affectedConflicts.map((candidate): [string, FileConflict] => [candidate.transferId, candidate]),
+      );
+
+      if (applyToAll) {
+        conflictDefaultsRef.current.set(selectedConflictKey, action);
+      }
+
+      setConflicts((prev) => prev.filter((c) => !affectedConflictIds.has(c.transferId)));
+
+      if (affectedTasks.length === 0) {
+        return;
+      }
+
+      if (action === "stop") {
+        await markBatchStopped(task);
+        return;
+      }
 
       if (action === "skip") {
+        for (const affectedTask of affectedTasks) {
+          cancelledTasksRef.current.add(affectedTask.id);
+        }
         setTransfers((prev) =>
-          prev.map((t) =>
-            t.id === conflictId
-              ? { ...t, status: "cancelled" as TransferStatus }
+          prev.map((t) => affectedConflictIds.has(t.id)
+              ? { ...t, status: "cancelled" as TransferStatus, endTime: Date.now() }
               : t,
           ),
         );
-        const completionHandler = completionHandlersRef.current.get(conflictId);
-        if (completionHandler) {
-          try {
-            await completionHandler({
-              id: task.id,
-              fileName: task.fileName,
-              originalFileName: task.originalFileName ?? task.fileName,
-              status: "cancelled",
-            });
-          } finally {
-            completionHandlersRef.current.delete(conflictId);
-          }
+        for (const affectedTask of affectedTasks) {
+          await completeCancelledTask(affectedTask);
         }
         return;
       }
 
-      let updatedTask = { ...task };
+      const updatedTasks: TransferTask[] = [];
+      const blockedReplaceTasks: Array<{ task: TransferTask; conflict: FileConflict }> = [];
 
-      if (action === "duplicate") {
-        const ext = task.fileName.includes(".")
-          ? "." + task.fileName.split(".").pop()
-          : "";
-        const baseName = task.fileName.includes(".")
-          ? task.fileName.slice(0, task.fileName.lastIndexOf("."))
-          : task.fileName;
-        const newName = `${baseName} (copy)${ext}`;
-        const newTargetPath = joinPath(getParentPath(task.targetPath), newName);
-        updatedTask = {
-          ...task,
-          fileName: newName,
-          targetPath: newTargetPath,
-          skipConflictCheck: true,
-        };
-      } else if (action === "replace") {
-        updatedTask = {
-          ...task,
-          skipConflictCheck: true,
-        };
+      for (const affectedTask of affectedTasks) {
+        let updatedTask = { ...affectedTask };
+        const affectedConflict = affectedConflictById.get(affectedTask.id);
+
+        if (action === "duplicate") {
+          const endpoints = resolveTaskEndpoints(affectedTask);
+          if (!endpoints) continue;
+          const targetSftpId = endpoints.targetPane.connection?.isLocal
+            ? null
+            : sftpSessionsRef.current.get(endpoints.targetPane.connection!.id) ?? null;
+          const targetEncoding = endpoints.targetPane.connection?.isLocal
+            ? "auto"
+            : endpoints.targetPane.filenameEncoding || "auto";
+          const duplicateTarget = await getDuplicateTarget(affectedTask, endpoints.targetPane, targetSftpId, targetEncoding);
+          updatedTask = {
+            ...affectedTask,
+            fileName: duplicateTarget.fileName,
+            targetPath: duplicateTarget.targetPath,
+            skipConflictCheck: true,
+          };
+        } else if (action === "replace") {
+          if (
+            affectedConflict &&
+            !canReplaceSftpConflict(affectedTask.isDirectory, affectedConflict.existingType)
+          ) {
+            blockedReplaceTasks.push({ task: affectedTask, conflict: affectedConflict });
+            continue;
+          }
+          updatedTask = {
+            ...affectedTask,
+            skipConflictCheck: true,
+            replaceExistingTarget: true,
+          };
+        } else if (action === "merge") {
+          updatedTask = {
+            ...affectedTask,
+            skipConflictCheck: true,
+            replaceExistingTarget: false,
+          };
+        }
+
+        updatedTasks.push(updatedTask);
       }
 
-      setTransfers((prev) =>
-        prev.map((t) =>
-          t.id === conflictId
-            ? { ...updatedTask, status: "pending" as TransferStatus }
+      if (blockedReplaceTasks.length > 0) {
+        const blockedTaskIds = new Set(blockedReplaceTasks.map(({ task }) => task.id));
+        const blockedErrors = new Map(
+          blockedReplaceTasks.map(({ task, conflict }) => [
+            task.id,
+            buildReplaceTypeMismatchError(task.isDirectory, conflict.existingType, task.targetPath),
+          ]),
+        );
+        setTransfers((prev) =>
+          prev.map((t) => blockedTaskIds.has(t.id)
+            ? {
+                ...t,
+                status: "failed" as TransferStatus,
+                endTime: Date.now(),
+                error: blockedErrors.get(t.id),
+                retryable: false,
+              }
             : t,
-        ),
+          ),
+        );
+      }
+
+      const updatedTaskMap = new Map(updatedTasks.map((updatedTask) => [updatedTask.id, updatedTask]));
+      setTransfers((prev) =>
+        prev.map((t) => {
+          const updatedTask = updatedTaskMap.get(t.id);
+          return updatedTask
+            ? { ...updatedTask, status: "pending" as TransferStatus }
+            : t;
+        }),
       );
 
-      setTimeout(async () => {
-        const endpoints = resolveTaskEndpoints(updatedTask);
-        if (!endpoints) return;
-        await processTransfer(updatedTask, endpoints.sourcePane, endpoints.targetPane, endpoints.targetSide);
-      }, 100);
+      for (const updatedTask of updatedTasks) {
+        setTimeout(async () => {
+          const endpoints = resolveTaskEndpoints(updatedTask);
+          if (!endpoints) return;
+          await processTransfer(updatedTask, endpoints.sourcePane, endpoints.targetPane, endpoints.targetSide);
+        }, 100);
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- processTransfer is defined inline; transfers/conflicts accessed via refs
-    [resolveTaskEndpoints],
+    [
+      completeCancelledTask,
+      conflictDefaultKey,
+      getDuplicateTarget,
+      markBatchStopped,
+      resolveTaskEndpoints,
+      sftpSessionsRef,
+    ],
   );
 
   const activeTransfersCount = useMemo(() => transfers.filter(

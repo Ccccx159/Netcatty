@@ -24,19 +24,26 @@ import {
 } from './ui/dialog';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
-import { Textarea } from './ui/textarea';
+import { SnippetScriptEditor } from './snippets/SnippetScriptEditor';
 
 export interface QuickAddSnippetDialogProps {
   snippets: Snippet[];
   packages: string[];
   onCreateSnippet: (snippet: Snippet) => void;
+  onUpdateSnippet?: (snippet: Snippet) => void;
   onCreatePackage?: (packagePath: string) => void;
+}
+
+export function getQuickAddSnippetInitialCommand(event: Event): string {
+  const detail = (event as CustomEvent<{ command?: unknown }>).detail;
+  return typeof detail?.command === 'string' ? detail.command : '';
 }
 
 export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
   snippets,
   packages,
   onCreateSnippet,
+  onUpdateSnippet,
   onCreatePackage,
 }) => {
   const { t } = useI18n();
@@ -44,20 +51,42 @@ export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
   const [label, setLabel] = useState('');
   const [command, setCommand] = useState('');
   const [packagePath, setPackagePath] = useState('');
+  const [noAutoRun, setNoAutoRun] = useState(false);
+  const [editing, setEditing] = useState<Snippet | null>(null);
   const labelInputRef = useRef<HTMLInputElement>(null);
 
   // Listen for the global "add snippet" request dispatched by the
   // terminal-side ScriptsSidePanel + button. We reset form state on
   // every open so stale input from a previous cancel does not leak.
   useEffect(() => {
-    const handler = () => {
+    const handler = (event: Event) => {
+      setEditing(null);
       setLabel('');
-      setCommand('');
+      setCommand(getQuickAddSnippetInitialCommand(event));
       setPackagePath('');
+      setNoAutoRun(false);
       setOpen(true);
     };
     window.addEventListener('netcatty:snippets:add', handler);
     return () => window.removeEventListener('netcatty:snippets:add', handler);
+  }, []);
+
+  // Sibling event for editing an existing snippet from the ScriptsSidePanel
+  // context menu. Prefills the form and flips the dialog into update mode.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ snippet?: Snippet }>).detail;
+      const snippet = detail?.snippet;
+      if (!snippet) return;
+      setEditing(snippet);
+      setLabel(snippet.label ?? '');
+      setCommand(snippet.command ?? '');
+      setPackagePath(snippet.package ?? '');
+      setNoAutoRun(snippet.noAutoRun ?? false);
+      setOpen(true);
+    };
+    window.addEventListener('netcatty:snippets:edit', handler);
+    return () => window.removeEventListener('netcatty:snippets:edit', handler);
   }, []);
 
   // Auto-focus the label input once the dialog renders, so the user can
@@ -92,16 +121,29 @@ export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
     if (trimmedPackage && !packages.includes(trimmedPackage)) {
       onCreatePackage?.(trimmedPackage);
     }
-    onCreateSnippet({
-      id: crypto.randomUUID(),
-      label: label.trim(),
-      command, // preserve whitespace in multi-line commands
-      tags: [],
-      package: trimmedPackage || '',
-      targets: [],
-    });
+    if (editing && onUpdateSnippet) {
+      // Preserve tags/targets/shortkey/noAutoRun etc. that this lightweight
+      // dialog does not expose — only the three quick-edit fields change.
+      onUpdateSnippet({
+        ...editing,
+        label: label.trim(),
+        command,
+        package: trimmedPackage || '',
+        noAutoRun: noAutoRun || undefined,
+      });
+    } else {
+      onCreateSnippet({
+        id: crypto.randomUUID(),
+        label: label.trim(),
+        command, // preserve whitespace in multi-line commands
+        tags: [],
+        package: trimmedPackage || '',
+        targets: [],
+        noAutoRun: noAutoRun || undefined,
+      });
+    }
     setOpen(false);
-  }, [canSave, packagePath, packages, onCreatePackage, onCreateSnippet, label, command]);
+  }, [canSave, packagePath, packages, onCreatePackage, onCreateSnippet, onUpdateSnippet, editing, label, command, noAutoRun]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -116,15 +158,20 @@ export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-md" onKeyDown={handleKeyDown}>
-        <DialogHeader>
-          <DialogTitle>{t('snippets.panel.newTitle')}</DialogTitle>
+      <DialogContent
+        className="max-w-md max-h-[min(90vh,720px)] flex flex-col overflow-hidden"
+        onKeyDown={handleKeyDown}
+      >
+        <DialogHeader className="shrink-0">
+          <DialogTitle>
+            {t(editing ? 'snippets.panel.editTitle' : 'snippets.panel.newTitle')}
+          </DialogTitle>
           <DialogDescription>
             {t('snippets.empty.desc')}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
           <div className="space-y-1.5">
             <Label htmlFor="quick-add-snippet-label" className="text-xs">
               {t('snippets.field.description')}
@@ -136,22 +183,17 @@ export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
               onChange={(e) => setLabel(e.target.value)}
               placeholder={t('snippets.field.descriptionPlaceholder')}
               className="h-9"
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="quick-add-snippet-command" className="text-xs">
-              {t('snippets.field.scriptRequired')}
-            </Label>
-            <Textarea
-              id="quick-add-snippet-command"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              placeholder="echo hello"
-              className="min-h-[120px] font-mono text-xs"
               spellCheck={false}
             />
           </div>
+
+          <SnippetScriptEditor
+            id="quick-add-snippet-command"
+            label={t('snippets.field.scriptRequired')}
+            value={command}
+            onChange={setCommand}
+            placeholder="echo hello"
+          />
 
           <div className="space-y-1.5">
             <Label className="text-xs flex items-center gap-1.5">
@@ -167,9 +209,19 @@ export const QuickAddSnippetDialog: React.FC<QuickAddSnippetDialogProps> = ({
               createText={t('snippets.field.createPackage')}
             />
           </div>
+
+          <label className="flex items-center gap-2 cursor-pointer px-1">
+            <input
+              type="checkbox"
+              checked={noAutoRun}
+              onChange={(e) => setNoAutoRun(e.target.checked)}
+              className="rounded border-input"
+            />
+            <span className="text-xs text-muted-foreground">{t('snippets.field.noAutoRun')}</span>
+          </label>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0">
           <Button variant="outline" onClick={() => setOpen(false)}>
             {t('common.cancel')}
           </Button>

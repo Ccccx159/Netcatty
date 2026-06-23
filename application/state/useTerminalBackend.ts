@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { netcattyBridge } from "../../infrastructure/services/netcattyBridge";
 
 export const useTerminalBackend = () => {
@@ -10,6 +10,11 @@ export const useTerminalBackend = () => {
   const moshAvailable = useCallback(() => {
     const bridge = netcattyBridge.get();
     return !!bridge?.startMoshSession;
+  }, []);
+
+  const etAvailable = useCallback(() => {
+    const bridge = netcattyBridge.get();
+    return !!bridge?.startEtSession;
   }, []);
 
   const localAvailable = useCallback(() => {
@@ -45,6 +50,12 @@ export const useTerminalBackend = () => {
     return bridge.startMoshSession(options);
   }, []);
 
+  const startEtSession = useCallback(async (options: Parameters<NonNullable<NetcattyBridge["startEtSession"]>>[0]) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.startEtSession) throw new Error("startEtSession unavailable");
+    return bridge.startEtSession(options);
+  }, []);
+
   const startLocalSession = useCallback(async (options: Parameters<NonNullable<NetcattyBridge["startLocalSession"]>>[0]) => {
     const bridge = netcattyBridge.get();
     if (!bridge?.startLocalSession) throw new Error("startLocalSession unavailable");
@@ -63,14 +74,19 @@ export const useTerminalBackend = () => {
     return bridge.execCommand(options);
   }, []);
 
-  const writeToSession = useCallback((sessionId: string, data: string) => {
+  const writeToSession = useCallback((sessionId: string, data: string, options?: { automated?: boolean }) => {
     const bridge = netcattyBridge.get();
-    bridge?.writeToSession?.(sessionId, data);
+    bridge?.writeToSession?.(sessionId, data, options);
   }, []);
 
   const resizeSession = useCallback((sessionId: string, cols: number, rows: number) => {
     const bridge = netcattyBridge.get();
     bridge?.resizeSession?.(sessionId, cols, rows);
+  }, []);
+
+  const setSessionFlowPaused = useCallback((sessionId: string, paused: boolean) => {
+    const bridge = netcattyBridge.get();
+    bridge?.setSessionFlowPaused?.(sessionId, paused);
   }, []);
 
   const closeSession = useCallback((sessionId: string) => {
@@ -96,9 +112,46 @@ export const useTerminalBackend = () => {
     return bridge.onSessionExit(sessionId, cb);
   }, []);
 
+  const onTelnetAutoLoginComplete = useCallback((sessionId: string, cb: (evt: { sessionId: string }) => void) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onTelnetAutoLoginComplete?.(sessionId, cb);
+  }, []);
+
+  const onTelnetAutoLoginCancelled = useCallback((sessionId: string, cb: (evt: { sessionId: string }) => void) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onTelnetAutoLoginCancelled?.(sessionId, cb);
+  }, []);
+
   const onChainProgress = useCallback((cb: (sessionId: string, hop: number, total: number, label: string, status: string, error?: string) => void) => {
     const bridge = netcattyBridge.get();
     return bridge?.onChainProgress?.(cb);
+  }, []);
+
+  const onConnectionReuseFallback = useCallback((cb: (sessionId: string, sourceSessionId?: string) => void) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onConnectionReuseFallback?.(cb);
+  }, []);
+
+  const onWindowFullScreenChanged = useCallback((cb: (isFullscreen: boolean) => void) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onWindowFullScreenChanged?.(cb);
+  }, []);
+
+  const onHostKeyVerification = useCallback((cb: Parameters<NonNullable<NetcattyBridge["onHostKeyVerification"]>>[0]) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onHostKeyVerification?.(cb);
+  }, []);
+
+  const respondHostKeyVerification = useCallback(async (
+    requestId: string,
+    accept: boolean,
+    addToKnownHosts?: boolean,
+  ) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.respondHostKeyVerification) {
+      return { success: false, error: "respondHostKeyVerification unavailable" };
+    }
+    return bridge.respondHostKeyVerification(requestId, accept, addToKnownHosts);
   }, []);
 
   const openExternal = useCallback(async (url: string) => {
@@ -122,10 +175,88 @@ export const useTerminalBackend = () => {
     return bridge.listSerialPorts();
   }, []);
 
-  const getSessionPwd = useCallback(async (sessionId: string) => {
+  const serialYmodemAvailable = useCallback(() => {
+    const bridge = netcattyBridge.get();
+    return !!bridge?.sendSerialYmodem;
+  }, []);
+
+  const serialYmodemReceiveAvailable = useCallback(() => {
+    const bridge = netcattyBridge.get();
+    return !!bridge?.receiveSerialYmodem;
+  }, []);
+
+  const selectFileAvailable = useCallback(() => {
+    const bridge = netcattyBridge.get();
+    return !!bridge?.selectFile;
+  }, []);
+
+  const selectDirectoryAvailable = useCallback(() => {
+    const bridge = netcattyBridge.get();
+    return !!bridge?.selectDirectory;
+  }, []);
+
+  const sendSerialYmodem = useCallback(async (sessionId: string, filePath: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.sendSerialYmodem) return { success: false, error: 'sendSerialYmodem unavailable' };
+    return bridge.sendSerialYmodem(sessionId, filePath);
+  }, []);
+
+  const receiveSerialYmodem = useCallback(async (sessionId: string, destinationDir: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.receiveSerialYmodem) return { success: false, error: 'receiveSerialYmodem unavailable' };
+    return bridge.receiveSerialYmodem(sessionId, destinationDir);
+  }, []);
+
+  const selectFile = useCallback(async (
+    title?: string,
+    defaultPath?: string,
+    filters?: Array<{ name: string; extensions: string[] }>,
+  ) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.selectFile) return null;
+    return bridge.selectFile(title, defaultPath, filters);
+  }, []);
+
+  const selectDirectory = useCallback(async (title?: string, defaultPath?: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.selectDirectory) return null;
+    return bridge.selectDirectory(title, defaultPath);
+  }, []);
+
+  const startZmodemDragDropUpload = useCallback(async (
+    sessionId: string,
+    files: Array<{
+      path?: string;
+      name: string;
+      remoteName: string;
+      data?: ArrayBuffer;
+    }>,
+    uploadCommand?: string,
+  ) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.startZmodemDragDropUpload) {
+      return { success: false, error: "startZmodemDragDropUpload unavailable" };
+    }
+    return bridge.startZmodemDragDropUpload(sessionId, files, uploadCommand);
+  }, []);
+
+  const cancelZmodem = useCallback((sessionId: string, options?: { interrupt?: boolean }) => {
+    const bridge = netcattyBridge.get();
+    bridge?.cancelZmodem?.(sessionId, options);
+  }, []);
+
+  const onZmodemEvent = useCallback((
+    sessionId: string,
+    cb: Parameters<NonNullable<NetcattyBridge["onZmodemEvent"]>>[1],
+  ) => {
+    const bridge = netcattyBridge.get();
+    return bridge?.onZmodemEvent?.(sessionId, cb) ?? (() => {});
+  }, []);
+
+  const getSessionPwd = useCallback(async (sessionId: string, options?: { allowHomeFallback?: boolean }) => {
     const bridge = netcattyBridge.get();
     if (!bridge?.getSessionPwd) return { success: false, error: 'getSessionPwd unavailable' };
-    return bridge.getSessionPwd(sessionId);
+    return bridge.getSessionPwd(sessionId, options);
   }, []);
 
   const getSessionRemoteInfo = useCallback(async (sessionId: string) => {
@@ -150,32 +281,111 @@ export const useTerminalBackend = () => {
     return bridge.getServerStats(sessionId);
   }, []);
 
-  return {
-    backendAvailable,
-    telnetAvailable,
-    moshAvailable,
-    localAvailable,
-    serialAvailable,
-    execAvailable,
-    openExternalAvailable,
-    startSSHSession,
-    startTelnetSession,
-    startMoshSession,
-    startLocalSession,
-    startSerialSession,
-    listSerialPorts,
-    execCommand,
-    getSessionPwd,
-    getSessionRemoteInfo,
-    getSessionDistroInfo,
-    getServerStats,
-    writeToSession,
-    resizeSession,
-    closeSession,
-    setSessionEncoding,
-    onSessionData,
-    onSessionExit,
-    onChainProgress,
-    openExternal,
-  };
+  // Memoize the returned object so its identity is stable across the
+  // hook's lifetime. Each method above is already useCallback([])-stable,
+  // so listing them as deps means useMemo recomputes once and then
+  // caches forever. Without this, every render produced a fresh object
+  // literal — making `terminalBackend` an unstable reference that
+  // forced consumers' useEffects (`}, [..., terminalBackend])`) to
+  // rerun on every parent render and forced lint to flag any deeper
+  // property dep (`}, [terminalBackend.onHostKeyVerification])`) it
+  // couldn't statically prove safe.
+  return useMemo(
+    () => ({
+      backendAvailable,
+      telnetAvailable,
+      moshAvailable,
+      etAvailable,
+      localAvailable,
+      serialAvailable,
+      execAvailable,
+      openExternalAvailable,
+      startSSHSession,
+      startTelnetSession,
+      startMoshSession,
+      startEtSession,
+      startLocalSession,
+      startSerialSession,
+      listSerialPorts,
+      serialYmodemAvailable,
+      serialYmodemReceiveAvailable,
+      selectFileAvailable,
+      selectDirectoryAvailable,
+      sendSerialYmodem,
+      receiveSerialYmodem,
+      selectFile,
+      selectDirectory,
+      startZmodemDragDropUpload,
+      cancelZmodem,
+      onZmodemEvent,
+      execCommand,
+      getSessionPwd,
+      getSessionRemoteInfo,
+      getSessionDistroInfo,
+      getServerStats,
+      writeToSession,
+      resizeSession,
+      setSessionFlowPaused,
+      closeSession,
+      setSessionEncoding,
+      onSessionData,
+      onSessionExit,
+      onTelnetAutoLoginComplete,
+      onTelnetAutoLoginCancelled,
+      onChainProgress,
+      onConnectionReuseFallback,
+      onWindowFullScreenChanged,
+      onHostKeyVerification,
+      respondHostKeyVerification,
+      openExternal,
+    }),
+    [
+      backendAvailable,
+      telnetAvailable,
+      moshAvailable,
+      etAvailable,
+      localAvailable,
+      serialAvailable,
+      execAvailable,
+      openExternalAvailable,
+      startSSHSession,
+      startTelnetSession,
+      startMoshSession,
+      startEtSession,
+      startLocalSession,
+      startSerialSession,
+      listSerialPorts,
+      serialYmodemAvailable,
+      serialYmodemReceiveAvailable,
+      selectFileAvailable,
+      selectDirectoryAvailable,
+      sendSerialYmodem,
+      receiveSerialYmodem,
+      selectFile,
+      selectDirectory,
+      startZmodemDragDropUpload,
+      cancelZmodem,
+      onZmodemEvent,
+      execCommand,
+      getSessionPwd,
+      getSessionRemoteInfo,
+      getSessionDistroInfo,
+      getServerStats,
+      writeToSession,
+      resizeSession,
+      setSessionFlowPaused,
+      closeSession,
+      setSessionEncoding,
+      onSessionData,
+      onSessionExit,
+      onTelnetAutoLoginComplete,
+      onTelnetAutoLoginCancelled,
+      onChainProgress,
+      onConnectionReuseFallback,
+      onWindowFullScreenChanged,
+      onHostKeyVerification,
+      respondHostKeyVerification,
+      openExternal,
+    ],
+  );
 };

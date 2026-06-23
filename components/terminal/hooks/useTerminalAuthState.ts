@@ -11,7 +11,7 @@ export const useTerminalAuthState = ({
   pendingAuthRef,
   termRef,
   onUpdateHost,
-  onStartSsh,
+  onStartSession,
   setStatus,
   setProgressLogs,
 }: {
@@ -19,7 +19,7 @@ export const useTerminalAuthState = ({
   pendingAuthRef: RefObject<PendingAuth>;
   termRef: RefObject<XTerm | null>;
   onUpdateHost?: (host: Host) => void;
-  onStartSsh: (term: XTerm) => void;
+  onStartSession: (term: XTerm) => void;
   setStatus: (status: TerminalSession["status"]) => void;
   setProgressLogs: (next: string[] | ((prev: string[]) => string[])) => void;
 }) => {
@@ -63,6 +63,7 @@ export const useTerminalAuthState = ({
     (opts?: { saveToHost?: boolean }) => {
       if (!isValid) return;
 
+      const shouldSave = opts?.saveToHost ?? saveCredentials;
       pendingAuthRef.current = {
         authMethod,
         username: authUsername,
@@ -75,15 +76,16 @@ export const useTerminalAuthState = ({
           authMethod === "key" || authMethod === "certificate"
             ? authPassphrase || undefined
             : undefined,
+        savedToHost: shouldSave && Boolean(onUpdateHost),
       };
 
-      const shouldSave = opts?.saveToHost ?? saveCredentials;
       if (shouldSave && onUpdateHost) {
         const updatedHost: Host = {
           ...host,
           username: authUsername,
           authMethod: authMethod,
           password: authMethod === "password" ? authPassword : undefined,
+          savePassword: authMethod === "password" ? true : host.savePassword,
           identityFileId:
             authMethod === "key" || authMethod === "certificate"
               ? (authKeyId ?? undefined)
@@ -106,7 +108,7 @@ export const useTerminalAuthState = ({
         logger.warn("Failed to clear terminal", err);
       }
 
-      onStartSsh(term);
+      onStartSession(term);
     },
     [
       authKeyId,
@@ -116,7 +118,7 @@ export const useTerminalAuthState = ({
       authUsername,
       host,
       isValid,
-      onStartSsh,
+      onStartSession,
       onUpdateHost,
       pendingAuthRef,
       saveCredentials,

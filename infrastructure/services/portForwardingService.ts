@@ -4,9 +4,15 @@
  * for establishing and managing SSH port forwarding tunnels.
  */
 
-import { Host, Identity, PortForwardingRule, SSHKey } from '../../domain/models';
+import { Host, Identity, PortForwardingRule, SSHKey, TerminalSettings } from '../../domain/models';
 import { isEncryptedCredentialPlaceholder, sanitizeCredentialValue } from '../../domain/credentials';
-import { resolveHostAuth } from '../../domain/sshAuth';
+import { resolveBridgeKeyAuth, resolveHostAuth } from '../../domain/sshAuth';
+import { resolveHostKeepalive } from '../../domain/host';
+import { hasUsableProxyConfig } from '../../domain/proxyProfiles';
+
+// Fallback matching DEFAULT_TERMINAL_SETTINGS so older call sites that don't
+// thread terminalSettings still get the cloud-friendly defaults.
+const FALLBACK_KEEPALIVE = { keepaliveInterval: 30, keepaliveCountMax: 10 };
 import { logger } from '../../lib/logger';
 import { localStorageAdapter } from '../persistence/localStorageAdapter';
 import { STORAGE_KEY_PF_RECONNECT_CANCEL } from '../config/storageKeys';
@@ -184,10 +190,8 @@ export const stopAndCleanupRule = (ruleId: string): void => {
     activeConnections.delete(ruleId);
   }
 
-  // Use stopPortForwardByRuleId exclusively — it sets tunnel.cancelled = true
-  // before conn.end(), so the close handler resolves gracefully.  The old
-  // stopPortForward(tunnelId) IPC deletes the tunnel entry immediately,
-  // which makes the cancelled flag invisible to the close handler.
+  // Use stopPortForwardByRuleId so every tunnel for this rule is marked
+  // cancelled before its sockets are closed.
   const bridge = netcattyBridge.get();
   if (bridge?.stopPortForwardByRuleId) {
     bridge.stopPortForwardByRuleId(ruleId).catch((err: unknown) => {
@@ -363,8 +367,10 @@ export const startPortForward = async (
   keys: SSHKey[],
   identities: Identity[],
   onStatusChange: (status: PortForwardingRule['status'], error?: string) => void,
-  enableReconnect = false
+  enableReconnect = false,
+  terminalSettings?: Pick<TerminalSettings, 'keepaliveInterval' | 'keepaliveCountMax'>,
 ): Promise<{ success: boolean; error?: string }> => {
+  const globalKeepalive = terminalSettings ?? FALLBACK_KEEPALIVE;
   const bridge = netcattyBridge.get();
   
   // Clear any existing reconnect timer
@@ -380,6 +386,10 @@ export const startPortForward = async (
     // Generate a unique tunnel ID
     const tunnelId = `pf-${rule.id}-${Date.now()}`;
 
+    if (host.proxyProfileId && !host.proxyConfig) {
+      throw new Error(`Saved proxy for host "${host.label || host.hostname}" is missing. Open host settings and select a valid proxy.`);
+    }
+
     const resolved = resolveHostAuth({ host, keys, identities });
     const key = resolved.key;
     const proxy = host.proxyConfig
@@ -387,6 +397,7 @@ export const startPortForward = async (
         type: host.proxyConfig.type,
         host: host.proxyConfig.host,
         port: host.proxyConfig.port,
+        command: host.proxyConfig.command,
         username: host.proxyConfig.username,
         password: sanitizeCredentialValue(host.proxyConfig.password),
       }
@@ -403,9 +414,12 @@ export const startPortForward = async (
       jumpHosts = resolvedJumpHosts
         .filter((jumpHost): jumpHost is Host => Boolean(jumpHost))
         .map((jumpHost, index) => {
+          if (jumpHost.proxyProfileId && !jumpHost.proxyConfig) {
+            throw new Error(`Saved proxy for jump host "${jumpHost.label || jumpHost.hostname}" is missing. Open host settings and select a valid proxy.`);
+          }
           const hasConfiguredJumpProxyEndpoint =
             index === 0 &&
-            !!(jumpHost.proxyConfig?.host && jumpHost.proxyConfig?.port);
+            hasUsableProxyConfig(jumpHost.proxyConfig);
           if (
             hasConfiguredJumpProxyEndpoint &&
             jumpHost.proxyConfig?.username &&
@@ -416,28 +430,54 @@ export const startPortForward = async (
           }
           const jumpResolved = resolveHostAuth({ host: jumpHost, keys, identities });
           const jumpKey = jumpResolved.key;
+          const jumpPassword = sanitizeCredentialValue(jumpResolved.password);
+          const jumpKeyAuth = resolveBridgeKeyAuth({
+            key: jumpKey,
+            fallbackIdentityFilePaths: jumpResolved.authMethod === "password" || jumpResolved.keyId
+              ? undefined
+              : jumpHost.identityFilePaths,
+            passphrase: jumpResolved.passphrase,
+          });
+          const hasJumpKeyMaterial = Boolean(jumpKeyAuth.privateKey || jumpKeyAuth.identityFilePaths?.length);
+          const hasUnreadableJumpCredential =
+            isEncryptedCredentialPlaceholder(jumpResolved.password) ||
+            isEncryptedCredentialPlaceholder(jumpKey?.privateKey) ||
+            isEncryptedCredentialPlaceholder(jumpResolved.passphrase);
+          if (
+            (jumpResolved.authMethod === "password" && isEncryptedCredentialPlaceholder(jumpResolved.password) && !jumpPassword) ||
+            (jumpResolved.authMethod !== "password" && hasUnreadableJumpCredential && !jumpPassword && !hasJumpKeyMaterial)
+          ) {
+            throw new Error(`Saved credentials for jump host "${jumpHost.label || jumpHost.hostname}" cannot be decrypted on this device. Open host settings and re-enter them.`);
+          }
+          const hopKeepalive = resolveHostKeepalive(jumpHost, globalKeepalive);
           return {
             hostname: jumpHost.hostname,
             port: jumpHost.port || 22,
             username: jumpResolved.username || 'root',
-            password: jumpResolved.password,
-            privateKey: jumpKey?.privateKey,
+            password: jumpPassword,
+            privateKey: jumpKeyAuth.privateKey,
             certificate: jumpKey?.certificate,
-            passphrase: jumpResolved.passphrase || jumpKey?.passphrase,
+            passphrase: jumpKeyAuth.passphrase,
             publicKey: jumpKey?.publicKey,
             keyId: jumpResolved.keyId,
             keySource: jumpKey?.source,
             label: jumpHost.label,
-            proxy: jumpHost.proxyConfig?.host && jumpHost.proxyConfig?.port
+            proxy: hasUsableProxyConfig(jumpHost.proxyConfig)
               ? {
                 type: jumpHost.proxyConfig.type,
                 host: jumpHost.proxyConfig.host,
                 port: jumpHost.proxyConfig.port,
+                command: jumpHost.proxyConfig.command,
                 username: jumpHost.proxyConfig.username,
                 password: sanitizeCredentialValue(jumpHost.proxyConfig.password),
               }
               : undefined,
-            identityFilePaths: jumpHost.identityFilePaths,
+            identityFilePaths: jumpKeyAuth.identityFilePaths,
+            keepaliveInterval: hopKeepalive.interval,
+            keepaliveCountMax: hopKeepalive.countMax,
+            legacyAlgorithms: jumpHost.legacyAlgorithms,
+            skipEcdsaHostKey: jumpHost.skipEcdsaHostKey,
+            algorithmOverrides: jumpHost.algorithms,
           };
         });
     }
@@ -446,6 +486,26 @@ export const startPortForward = async (
       throw new Error('Proxy credentials cannot be decrypted on this device. Open host settings and re-enter the proxy password.');
     }
     
+    const keyAuth = resolveBridgeKeyAuth({
+      key,
+      fallbackIdentityFilePaths: resolved.authMethod === "password" || resolved.keyId
+        ? undefined
+        : host.identityFilePaths,
+      passphrase: resolved.passphrase,
+    });
+    const password = sanitizeCredentialValue(resolved.password);
+    const hasKeyMaterial = Boolean(keyAuth.privateKey || keyAuth.identityFilePaths?.length);
+    const hasUnreadableCredential =
+      isEncryptedCredentialPlaceholder(resolved.password) ||
+      isEncryptedCredentialPlaceholder(key?.privateKey) ||
+      isEncryptedCredentialPlaceholder(resolved.passphrase);
+    if (
+      (resolved.authMethod === "password" && isEncryptedCredentialPlaceholder(resolved.password) && !password) ||
+      (resolved.authMethod !== "password" && hasUnreadableCredential && !password && !hasKeyMaterial)
+    ) {
+      throw new Error('Saved credentials cannot be decrypted on this device. Open host settings and re-enter them.');
+    }
+
     // Subscribe to status updates first
     const unsubscribe = bridge.onPortForwardStatus?.(tunnelId, (status, error) => {
       const conn = activeConnections.get(rule.id);
@@ -479,6 +539,7 @@ export const startPortForward = async (
     
     // Start the tunnel
     const result = await bridge.startPortForward({
+      ruleId: rule.id,
       tunnelId,
       type: rule.type,
       localPort: rule.localPort,
@@ -488,15 +549,19 @@ export const startPortForward = async (
       hostname: host.hostname,
       port: host.port,
       username: resolved.username,
-      password: resolved.password,
-      privateKey: key?.privateKey,
+      password,
+      privateKey: keyAuth.privateKey,
       certificate: key?.certificate,
       keyId: resolved.keyId,
-      passphrase: resolved.passphrase || key?.passphrase,
+      passphrase: keyAuth.passphrase,
       proxy,
       jumpHosts: jumpHosts && jumpHosts.length > 0 ? jumpHosts : undefined,
-      identityFilePaths: host.identityFilePaths,
+      identityFilePaths: keyAuth.identityFilePaths,
       legacyAlgorithms: host.legacyAlgorithms,
+      skipEcdsaHostKey: host.skipEcdsaHostKey,
+      algorithmOverrides: host.algorithms,
+      keepaliveInterval: resolveHostKeepalive(host, globalKeepalive).interval,
+      keepaliveCountMax: resolveHostKeepalive(host, globalKeepalive).countMax,
     });
     
     if (!result.success) {

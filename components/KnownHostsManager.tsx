@@ -6,7 +6,6 @@ import {
   LayoutGrid,
   List as ListIcon,
   RefreshCw,
-  Search,
   Server,
   Shield,
   Trash2,
@@ -22,6 +21,8 @@ import React, {
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useKnownHostsBackend } from "../application/state/useKnownHostsBackend";
 import { useStoredViewMode, ViewMode } from "../application/state/useStoredViewMode";
+import { fingerprintFromPublicKey } from "../domain/knownHosts";
+import { reorderVaultItems, sortByVaultOrder } from "../domain/vaultOrder";
 import { STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE } from "../infrastructure/config/storageKeys";
 import { logger } from "../lib/logger";
 import { cn } from "../lib/utils";
@@ -34,16 +35,25 @@ import {
   ContextMenuTrigger,
 } from "./ui/context-menu";
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
-import { Input } from "./ui/input";
 import { ScrollArea } from "./ui/scroll-area";
 import { SortDropdown, SortMode } from "./ui/sort-dropdown";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { toast } from "./ui/toast";
+import {
+  VaultHeaderSearch,
+  VaultPageHeader,
+  vaultHeaderIconButtonClass,
+  vaultHeaderSecondaryButtonClass,
+} from "./vault/VaultPageHeader";
+import { VaultEntityIcon, vaultPrimaryIconClass } from "./vault/VaultEntityIcon";
+import { useVaultItemReorder } from "./vault/vaultReorderDrag";
 
 interface KnownHostsManagerProps {
   knownHosts: KnownHost[];
   hosts: Host[];
   onSave: (knownHost: KnownHost) => void;
   onUpdate: (knownHost: KnownHost) => void;
+  onReorder: (knownHosts: KnownHost[]) => void;
   onDelete: (id: string) => void;
   onConvertToHost: (knownHost: KnownHost) => void;
   onImportFromFile: (hosts: KnownHost[]) => void;
@@ -79,12 +89,20 @@ const parseKnownHostsFile = (content: string): KnownHost[] => {
         hostname = "(hashed)";
       }
 
+      const fullPublicKey = `${keyType} ${publicKey}`;
+      // Compute the fingerprint up front so the SSH host verifier can match
+      // against this record directly instead of re-deriving on every connect —
+      // the re-derivation path is where the false "fingerprint changed"
+      // warnings in #972 originated.
+      const fingerprint = fingerprintFromPublicKey(fullPublicKey);
+
       parsed.push({
         id: `kh-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         hostname,
         port,
         keyType,
-        publicKey: publicKey.slice(0, 64) + "...",
+        publicKey: fullPublicKey,
+        fingerprint: fingerprint || undefined,
         discoveredAt: Date.now(),
       });
     } catch {
@@ -100,12 +118,13 @@ interface HostItemProps {
   knownHost: KnownHost;
   converted: boolean;
   viewMode: ViewMode;
+  reorderProps?: React.HTMLAttributes<HTMLDivElement>;
   onDelete: (id: string) => void;
   onConvertToHost: (knownHost: KnownHost) => void;
 }
 
 const HostItem = React.memo<HostItemProps>(
-  ({ knownHost, converted, viewMode, onDelete, onConvertToHost }) => {
+  ({ knownHost, converted, viewMode, reorderProps, onDelete, onConvertToHost }) => {
     const { t } = useI18n();
     // Disabled to reduce log noise - uncomment for debugging
     // console.log('[HostItem] render:', knownHost.hostname);
@@ -114,40 +133,52 @@ const HostItem = React.memo<HostItemProps>(
         <ContextMenu>
           <ContextMenuTrigger asChild>
             <div
+              {...reorderProps}
               className={cn(
+                reorderProps && "vault-drop-indicator-row",
                 "group cursor-pointer soft-card elevate rounded-xl h-[68px] px-3 py-2",
                 converted && "opacity-60",
+                reorderProps?.className,
               )}
             >
               {/* Quick action buttons on hover */}
               <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                 {!converted && (
-                  <button
-                    className="p-1 rounded hover:bg-primary/20 text-primary"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onConvertToHost(knownHost);
-                    }}
-                    title={t("action.convertToHost")}
-                  >
-                    <ArrowRight size={12} />
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        className="p-1 rounded hover:bg-primary/20 text-primary"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onConvertToHost(knownHost);
+                        }}
+                      >
+                        <ArrowRight size={12} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>{t("action.convertToHost")}</TooltipContent>
+                  </Tooltip>
                 )}
-                <button
-                  className="p-1 rounded hover:bg-destructive/20 text-destructive"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onDelete(knownHost.id);
-                  }}
-                  title={t("action.remove")}
-                >
-                  <Trash2 size={12} />
-                </button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      className="p-1 rounded hover:bg-destructive/20 text-destructive"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDelete(knownHost.id);
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("action.remove")}</TooltipContent>
+                </Tooltip>
               </div>
               <div className="flex items-center gap-3 h-full">
-                <div className="h-11 w-11 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
-                  <Server size={18} />
-                </div>
+                <VaultEntityIcon
+                  className={vaultPrimaryIconClass}
+                  icon={<Server size={18} />}
+                />
                 <div className="flex-1 min-w-0">
                   <span className="text-sm font-semibold truncate block">
                     {knownHost.hostname}
@@ -178,14 +209,18 @@ const HostItem = React.memo<HostItemProps>(
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
+            {...reorderProps}
             className={cn(
+              reorderProps && "vault-drop-indicator-row",
               "group flex items-center gap-3 px-3 py-2 h-14 rounded-lg hover:bg-secondary/60 transition-colors cursor-pointer",
               converted && "opacity-60",
+              reorderProps?.className,
             )}
           >
-            <div className="h-11 w-11 rounded-xl bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
-              <Server size={18} />
-            </div>
+            <VaultEntityIcon
+              className={vaultPrimaryIconClass}
+              icon={<Server size={18} />}
+            />
             <div className="flex-1 min-w-0">
               <span className="text-sm font-semibold truncate block">
                 {knownHost.hostname}
@@ -193,18 +228,22 @@ const HostItem = React.memo<HostItemProps>(
             </div>
             <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
               {!converted && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onConvertToHost(knownHost);
-                  }}
-                  title={t("action.convertToHost")}
-                >
-                  <ArrowRight size={14} />
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onConvertToHost(knownHost);
+                      }}
+                    >
+                      <ArrowRight size={14} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("action.convertToHost")}</TooltipContent>
+                </Tooltip>
               )}
             </div>
           </div>
@@ -234,6 +273,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
   hosts,
   onSave: _onSave,
   onUpdate: _onUpdate,
+  onReorder,
   onDelete,
   onConvertToHost,
   onImportFromFile,
@@ -248,9 +288,10 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
     STORAGE_KEY_VAULT_KNOWN_HOSTS_VIEW_MODE,
     "grid",
   );
-  const [sortMode, setSortMode] = useState<SortMode>("newest");
+  const [sortMode, setSortMode] = useState<SortMode>("manual");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const hasScannedRef = React.useRef(false);
+  const listRef = React.useRef<HTMLDivElement | null>(null);
   const RENDER_LIMIT = 100; // Limit rendered items for performance
 
   // Define handleScanSystem before useEffect that depends on it
@@ -352,12 +393,14 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           return b.discoveredAt - a.discoveredAt;
         case "oldest":
           return a.discoveredAt - b.discoveredAt;
+        case "manual":
+          return 0;
         default:
           return 0;
       }
     });
 
-    return result;
+    return sortMode === "manual" ? sortByVaultOrder(result) : result;
   }, [knownHosts, deferredSearch, sortMode]);
 
   // Limit rendered items for performance
@@ -432,6 +475,18 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
 
   const openFilePicker = useCallback(() => fileInputRef.current?.click(), []);
 
+  const knownHostReorder = useVaultItemReorder({
+    containerRef: listRef,
+    viewMode,
+    dragType: "known-host-id",
+    targetAttribute: "data-known-host-id",
+    disabled: deferredSearch.trim().length > 0,
+    onReorder: (sourceId, targetId, position) => {
+      onReorder(reorderVaultItems(knownHosts, sourceId, targetId, position));
+      setSortMode("manual");
+    },
+  });
+
   // Memoize the rendered list to prevent re-renders
   const renderedItems = useMemo(() => {
     return displayedHosts.map((knownHost) => (
@@ -440,6 +495,7 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
         knownHost={knownHost}
         converted={convertedMap.get(knownHost.id) || false}
         viewMode={viewMode}
+        reorderProps={knownHostReorder.getItemReorderProps(knownHost.id, `known:${knownHost.id}`)}
         onDelete={handleDelete}
         onConvertToHost={handleConvertToHost}
       />
@@ -450,31 +506,25 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
     viewMode,
     handleDelete,
     handleConvertToHost,
+    knownHostReorder,
   ]);
 
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 border-b border-border/50 bg-secondary/50">
+      <VaultPageHeader>
         <div className="flex-1 min-w-0 flex items-center gap-2">
-          <div className="relative flex-1 max-w-xs">
-            <Search
-              size={14}
-              className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-            />
-            <Input
-              placeholder={t("knownHosts.search.placeholder")}
-              className="pl-9 h-9 bg-background border-border/60 text-sm"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-          </div>
+          <VaultHeaderSearch
+            placeholder={t("knownHosts.search.placeholder")}
+            className="flex-1 max-w-xs"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
         </div>
         <div className="flex items-center gap-1">
           {/* View Mode Toggle */}
           <Dropdown>
             <DropdownTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-9 w-9">
+              <Button variant="ghost" size="icon" className={vaultHeaderIconButtonClass}>
                 {viewMode === "grid" ? (
                   <LayoutGrid size={16} />
                 ) : (
@@ -505,15 +555,15 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           <SortDropdown
             value={sortMode}
             onChange={setSortMode}
-            className="h-9 w-9"
+            modes={["manual", "az", "za", "newest", "oldest"]}
+            className={vaultHeaderIconButtonClass}
           />
         </div>
         <div className="w-px h-5 bg-border/50" />
         <div className="flex items-center gap-2">
           <Button
-            variant="ghost"
-            size="sm"
-            className="h-9 px-3 text-xs"
+            variant="secondary"
+            className={vaultHeaderSecondaryButtonClass}
             onClick={() => handleScanSystem()}
             disabled={isScanning}
           >
@@ -532,25 +582,29 @@ const KnownHostsManager: React.FC<KnownHostsManagerProps> = ({
           />
           <Button
             variant="secondary"
-            size="sm"
-            className="h-9 px-3 text-xs"
+            className={vaultHeaderSecondaryButtonClass}
             onClick={openFilePicker}
           >
             <Import size={14} className="mr-2" />
             {t("knownHosts.action.importFile")}
           </Button>
         </div>
-      </div>
+      </VaultPageHeader>
 
       {/* Content */}
       <ScrollArea className="flex-1">
         <div
+          ref={listRef}
           className={cn(
             "p-4",
             viewMode === "grid"
               ? "grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3"
               : "flex flex-col gap-0",
           )}
+          onDragOverCapture={knownHostReorder.handleDragOverCapture}
+          onDragOver={knownHostReorder.handleDragOver}
+          onDropCapture={knownHostReorder.handleDropCapture}
+          onDragEndCapture={knownHostReorder.handleDragEndCapture}
         >
           {displayedHosts.length === 0 ? (
             <div

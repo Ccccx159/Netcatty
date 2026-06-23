@@ -1,16 +1,16 @@
 /**
  * Settings System Tab - System information, temp file management, session logs, and global hotkey
  */
-import { AlertTriangle, ChevronDown, ChevronRight, Download, ExternalLink, FileText, FolderOpen, HardDrive, Keyboard, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, ExternalLink, FolderOpen, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { getCredentialProtectionAvailability } from "../../../infrastructure/services/credentialProtection";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import type { UpdateState } from '../../../application/state/useUpdateCheck';
 import { SessionLogFormat, keyEventToString } from "../../../domain/models";
-import { TabsContent } from "../../ui/tabs";
 import { Button } from "../../ui/button";
-import { Toggle, Select, SettingRow } from "../settings-ui";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../ui/tooltip";
+import { Toggle, Select, SettingRow, SectionHeader, SettingCard, SettingsTabContent } from "../settings-ui";
 import { cn } from "../../../lib/utils";
 
 interface CrashLogFile {
@@ -44,6 +44,13 @@ interface TempDirInfo {
   totalSize: number;
 }
 
+interface SshDebugLogInfo {
+  enabled: boolean;
+  path: string;
+  exists: boolean;
+  size: number;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const k = 1024;
@@ -75,6 +82,16 @@ interface SettingsSystemTabProps {
   setSessionLogsDir: (dir: string) => void;
   sessionLogsFormat: SessionLogFormat;
   setSessionLogsFormat: (format: SessionLogFormat) => void;
+  sessionLogsTimestampsEnabled: boolean;
+  setSessionLogsTimestampsEnabled: (enabled: boolean) => void;
+  sshDebugLogsEnabled: boolean;
+  setSshDebugLogsEnabled: (enabled: boolean) => void;
+  sshDeepLinkEnabled: boolean;
+  setSshDeepLinkEnabled: (enabled: boolean) => void;
+  restorePreviousSession: boolean;
+  setRestorePreviousSession: (enabled: boolean) => void;
+  restoreTerminalCwd: boolean;
+  setRestoreTerminalCwd: (enabled: boolean) => void;
   toggleWindowHotkey: string;
   setToggleWindowHotkey: (hotkey: string) => void;
   closeToTray: boolean;
@@ -99,6 +116,16 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   setSessionLogsDir,
   sessionLogsFormat,
   setSessionLogsFormat,
+  sessionLogsTimestampsEnabled,
+  setSessionLogsTimestampsEnabled,
+  sshDebugLogsEnabled,
+  setSshDebugLogsEnabled,
+  sshDeepLinkEnabled,
+  setSshDeepLinkEnabled,
+  restorePreviousSession,
+  setRestorePreviousSession,
+  restoreTerminalCwd,
+  setRestoreTerminalCwd,
   toggleWindowHotkey,
   setToggleWindowHotkey,
   closeToTray,
@@ -131,6 +158,8 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   const [logEntries, setLogEntries] = useState<CrashLogEntry[]>([]);
   const [isClearingCrashLogs, setIsClearingCrashLogs] = useState(false);
   const [crashLogClearResult, setCrashLogClearResult] = useState<{ deletedCount: number } | null>(null);
+  const [sshDebugLogInfo, setSshDebugLogInfo] = useState<SshDebugLogInfo | null>(null);
+  const [isLoadingSshDebugLogInfo, setIsLoadingSshDebugLogInfo] = useState(false);
 
   const [appVersion, setAppVersion] = useState('');
 
@@ -194,6 +223,24 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   useEffect(() => {
     void loadCrashLogs();
   }, [loadCrashLogs]);
+
+  const loadSshDebugLogInfo = useCallback(async () => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.getSshDebugLogInfo) return;
+    setIsLoadingSshDebugLogInfo(true);
+    try {
+      const info = await bridge.getSshDebugLogInfo();
+      setSshDebugLogInfo(info);
+    } catch (err) {
+      console.error("[SettingsSystemTab] Failed to load SSH debug log info:", err);
+    } finally {
+      setIsLoadingSshDebugLogInfo(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSshDebugLogInfo();
+  }, [loadSshDebugLogInfo, sshDebugLogsEnabled]);
 
   const expandRequestRef = React.useRef(0);
   const handleExpandCrashLog = useCallback(async (fileName: string) => {
@@ -293,6 +340,12 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     }
   }, [sessionLogsDir]);
 
+  const handleOpenSshDebugLogDir = useCallback(async () => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.openSshDebugLogDir) return;
+    await bridge.openSshDebugLogDir();
+  }, []);
+
   // Handle global toggle hotkey recording
   const cancelHotkeyRecording = useCallback(() => {
     setIsRecordingHotkey(false);
@@ -350,27 +403,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   ];
 
   return (
-    <TabsContent
-      value="system"
-      className="data-[state=inactive]:hidden h-full flex flex-col"
-    >
-      <div className="flex-1 overflow-y-auto overflow-x-hidden px-8 py-6">
-        <div className="max-w-2xl space-y-8">
-          {/* Header */}
-          <div>
-            <h2 className="text-xl font-semibold">{t("settings.system.title")}</h2>
-            <p className="text-sm text-muted-foreground mt-1">
-              {t("settings.system.description")}
-            </p>
-          </div>
-
-          {/* Software Update Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Download size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t('settings.update.title')}</h3>
-            </div>
-            <div className="rounded-lg border border-border/60 p-4 space-y-3">
+    <SettingsTabContent value="system">
+          <SectionHeader title={t('settings.update.title')} />
+            <SettingCard className="space-y-3 py-4">
               {/* Current version */}
               <div className="flex items-center justify-between">
                 <span className="text-sm text-muted-foreground">
@@ -483,16 +518,16 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   </Button>
                 )}
               </div>
-            </div>
-            <SettingRow
-              label={t('settings.update.autoUpdateEnabled')}
-              description={t('settings.update.autoUpdateEnabledDesc')}
-            >
-              <Toggle
-                checked={autoUpdateEnabled}
-                onChange={setAutoUpdateEnabled}
-              />
-            </SettingRow>
+              <SettingRow
+                label={t('settings.update.autoUpdateEnabled')}
+                description={t('settings.update.autoUpdateEnabledDesc')}
+              >
+                <Toggle
+                  checked={autoUpdateEnabled}
+                  onChange={setAutoUpdateEnabled}
+                />
+              </SettingRow>
+            </SettingCard>
             <p className="text-xs text-muted-foreground">
               {updateState.lastCheckedAt && (
                 <span>
@@ -503,16 +538,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               )}
               {t('settings.update.hint')}
             </p>
-          </div>
 
-          {/* Credential Protection Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <HardDrive size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.credentials.title")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.credentials.title")} />
+            <SettingCard className="space-y-3 py-4">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-sm text-muted-foreground">
@@ -555,17 +583,10 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               <p className="text-xs text-muted-foreground">
                 {t("settings.system.credentials.portabilityHint")}
               </p>
-            </div>
-          </div>
+            </SettingCard>
 
-          {/* Crash Logs Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <AlertTriangle size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.crashLogs.title")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.crashLogs.title")} />
+            <SettingCard className="space-y-3 py-4">
               <p className="text-sm text-muted-foreground">
                 {t("settings.system.crashLogs.description")}
               </p>
@@ -637,9 +658,14 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                                 if (entry.uptimeSeconds != null) parts.push(`Uptime: ${entry.uptimeSeconds}s`);
                                 const text = parts.join('  ');
                                 return text ? (
-                                  <div className="text-muted-foreground truncate" title={text}>
-                                    {text}
-                                  </div>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <div className="text-muted-foreground truncate cursor-default">
+                                        {text}
+                                      </div>
+                                    </TooltipTrigger>
+                                    <TooltipContent>{text}</TooltipContent>
+                                  </Tooltip>
                                 ) : null;
                               })()}
                               {entry.stack && (
@@ -678,14 +704,18 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   <Trash2 size={14} />
                   {t("settings.system.crashLogs.clear")}
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleOpenCrashLogsDir}
-                  title={t("settings.system.openFolder")}
-                >
-                  <FolderOpen size={16} />
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleOpenCrashLogsDir}
+                    >
+                      <FolderOpen size={16} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("settings.system.openFolder")}</TooltipContent>
+                </Tooltip>
               </div>
 
               {crashLogClearResult && (
@@ -693,21 +723,14 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   {t("settings.system.crashLogs.cleared").replace("{count}", String(crashLogClearResult.deletedCount))}
                 </p>
               )}
-            </div>
+            </SettingCard>
 
             <p className="text-xs text-muted-foreground">
               {t("settings.system.crashLogs.hint")}
             </p>
-          </div>
 
-          {/* Temp Directory Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <HardDrive size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.system.tempDirectory")}</h3>
-            </div>
-
-            <div className="bg-muted/30 rounded-lg p-4 space-y-3">
+          <SectionHeader title={t("settings.system.tempDirectory")} />
+            <SettingCard className="space-y-3 py-4">
               {/* Path */}
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0 flex-1">
@@ -716,16 +739,20 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                     {isLoading ? "..." : (tempDirInfo?.path ?? "-")}
                   </p>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="shrink-0"
-                  onClick={handleOpenTempDir}
-                  disabled={!tempDirInfo?.path}
-                  title={t("settings.system.openFolder")}
-                >
-                  <FolderOpen size={16} />
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0"
+                      onClick={handleOpenTempDir}
+                      disabled={!tempDirInfo?.path}
+                    >
+                      <FolderOpen size={16} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("settings.system.openFolder")}</TooltipContent>
+                </Tooltip>
               </div>
 
               {/* Stats */}
@@ -777,21 +804,36 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   })}
                 </p>
               )}
-            </div>
+            </SettingCard>
 
             <p className="text-xs text-muted-foreground">
               {t("settings.system.tempDirectoryHint")}
             </p>
-          </div>
 
-          {/* Session Logs Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <FileText size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.sessionLogs.title")}</h3>
-            </div>
+          <SectionHeader title={t("settings.sessionRestore.title")} />
+            <SettingCard className="space-y-4 py-4">
+              <SettingRow
+                label={t("settings.sessionRestore.restorePreviousSession")}
+                description={t("settings.sessionRestore.restorePreviousSessionDesc")}
+              >
+                <Toggle
+                  checked={restorePreviousSession}
+                  onChange={setRestorePreviousSession}
+                />
+              </SettingRow>
+              <SettingRow
+                label={t("settings.sessionRestore.restoreTerminalCwd")}
+                description={t("settings.sessionRestore.restoreTerminalCwdDesc")}
+              >
+                <Toggle
+                  checked={restoreTerminalCwd}
+                  onChange={setRestoreTerminalCwd}
+                />
+              </SettingRow>
+            </SettingCard>
 
-            <div className="bg-muted/30 rounded-lg p-4 space-y-4">
+          <SectionHeader title={t("settings.sessionLogs.title")} />
+            <SettingCard className="space-y-4 py-4">
               {/* Enable Toggle */}
               <SettingRow
                 label={t("settings.sessionLogs.enableAutoSave")}
@@ -823,15 +865,19 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                     {t("settings.sessionLogs.browse")}
                   </Button>
                   {sessionLogsDir && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={handleOpenSessionLogsDir}
-                      className="shrink-0"
-                      title={t("settings.sessionLogs.openFolder")}
-                    >
-                      <FolderOpen size={16} />
-                    </Button>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={handleOpenSessionLogsDir}
+                          className="shrink-0"
+                        >
+                          <FolderOpen size={16} />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t("settings.sessionLogs.openFolder")}</TooltipContent>
+                    </Tooltip>
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">
@@ -852,21 +898,102 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   disabled={!sessionLogsEnabled}
                 />
               </SettingRow>
-            </div>
+
+              <SettingRow
+                label={t("settings.sessionLogs.timestamps")}
+                description={t("settings.sessionLogs.timestampsDesc")}
+              >
+                <Toggle
+                  checked={sessionLogsTimestampsEnabled}
+                  onChange={setSessionLogsTimestampsEnabled}
+                  disabled={!sessionLogsEnabled}
+                />
+              </SettingRow>
+            </SettingCard>
 
             <p className="text-xs text-muted-foreground">
               {t("settings.sessionLogs.hint")}
             </p>
-          </div>
 
-          {/* Global Toggle Window Section (Quake Mode) */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Keyboard size={18} className="text-muted-foreground" />
-              <h3 className="text-base font-medium">{t("settings.globalHotkey.title")}</h3>
-            </div>
+          <SectionHeader title={t('settings.sshDeepLink.title')} />
+            <SettingCard>
+              <SettingRow
+                label={t('settings.sshDeepLink.enable')}
+                description={t('settings.sshDeepLink.enableDesc')}
+              >
+                <Toggle
+                  checked={sshDeepLinkEnabled}
+                  onChange={setSshDeepLinkEnabled}
+                  ariaLabel={t('settings.sshDeepLink.enable')}
+                />
+              </SettingRow>
+            </SettingCard>
 
-            <div className="bg-muted/30 rounded-lg p-4 space-y-4">
+          <SectionHeader title={t("settings.sshDebugLogs.title")} />
+            <SettingCard className="min-w-0 max-w-full overflow-hidden space-y-4 py-4">
+              <SettingRow
+                label={t("settings.sshDebugLogs.enable")}
+                description={t("settings.sshDebugLogs.enableDesc")}
+              >
+                <Toggle
+                  checked={sshDebugLogsEnabled}
+                  onChange={setSshDebugLogsEnabled}
+                />
+              </SettingRow>
+
+              <div className="space-y-2">
+                <span className="text-sm font-medium">{t("settings.sshDebugLogs.location")}</span>
+                <div className="grid w-full min-w-0 max-w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2">
+                  <div className="min-w-0 overflow-hidden">
+                    <div
+                      className="w-full min-w-0 overflow-hidden truncate rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
+                      title={isLoadingSshDebugLogInfo ? "..." : (sshDebugLogInfo?.path || "-")}
+                    >
+                      {isLoadingSshDebugLogInfo ? "..." : (sshDebugLogInfo?.path || "-")}
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={loadSshDebugLogInfo}
+                    disabled={isLoadingSshDebugLogInfo}
+                    className="shrink-0 gap-1.5"
+                  >
+                    <RefreshCw size={14} className={isLoadingSshDebugLogInfo ? "animate-spin" : ""} />
+                    {t("settings.system.refresh")}
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={handleOpenSshDebugLogDir}
+                        className="shrink-0"
+                      >
+                        <FolderOpen size={16} />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>{t("settings.system.openFolder")}</TooltipContent>
+                  </Tooltip>
+                </div>
+                <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                  <span>
+                    {t("settings.sshDebugLogs.status")}:{" "}
+                    {sshDebugLogsEnabled ? t("settings.sshDebugLogs.statusOn") : t("settings.sshDebugLogs.statusOff")}
+                  </span>
+                  <span>
+                    {t("settings.sshDebugLogs.size")}: {formatBytes(sshDebugLogInfo?.size ?? 0)}
+                  </span>
+                </div>
+              </div>
+            </SettingCard>
+
+            <p className="text-xs text-muted-foreground">
+              {t("settings.sshDebugLogs.hint")}
+            </p>
+
+          <SectionHeader title={t("settings.globalHotkey.title")} />
+            <SettingCard className="space-y-4 py-4">
               {/* Enable/Disable Global Hotkey */}
               <SettingRow
                 label={t('settings.globalHotkey.enabled')}
@@ -902,13 +1029,17 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                         : toggleWindowHotkey || t("settings.globalHotkey.notSet")}
                     </button>
                     {toggleWindowHotkey && (
-                      <button
-                        onClick={handleResetHotkey}
-                        className="p-1 hover:bg-muted rounded"
-                        title={t("settings.globalHotkey.reset")}
-                      >
-                        <RotateCcw size={14} />
-                      </button>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            onClick={handleResetHotkey}
+                            className="p-1 hover:bg-muted rounded"
+                          >
+                            <RotateCcw size={14} />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>{t("settings.globalHotkey.reset")}</TooltipContent>
+                      </Tooltip>
                     )}
                   </div>
                 </SettingRow>
@@ -927,16 +1058,13 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   onChange={setCloseToTray}
                 />
               </SettingRow>
-            </div>
+            </SettingCard>
 
             <p className="text-xs text-muted-foreground">
               {t("settings.globalHotkey.hint")}
             </p>
-          </div>
-        </div>
-      </div>
-    </TabsContent>
+    </SettingsTabContent>
   );
 };
 
-export default SettingsSystemTab;
+export default React.memo(SettingsSystemTab);

@@ -10,263 +10,19 @@
 "use strict";
 
 const crypto = require("crypto");
-const { stripAnsi } = require("./shellUtils.cjs");
-const { classifyLocalShellType } = require("../../../lib/localShell.cjs");
-
-function detectShellKind(shellPath, platform = process.platform) {
-  return classifyLocalShellType(shellPath, platform);
-}
-
-function subscribeToPtyData(ptyStream, onData) {
-  if (typeof ptyStream?.onData === "function") {
-    const disposable = ptyStream.onData((data) => onData(data));
-    return () => {
-      try {
-        disposable?.dispose?.();
-      } catch {
-        // Ignore cleanup failures
-      }
-    };
-  }
-
-  if (typeof ptyStream?.on === "function" && typeof ptyStream?.removeListener === "function") {
-    ptyStream.on("data", onData);
-    return () => {
-      try {
-        ptyStream.removeListener("data", onData);
-      } catch {
-        // Ignore cleanup failures
-      }
-    };
-  }
-
-  throw new Error("PTY stream does not support data subscriptions");
-}
-
-function hasExpectedPromptSuffix(text, expectedPrompt) {
-  if (!expectedPrompt) return false;
-  const normalizedText = stripAnsi(String(text || "")).replace(/\r/g, "");
-  const normalizedPrompt = stripAnsi(String(expectedPrompt || "")).replace(/\r/g, "");
-  return !!normalizedPrompt && normalizedText.endsWith(normalizedPrompt);
-}
-
-function escapePosixSingleQuoted(text) {
-  return String(text || "").replace(/'/g, "'\\''");
-}
-
-function escapePowerShellSingleQuoted(text) {
-  return String(text || "").replace(/'/g, "''");
-}
-
-function escapeFishSingleQuoted(text) {
-  return String(text || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-function escapeCmdForNestedShell(text) {
-  return String(text || "").replace(/"/g, '""').replace(/%/g, "%%");
-}
-
-function buildWrappedCommand(command, shellKind, marker) {
-  switch (shellKind) {
-    case "powershell": {
-      const psPager = "$env:PAGER='cat'; $env:SYSTEMD_PAGER=''; $env:GIT_PAGER='cat'; $env:LESS=''; ";
-      const psEscaped = escapePowerShellSingleQuoted(command);
-      return (
-        `$${marker}=0; $${marker}_cmd='${psEscaped}'; & { Write-Output '${marker}_S'; ${psPager}$LASTEXITCODE=$null; try { Invoke-Expression $${marker}_cmd; $${marker}_rc = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 } } catch { $${marker}_rc = 1 }; Write-Output "${marker}_E:$${marker}_rc" }\r\n`
-      );
-    }
-
-    case "cmd": {
-      const cmdEscaped = escapeCmdForNestedShell(command);
-      return (
-        `set "${marker}=0" & set "${marker}_CMD=${cmdEscaped}" & (echo ${marker}_S & set "PAGER=cat" & set "SYSTEMD_PAGER=" & set "GIT_PAGER=cat" & set "LESS=" & call cmd /d /s /c "%%${marker}_CMD%%" & call echo ${marker}_E:^%errorlevel^%)\r\n`
-      );
-    }
-
-    case "fish":
-      return (
-        `set ${marker} 0; function __ncmcp_int --on-signal INT; printf '%s\\n' '${marker}_E:130'; functions -e __ncmcp_int; end; ` +
-        `set -l ${marker}_cmd '${escapeFishSingleQuoted(command)}'; ` +
-        `begin; set -gx PAGER cat; set -gx SYSTEMD_PAGER ''; set -gx GIT_PAGER cat; set -gx LESS ''; ` +
-        `printf '%s\\n' '${marker}_S'; eval -- \$${marker}_cmd; set __NCMCP_rc $status; ` +
-        `functions -e __ncmcp_int; printf '%s\\n' '${marker}_E:'\$__NCMCP_rc; end\n`
-      );
-
-    case "posix":
-    default: {
-      // Single-line compound command with early marker.
-      //
-      // Layout: __NCMCP_xxx=0; { ... MARKER_S; eval command; MARKER_E; }
-      //
-      // Key design decisions:
-      //
-      // 1) __NCMCP_xxx=0 at the VERY START ensures the PTY echo line
-      //    contains __NCMCP_ in its first few bytes. This is critical:
-      //    preload.cjs filters chunks by buffering incomplete lines that
-      //    contain __NCMCP_. Without this prefix, the first chunk of a
-      //    long echo line might not contain the marker and would leak
-      //    through to the terminal as garbage.
-      //
-      // 2) The user command is executed via eval on a quoted string. This
-      //    keeps shell syntax errors inside the eval call so the wrapper
-      //    can still emit the end marker and return a non-zero exit code.
-      //
-      // 3) Single-line { ... } is parsed fully before execution, so SIGINT
-      //    cannot cause bash to flush the end marker from the input buffer.
-      //    trap ':' INT lets child processes receive SIGINT normally while
-      //    preventing the shell from aborting the compound command.
-      const noPager = "PAGER=cat SYSTEMD_PAGER= GIT_PAGER=cat LESS= ";
-      const escaped = escapePosixSingleQuoted(command);
-      return (
-        `${marker}=0; ${marker}_cmd='${escaped}'; { printf '%s\\n' '${marker}_S'; trap ':' INT; ${noPager}eval "$${marker}_cmd"; __NCMCP_rc=$?; trap - INT; printf '%s\\n' '${marker}_E:'\"$__NCMCP_rc\"; (exit $__NCMCP_rc); }\n`
-      );
-    }
-  }
-}
-
-function findEndMarker(outputText, marker) {
-  const endPattern = marker + "_E:";
-  let searchFrom = 0;
-  while (searchFrom < outputText.length) {
-    const endIdx = outputText.indexOf(endPattern, searchFrom);
-    if (endIdx === -1) return null;
-
-    // Accept if at start of output, or preceded by \n or \r (line boundary)
-    if (endIdx === 0 || outputText[endIdx - 1] === "\n" || outputText[endIdx - 1] === "\r") {
-      const afterEnd = outputText.slice(endIdx + endPattern.length);
-      const codeMatch = afterEnd.match(/^(\d+)/);
-      const exitCode = codeMatch ? parseInt(codeMatch[1], 10) : null;
-      if (exitCode !== null) {
-        return { endIdx, exitCode };
-      }
-    }
-    searchFrom = endIdx + 1;
-  }
-  return null;
-}
-
-function normalizePtyOutput(stdout, {
-  stripMarkers = false,
-  expectedPrompt = "",
-  trimOutput = true,
-  stripPrompt = true,
-  markerToStrip = null,
-} = {}) {
-  let cleaned = stripAnsi(stdout || "").replace(/\r/g, "");
-  if (stripMarkers) {
-    // Prefer the job-specific marker so user output that contains "__NCMCP_"
-    // (e.g. printf '__NCMCP_demo\n') is preserved.
-    const pattern = markerToStrip
-      ? new RegExp(`^[^\r\n]*${markerToStrip}[^\r\n]*[\r\n]*`, "gm")
-      : /^[^\r\n]*__NCMCP_[^\r\n]*[\r\n]*/gm;
-    cleaned = cleaned.replace(pattern, "");
-  }
-  const normalizedPrompt = stripAnsi(String(expectedPrompt || "")).replace(/\r/g, "");
-  if (stripPrompt && normalizedPrompt && cleaned.endsWith(normalizedPrompt)) {
-    cleaned = cleaned.slice(0, cleaned.length - normalizedPrompt.length);
-  }
-  return trimOutput ? cleaned.trim() : cleaned;
-}
-
-function appendBoundedOutput(current, chunk, maxBufferedChars) {
-  const combined = `${current || ""}${chunk || ""}`;
-  const limit = Number.isFinite(maxBufferedChars) ? Math.max(0, Math.floor(maxBufferedChars)) : 0;
-  if (limit <= 0 || combined.length <= limit) {
-    return { text: combined, dropped: 0 };
-  }
-  const dropped = combined.length - limit;
-  return {
-    text: combined.slice(dropped),
-    dropped,
-  };
-}
-
-function consumeVisibleText(carry, chunk) {
-  const input = `${carry || ""}${chunk || ""}`;
-  if (!input) {
-    return { visibleText: "", carry: "" };
-  }
-
-  let visibleText = "";
-  let index = 0;
-
-  while (index < input.length) {
-    const ch = input[index];
-
-    if (ch === "\r") {
-      // Preserve \r so consumers / serializers can collapse progress-bar
-      // redraws to the latest frame. \r\n becomes a single \n.
-      if (input[index + 1] === "\n") {
-        visibleText += "\n";
-        index += 2;
-        continue;
-      }
-      visibleText += "\r";
-      index += 1;
-      continue;
-    }
-
-    if (ch !== "\u001b") {
-      visibleText += ch;
-      index += 1;
-      continue;
-    }
-
-    if (index + 1 >= input.length) {
-      break;
-    }
-
-    const next = input[index + 1];
-
-    if (next === "[") {
-      let cursor = index + 2;
-      let complete = false;
-      while (cursor < input.length) {
-        const code = input.charCodeAt(cursor);
-        if (code >= 0x40 && code <= 0x7e) {
-          index = cursor + 1;
-          complete = true;
-          break;
-        }
-        cursor += 1;
-      }
-      if (!complete) break;
-      continue;
-    }
-
-    if (next === "]") {
-      let cursor = index + 2;
-      let complete = false;
-      while (cursor < input.length) {
-        const oscChar = input[cursor];
-        if (oscChar === "\u0007") {
-          index = cursor + 1;
-          complete = true;
-          break;
-        }
-        if (oscChar === "\u001b") {
-          if (cursor + 1 >= input.length) break;
-          if (input[cursor + 1] === "\\") {
-            index = cursor + 2;
-            complete = true;
-            break;
-          }
-        }
-        cursor += 1;
-      }
-      if (!complete) break;
-      continue;
-    }
-
-    visibleText += ch;
-    index += 1;
-  }
-
-  return {
-    visibleText,
-    carry: input.slice(index),
-  };
-}
+const {
+  createStatefulDecoder,
+  detectShellKind,
+  subscribeToPtyData,
+  hasExpectedPromptSuffix,
+  resolveEffectiveShellKind,
+  buildWrappedCommand,
+  findEndMarker,
+  normalizePtyOutput,
+  appendBoundedOutput,
+  consumeVisibleText,
+  stripAnsi,
+} = require("./ptyExecHelpers.cjs");
 
 function startPtyJob(ptyStream, command, options) {
   const {
@@ -285,7 +41,7 @@ function startPtyJob(ptyStream, command, options) {
   } = options || {};
 
   const marker = `__NCMCP_${Date.now().toString(36)}_${crypto.randomBytes(16).toString('hex')}__`;
-  const resolvedShellKind = shellKind || "posix";
+  const resolvedShellKind = resolveEffectiveShellKind(shellKind, expectedPrompt);
   const CANCEL_RETRY_MS = 5000;
   const CANCEL_WALL_TIMEOUT_MS = 30000;
 
@@ -844,7 +600,36 @@ function execViaChannel(sshClient, command, options) {
   } = options || {};
 
   return new Promise((resolve) => {
-    sshClient.exec(command, (err, execStream) => {
+    // Register a *pending* cancellation marker synchronously, before
+    // `sshClient.exec` opens the channel. Without this, a cancel that
+    // arrives while we're still waiting on `sshClient.exec`'s callback
+    // finds nothing in `activePtyExecs` to act on — the channel then
+    // opens, the real marker registers, and the command runs to
+    // completion despite the user already cancelling. The pending
+    // marker latches `cancelled = true`; when the callback fires we
+    // check the latch and short-circuit instead of starting work.
+    const pendingMarker = `__NCMCP_CH_PENDING_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}__`;
+    let cancelled = false;
+    if (trackForCancellation) {
+      trackForCancellation.set(pendingMarker, {
+        chatSessionId: chatSessionId || null,
+        cancel: () => { cancelled = true; },
+        cleanup: () => { /* nothing pending to clean up before channel opens */ },
+      });
+    }
+
+    try {
+      sshClient.exec(command, (err, execStream) => {
+      if (trackForCancellation) {
+        trackForCancellation.delete(pendingMarker);
+      }
+      if (cancelled) {
+        if (execStream) {
+          try { execStream.close(); } catch { /* ignore */ }
+        }
+        resolve({ ok: false, stdout: "", stderr: "", exitCode: -1, error: "Cancelled" });
+        return;
+      }
       if (err) {
         resolve({ ok: false, error: err.message });
         return;
@@ -895,6 +680,18 @@ function execViaChannel(sshClient, command, options) {
         }
       });
     });
+    } catch (err) {
+      // Rare path: `sshClient.exec` itself synchronously throws (e.g.
+      // because the underlying ssh2 client was destroyed between the
+      // session lookup and now). Drop the pending marker so it doesn't
+      // leak in `activePtyExecs`, and resolve as a normal failure
+      // result instead of letting the Promise reject — the tool layer
+      // expects `{ ok, error }` shape, not a thrown error.
+      if (trackForCancellation) {
+        trackForCancellation.delete(pendingMarker);
+      }
+      resolve({ ok: false, error: err?.message || String(err) });
+    }
   });
 }
 
@@ -943,6 +740,7 @@ function execViaRawPty(serialPort, command, options) {
     let overallTimer = null;
     let idleTimer = null;
     const cleanupFns = [];
+    const decoder = createStatefulDecoder(encoding);
 
     function safeWrite(data) {
       try {
@@ -962,7 +760,12 @@ function execViaRawPty(serialPort, command, options) {
         trackForCancellation.delete(cancelKey);
       }
 
-      let cleaned = stripAnsi(stdout || "").replace(/\r/g, "");
+      // Flush any bytes the decoder is still holding (e.g. the leading
+      // half of a multi-byte char that arrived right before finish).
+      let tail = "";
+      try { tail = decoder.end() || ""; } catch { /* ignore */ }
+      const complete = (stdout || "") + tail;
+      let cleaned = stripAnsi(complete).replace(/\r/g, "");
 
       // Strip echoed command from the beginning of output.
       // Network devices typically echo back the typed command on the first line,
@@ -1011,8 +814,11 @@ function execViaRawPty(serialPort, command, options) {
     const MAX_OUTPUT_BYTES = 512 * 1024; // 512 KB
 
     const onData = (data) => {
-      // latin1 for serial ports (matches terminalBridge.cjs decoder); utf8 for SSH PTY streams.
-      const chunk = typeof data === "string" ? data : data.toString(encoding);
+      // Encoding follows the session: utf8 for SSH PTY streams, whatever the
+      // user picked for serial (utf-8/gb18030/...). The decoder is stateful
+      // so multi-byte characters split across chunks get stitched back
+      // together instead of emitting replacement bytes.
+      const chunk = typeof data === "string" ? data : decoder.write(data);
       chunkCount++;
       // Cancel the no-response fallback on first data
       if (noResponseTimer) {
@@ -1104,5 +910,6 @@ module.exports = {
   execViaChannel,
   execViaRawPty,
   detectShellKind,
+  resolveEffectiveShellKind,
   stripAnsi,
 };

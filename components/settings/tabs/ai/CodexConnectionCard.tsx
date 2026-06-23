@@ -1,10 +1,9 @@
 import React from "react";
-import { ExternalLink, LogIn, LogOut, RefreshCw, X } from "lucide-react";
+import { ExternalLink, LogIn, LogOut, RefreshCw, RotateCcw, X } from "lucide-react";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
 import { cn } from "../../../../lib/utils";
 import type { AgentPathInfo, CodexIntegrationStatus, CodexLoginSession } from "./types";
-import { ProviderIconBadge } from "./ProviderIconBadge";
 
 export const CodexConnectionCard: React.FC<{
   pathInfo: AgentPathInfo | null;
@@ -12,10 +11,11 @@ export const CodexConnectionCard: React.FC<{
   customPath: string;
   onCustomPathChange: (path: string) => void;
   onRecheckPath: () => void;
+  onResetPath: () => void;
   integration: CodexIntegrationStatus | null;
   loginSession: CodexLoginSession | null;
   isLoading: boolean;
-  hasOpenAiProviderKey: boolean;
+  hasPendingCustomPath?: boolean;
   error: string | null;
   onRefresh: () => void;
   onConnect: () => void;
@@ -28,10 +28,11 @@ export const CodexConnectionCard: React.FC<{
   customPath,
   onCustomPathChange,
   onRecheckPath,
+  onResetPath,
   integration,
   loginSession,
   isLoading,
-  hasOpenAiProviderKey,
+  hasPendingCustomPath = false,
   error,
   onRefresh,
   onConnect,
@@ -41,6 +42,14 @@ export const CodexConnectionCard: React.FC<{
 }) => {
   const { t } = useI18n();
   const found = pathInfo?.available;
+
+  const customConfigIncomplete = Boolean(
+    integration?.state === "connected_custom_config"
+    && integration.customConfig
+    && integration.customConfig.envKey
+    && !integration.customConfig.envKeyPresent
+    && !integration.customConfig.hasHardcodedApiKey,
+  );
 
   const status = isResolvingPath
     ? t('ai.codex.detecting')
@@ -52,9 +61,13 @@ export const CodexConnectionCard: React.FC<{
           ? t('ai.codex.connectedChatGPT')
           : integration?.state === "connected_api_key"
             ? t('ai.codex.connectedApiKey')
-            : integration?.state === "not_logged_in"
-              ? t('ai.codex.notConnected')
-              : t('ai.codex.statusUnknown');
+            : integration?.state === "connected_custom_config"
+              ? customConfigIncomplete
+                ? t('ai.codex.customConfigIncomplete')
+                : t('ai.codex.connectedCustomConfig')
+              : integration?.state === "not_logged_in"
+                ? t('ai.codex.notConnected')
+                : t('ai.codex.statusUnknown');
 
   const statusClassName = isResolvingPath
     ? "text-muted-foreground"
@@ -62,9 +75,11 @@ export const CodexConnectionCard: React.FC<{
       ? "text-amber-500"
       : loginSession?.state === "running"
         ? "text-amber-500"
-        : integration?.isConnected
-          ? "text-emerald-500"
-          : "text-muted-foreground";
+        : customConfigIncomplete
+          ? "text-amber-500"
+          : integration?.isConnected
+            ? "text-emerald-500"
+            : "text-muted-foreground";
 
   const outputText = loginSession?.error
     ? loginSession.error
@@ -75,24 +90,17 @@ export const CodexConnectionCard: React.FC<{
         : "";
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/20 p-4 space-y-3">
+    <div className="rounded-lg border bg-card p-4 space-y-3">
       <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <ProviderIconBadge providerId="openai" size="sm" />
-            <span className="text-sm font-medium">{t('ai.codex.title')}</span>
-          </div>
-          <p className="text-xs text-muted-foreground mt-2 leading-5">
-            {t('ai.codex.description')}
-          </p>
-        </div>
+        <p className="min-w-0 text-xs text-muted-foreground leading-5">
+          {t('ai.codex.description')}
+        </p>
         <div className={cn("text-xs font-medium shrink-0", statusClassName)}>
           {status}
         </div>
       </div>
 
-      {/* Path detection info */}
-      {found ? (
+      {found && (
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">{t('ai.codex.path')}</span>
           <span className="font-mono text-foreground truncate">{pathInfo.path}</span>
@@ -103,11 +111,15 @@ export const CodexConnectionCard: React.FC<{
             </>
           )}
         </div>
-      ) : !isResolvingPath ? (
+      )}
+
+      {!isResolvingPath && (
         <div className="space-y-2">
-          <p className="text-xs text-amber-500">
-            {t('ai.codex.notFoundHint')}
-          </p>
+          {!found && (
+            <p className="text-xs text-amber-500">
+              {t('ai.codex.notFoundHint')}
+            </p>
+          )}
           <div className="flex items-center gap-2">
             <input
               type="text"
@@ -120,9 +132,13 @@ export const CodexConnectionCard: React.FC<{
               <RefreshCw size={14} className="mr-1.5" />
               {t('ai.codex.check')}
             </Button>
+            <Button variant="ghost" size="sm" onClick={onResetPath} disabled={!customPath.trim()}>
+              <RotateCcw size={14} className="mr-1.5" />
+              {t('ai.codex.resetPath')}
+            </Button>
           </div>
         </div>
-      ) : null}
+      )}
 
       {/* Connection & login UI -- only when codex is detected */}
       {found && (
@@ -139,28 +155,44 @@ export const CodexConnectionCard: React.FC<{
                   {t('common.cancel')}
                 </Button>
               </>
+            ) : integration?.state === "connected_custom_config" ? (
+              // Nothing to log out of; config.toml is user-owned state.
+              null
             ) : integration?.isConnected ? (
-              <Button variant="outline" size="sm" onClick={onLogout}>
+              <Button variant="outline" size="sm" onClick={onLogout} disabled={hasPendingCustomPath}>
                 <LogOut size={14} className="mr-1.5" />
                 {t('ai.codex.logout')}
               </Button>
             ) : (
-              <Button variant="default" size="sm" onClick={onConnect}>
+              <Button variant="default" size="sm" onClick={onConnect} disabled={hasPendingCustomPath}>
                 <LogIn size={14} className="mr-1.5" />
                 {t('ai.codex.connectChatGPT')}
               </Button>
             )}
 
-            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading}>
+            <Button variant="outline" size="sm" onClick={onRefresh} disabled={isLoading || hasPendingCustomPath}>
               <RefreshCw size={14} className={cn("mr-1.5", isLoading && "animate-spin")} />
               {t('ai.codex.refreshStatus')}
             </Button>
           </div>
 
-          {hasOpenAiProviderKey && (
-            <p className="text-xs text-emerald-500">
-              {t('ai.codex.apiKeyHint')}
-            </p>
+          {integration?.state === "connected_custom_config" && integration.customConfig && (
+            <>
+              <p className="text-xs text-emerald-500">
+                {t('ai.codex.customConfigHint').replace(
+                  '{provider}',
+                  integration.customConfig.displayName || integration.customConfig.providerName,
+                )}
+              </p>
+              {integration.customConfig.envKey && !integration.customConfig.envKeyPresent && !integration.customConfig.hasHardcodedApiKey && (
+                <p className="text-xs text-amber-500">
+                  {t('ai.codex.customConfigMissingEnvKey').replace(
+                    '{envKey}',
+                    integration.customConfig.envKey,
+                  )}
+                </p>
+              )}
+            </>
           )}
         </>
       )}

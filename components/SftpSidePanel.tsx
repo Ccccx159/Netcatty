@@ -10,19 +10,24 @@
  * Used in TerminalLayer to provide SFTP alongside terminal sessions.
  */
 
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { SftpSidePanelDeferredMount } from "./SftpSidePanelDeferredMount";
 import { formatHostPort } from "../domain/host";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useSftpState } from "../application/state/useSftpState";
+import { registerEditorSftpWriterScoped } from "../application/state/editorSftpBridge";
+import { editorTabStore } from "../application/state/editorTabStore";
+import { releaseEditorTabSaveCoordinator } from "../application/state/editorTabSave";
 import { useSftpBackend } from "../application/state/useSftpBackend";
 import { useSftpFileAssociations } from "../application/state/useSftpFileAssociations";
-import { getParentPath } from "../application/state/sftp/utils";
+import { getParentPath, isConcreteTransferTargetPath } from "../application/state/sftp/utils";
 import { buildCacheKey } from "../application/state/sftp/sharedRemoteHostCache";
 import { logger } from "../lib/logger";
 import type { DropEntry } from "../lib/sftpFileUtils";
-import { Host, Identity, SSHKey } from "../types";
+import { Host, Identity, KnownHost, SSHKey } from "../types";
 import type { TransferTask } from "../types";
 import { toast } from "./ui/toast";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { DistroAvatar } from "./DistroAvatar";
 
 import { SftpPaneView } from "./sftp/SftpPaneView";
@@ -35,16 +40,23 @@ import { useSftpKeyboardShortcuts } from "./sftp/hooks/useSftpKeyboardShortcuts"
 import { sftpFocusStore } from "./sftp/hooks/useSftpFocusedPane";
 import { keepOnlyPaneSelections } from "./sftp/hooks/selectionScope";
 import { KeyBinding, HotkeyScheme } from "../domain/models";
+import { shouldFollowTerminalCwdNavigate } from "./sftp/sftpFollowTerminalCwd";
 
 interface SftpSidePanelProps {
   hosts: Host[];
+  writableHosts?: Host[];
   keys: SSHKey[];
   identities: Identity[];
+  knownHosts?: KnownHost[];
   updateHosts: (hosts: Host[]) => void;
+  onAddKnownHost?: (knownHost: KnownHost) => void;
   sftpDefaultViewMode: "list" | "tree";
   /** The host to connect to (follows focused terminal) */
   activeHost: Host | null;
+  /** The terminal session id whose SSH connection can be reused for SFTP */
+  activeSessionId?: string | null;
   initialLocation?: { hostId: string; path: string } | null;
+  onInitialLocationApplied?: (location: { hostId: string; path: string }) => void;
   showWorkspaceHostHeader?: boolean;
   isVisible?: boolean;
   renderOverlays?: boolean;
@@ -64,17 +76,27 @@ interface SftpSidePanelProps {
   keyBindings: KeyBinding[];
   editorWordWrap: boolean;
   setEditorWordWrap: (value: boolean) => void;
-  onGetTerminalCwd?: () => Promise<string | null>;
+  onGetTerminalCwd?: (options?: { preferFreshBackend?: boolean }) => Promise<string | null>;
+  activeTerminalCwd?: string | null;
+  sftpFollowTerminalCwd?: boolean;
+  onSftpFollowTerminalCwdChange?: (enabled: boolean) => void;
+  onRequestTerminalFocus?: () => void;
+  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
 }
 
 const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   hosts,
+  writableHosts,
   keys,
   identities,
+  knownHosts = [],
   updateHosts,
+  onAddKnownHost,
   sftpDefaultViewMode,
   activeHost,
+  activeSessionId,
   initialLocation,
+  onInitialLocationApplied,
   showWorkspaceHostHeader = false,
   isVisible = true,
   renderOverlays = true,
@@ -89,8 +111,14 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   editorWordWrap,
   setEditorWordWrap,
   onGetTerminalCwd,
+  activeTerminalCwd = null,
+  sftpFollowTerminalCwd = false,
+  onSftpFollowTerminalCwdChange,
+  onRequestTerminalFocus,
+  terminalSettings,
 }) => {
   const { t } = useI18n();
+  const hostWriteSource = writableHosts ?? hosts;
 
   const fileWatchHandlers = useMemo(() => ({
     onFileWatchSynced: (payload: { remotePath: string }) => {
@@ -109,7 +137,10 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     useCompressedUpload: sftpUseCompressedUpload,
     defaultShowHiddenFiles: sftpShowHiddenFiles,
     autoConnectLocalOnMount: false,
-  }), [fileWatchHandlers, sftpUseCompressedUpload, sftpShowHiddenFiles]);
+    terminalSettings,
+    knownHosts,
+    onAddKnownHost,
+  }), [fileWatchHandlers, sftpUseCompressedUpload, sftpShowHiddenFiles, terminalSettings, knownHosts, onAddKnownHost]);
 
   const sftp = useSftpState(hosts, keys, identities, sftpOptions);
   const {
@@ -120,207 +151,87 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     mkdirLocal,
     deleteLocalFile,
     listLocalDir,
+    listDrives,
+    openPath,
   } = useSftpBackend();
 
   const sftpRef = useRef(sftp);
   sftpRef.current = sftp;
+
+  // Register this instance's writeTextFileByConnection with the editor bridge
+  // so editor tabs promoted from SFTP files opened in a terminal side panel
+  // can still route saves through this useSftpState.
+  //
+  // Intentionally no deps — go through sftpRef so SFTP state churn (transfers,
+  // tab switches, listings) doesn't make this unregister+reregister on every
+  // re-render.
+  useEffect(() => {
+    return registerEditorSftpWriterScoped((connectionId, expectedHostId, filePath, content, encoding) =>
+      sftpRef.current.writeTextFileByConnection(connectionId, expectedHostId, filePath, content, encoding),
+    );
+  }, []);
+
+  // When this side panel unmounts (its hosting terminal tab was closed) we
+  // force-close any editor tabs bound to connections this panel owned — the
+  // save channel is gone with the SFTP session and there's no way to recover
+  // it. Dirty state is dropped intentionally; the user closed the terminal
+  // knowing the file was open.
+  //
+  // Collect every connection id across all left/right tabs — the panel can
+  // host multiple SFTP tabs per side, and an editor tab promoted from an
+  // inactive-pane tab would otherwise be stranded by the unmount.
+  useEffect(() => {
+    return () => {
+      const s = sftpRef.current;
+      if (!s) return;
+      const owned = new Set<string>();
+      for (const tab of s.leftTabs?.tabs ?? []) {
+        const id = tab.connection?.id;
+        if (id) owned.add(id);
+      }
+      for (const tab of s.rightTabs?.tabs ?? []) {
+        const id = tab.connection?.id;
+        if (id) owned.add(id);
+      }
+      if (owned.size === 0) return;
+      const closed = editorTabStore.forceCloseBySessions([...owned]);
+      closed.forEach(releaseEditorTabSaveCoordinator);
+    };
+  }, []);
 
   const behaviorRef = useRef(sftpDoubleClickBehavior);
   behaviorRef.current = sftpDoubleClickBehavior;
 
   const autoSyncRef = useRef(sftpAutoSync);
   autoSyncRef.current = sftpAutoSync;
-  const panelRootRef = useRef<HTMLDivElement>(null);
-  const dialogActionScopeIdRef = useRef(`sftp-side-panel:${crypto.randomUUID()}`);
-  const [hasPaneFocus, setHasPaneFocus] = useState(false);
 
-  useSftpKeyboardShortcuts({
-    keyBindings,
-    hotkeyScheme,
-    sftpRef,
-    dialogActionScopeId: dialogActionScopeIdRef.current,
-    isActive: isVisible && hasPaneFocus,
-  });
-
-  const { getOpenerForFile, setOpenerForExtension } = useSftpFileAssociations();
-  const getOpenerForFileRef = useRef(getOpenerForFile);
-  getOpenerForFileRef.current = getOpenerForFile;
-
-  const handleToggleHiddenFiles = useCallback((paneId: string) => {
-    const pane = sftpRef.current.leftTabs.tabs.find((tab) => tab.id === paneId);
-    if (!pane) return;
-    sftpRef.current.setShowHiddenFiles("left", paneId, !pane.showHiddenFiles);
-  }, []);
-
-  const syncFocusedSelection = useCallback((tabId: string | null) => {
-    if (tabId) {
-      keepOnlyPaneSelections(sftpRef.current, { side: "left", tabId });
-      return;
-    }
-    keepOnlyPaneSelections(sftpRef.current, null);
-  }, []);
-
-  const handlePaneFocus = useCallback(() => {
-    sftpFocusStore.setFocusedSide("left");
-    setHasPaneFocus(true);
-    syncFocusedSelection(sftpRef.current.getActiveTabId("left"));
-  }, [syncFocusedSelection]);
-
-  // NOTE: We intentionally do NOT sync to activeTabStore here.
-  // activeTabStore is a global singleton shared with SftpView.
-  // Writing to it here would corrupt SftpView's left pane visibility.
-
-  useEffect(() => {
-    if (!isVisible) {
-      setHasPaneFocus(false);
-      syncFocusedSelection(null);
-    }
-  }, [isVisible, syncFocusedSelection]);
-
-  useEffect(() => {
-    if (!isVisible) return;
-
-    const handlePointerDown = (event: PointerEvent) => {
-      const target = event.target as Node | null;
-      const elementTarget = target instanceof Element ? target : null;
-      const isPortalInteraction = !!elementTarget?.closest(
-        '#netcatty-context-menu-root, [role="dialog"], [data-radix-popper-content-wrapper]',
-      );
-      if (isPortalInteraction) {
-        return;
-      }
-
-      if (panelRootRef.current?.contains(target)) {
-        sftpFocusStore.setFocusedSide("left");
-        setHasPaneFocus(true);
-        syncFocusedSelection(sftpRef.current.getActiveTabId("left"));
-      } else {
-        setHasPaneFocus(false);
-        syncFocusedSelection(null);
-      }
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-    };
-  }, [isVisible, syncFocusedSelection]);
-
-  const {
-    leftCallbacks,
-    rightCallbacks,
-    dragCallbacks,
-    draggedFiles,
-    permissionsState,
-    setPermissionsState,
-    showTextEditor,
-    setShowTextEditor,
-    textEditorTarget,
-    setTextEditorTarget,
-    textEditorContent,
-    setTextEditorContent,
-    showFileOpenerDialog,
-    setShowFileOpenerDialog,
-    fileOpenerTarget,
-    setFileOpenerTarget,
-    handleSaveTextFile,
-    handleFileOpenerSelect,
-    handleSelectSystemApp,
-  } = useSftpViewPaneCallbacks({
-    sftpRef,
-    behaviorRef,
-    autoSyncRef,
-    getOpenerForFileRef,
-    setOpenerForExtension,
-    t,
-    listSftp,
-    mkdirLocal,
-    deleteLocalFile,
-    showSaveDialog,
-    selectDirectory,
-    startStreamTransfer,
-    getSftpIdForConnection: sftp.getSftpIdForConnection,
-    listLocalFiles: listLocalDir,
-  });
-
-  const {
-    leftPanes,
-    showHostPickerLeft,
-    showHostPickerRight,
-    hostSearchLeft,
-    hostSearchRight,
-    setShowHostPickerLeft,
-    setShowHostPickerRight,
-    setHostSearchLeft,
-    setHostSearchRight,
-    handleHostSelectLeft,
-    handleHostSelectRight,
-  } = useSftpViewTabs({ sftp, sftpRef });
-
-  // Auto-connect when activeHost changes.
-  // Uses sftpRef to avoid re-triggering on every sftp state change.
   const connectedKeyRef = useRef<string | null>(null);
-  // Store the Host object used for the current connection so the header
-  // can show session-time overrides even during deferred host switches.
   const connectedHostObjRef = useRef<Host | null>(null);
   const lastAppliedInitialLocationKeyRef = useRef<string | null>(null);
   const handledPendingUploadIdRef = useRef<string | null>(null);
-  // Maps tab IDs to the connectionKey used to create them, so we can
-  // correctly identify tabs when the same host ID has different overrides.
   const tabConnectionKeyMapRef = useRef<Map<string, string>>(new Map());
+  const [interactiveWorkActive, setInteractiveWorkActive] = useState(false);
+  const [sftpUiReady, setSftpUiReady] = useState(false);
 
-  // NOTE: We intentionally do NOT reset lastAppliedInitialLocationKeyRef on
-  // visibility changes. When the user switches terminal tabs, the panel
-  // toggles isVisible but should preserve its navigation state (the user may
-  // have navigated away from initialLocation). When the panel is truly
-  // closed, the component unmounts and all refs are naturally reset.
-
-  // Navigate SFTP to the terminal's current working directory
-  const handleGoToTerminalCwd = useCallback(async () => {
-    if (!onGetTerminalCwd) return;
-    const cwd = await onGetTerminalCwd();
-    if (cwd) {
-      sftpRef.current.navigateTo("left", cwd);
-    }
-  }, [onGetTerminalCwd]);
-
-  // Track whether there's active work that should block connection switching.
-  // Computed outside the effect so it can be in the dependency array.
-  // Block host-following while any connection-sensitive interactive UI is
-  // active: text editor, permissions dialog, file-opener dialog, or
-  // auto-synced external file watches.
-  // Note: transfers are NOT included here — they run on their own sftpId
-  // independent of the active tab, and forceNewTab preserves old connections.
-  const hasActiveWork = showTextEditor || !!permissionsState || showFileOpenerDialog
-    || (sftp.activeFileWatchCountRef?.current ?? 0) > 0;
-
-  useEffect(() => {
+  const runAutoConnect = useCallback(() => {
     if (!activeHost) return;
 
     const s = sftpRef.current;
+    const hasActiveWork = interactiveWorkActive
+      || (s.activeFileWatchCountRef?.current ?? 0) > 0;
 
-    // Serial terminals don't support SFTP — disconnect any existing
-    // connection (remote or local) so the panel doesn't remain bound to
-    // a previous host.
     const proto = activeHost.protocol;
     if (proto === 'serial' || activeHost.id?.startsWith('serial-')) {
-      // Serial terminals don't support SFTP. Just clear the tracked
-      // connection key so switching back to a remote terminal will
-      // trigger auto-connect. Don't disconnect existing tabs — they
-      // may be reused when focus returns.
       connectedKeyRef.current = null;
       return;
     }
-    // Local terminals connect to the local file browser
     if (proto === 'local' || activeHost.id?.startsWith('local-')) {
       if (hasActiveWork) return;
       const leftConn = s.leftPane.connection;
       if (leftConn?.isLocal) {
-        // Already connected locally
         connectedKeyRef.current = "local";
         return;
       }
-      // Check for an existing local tab to reuse
       const existingLocalTab = s.leftTabs.tabs.find((tab) =>
         tab.connection?.isLocal && tab.connection.status === "connected",
       );
@@ -330,27 +241,28 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
         return;
       }
       connectedKeyRef.current = "local";
-      // Preserve existing remote tab when switching to local
       const needsNewTab = !!(leftConn && leftConn.status === "connected");
       if (needsNewTab) {
         s.connect("left", "local", { forceNewTab: true });
       } else if (leftConn) {
-        // Await disconnect before connecting locally to avoid the async
-        // disconnect wiping out the fresh local connection.
         void s.disconnect("left").then(() => s.connect("left", "local"));
       } else {
         s.connect("left", "local");
       }
       return;
     }
-    // Build a connection key that accounts for session-time overrides
-    // (same host ID may have different port/protocol in different workspace panes).
-    // Uses buildCacheKey to stay consistent with the key recorded on upload tasks.
-    const connectionKey = buildCacheKey(activeHost.id, activeHost.hostname, activeHost.port, activeHost.protocol, activeHost.sftpSudo, activeHost.username);
-    if (connectedKeyRef.current === connectionKey) return;
 
-    // Don't switch connections while transfers or editor are active
+    const connectionKey = buildCacheKey(
+      activeHost.id,
+      activeHost.hostname,
+      activeHost.port,
+      activeHost.protocol,
+      activeHost.sftpSudo,
+      activeHost.username,
+    );
+    if (connectedKeyRef.current === connectionKey) return;
     if (hasActiveWork) return;
+
     logger.info("[SftpSidePanel] Auto-connect triggered", {
       hostId: activeHost.id,
       hostLabel: activeHost.label,
@@ -358,14 +270,9 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       hostname: activeHost.hostname,
     });
 
-    // Check if an existing SFTP tab matches this exact endpoint.
-    // We track which connectionKey was used to create each tab so that
-    // tabs for the same host ID with different session-time overrides
-    // (port/protocol) are not incorrectly reused.
     const tabs = s.leftTabs.tabs;
     const existingTab = tabs.find((tab) => {
       if (!tab.connection || tab.connection.hostId !== activeHost.id) return false;
-      // Don't reuse errored tabs — they need a fresh connection
       if (tab.connection.status === "error" || tab.connection.status === "disconnected") return false;
       return tabConnectionKeyMapRef.current.get(tab.id) === connectionKey;
     });
@@ -376,28 +283,33 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       return;
     }
 
-    // Create a new tab when there's already an active connection, so the
-    // previous tab is preserved for instant switching on focus change.
-    // This covers both different hosts AND same host with different
-    // session-time overrides (port/protocol), preventing the old SFTP
-    // session from being closed while it may have in-flight transfers.
     const currentConn = s.leftPane.connection;
     const needsNewTab = !!(currentConn && currentConn.status === "connected");
 
     connectedKeyRef.current = connectionKey;
     connectedHostObjRef.current = activeHost;
     s.connect("left", activeHost, {
+      sourceSessionId: activeSessionId ?? undefined,
       ...(needsNewTab ? { forceNewTab: true } : undefined),
       onTabCreated: (tabId) => {
         tabConnectionKeyMapRef.current.set(tabId, connectionKey);
       },
     });
-  }, [activeHost, hasActiveWork]); // Re-evaluate when work finishes so deferred switch can proceed
+  }, [activeHost, activeSessionId, interactiveWorkActive]);
 
-  // Clear the remembered connection key when the pane disconnects or the
-  // session is lost, so re-opening SFTP for the same terminal reconnects.
-  // Also reset the file-watch counter — watches are bound to the SFTP session,
-  // so they stop when the session disconnects.
+  useEffect(() => {
+    if (!activeHost || !isVisible) return;
+
+    let cancelled = false;
+    const frameId = requestAnimationFrame(() => {
+      if (!cancelled) runAutoConnect();
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frameId);
+    };
+  }, [activeHost, activeSessionId, interactiveWorkActive, isVisible, runAutoConnect]);
+
   useEffect(() => {
     const connection = sftp.leftPane.connection;
     if (!connection || connection.status === "error" || connection.status === "disconnected") {
@@ -417,21 +329,21 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     if (!connection || connection.isLocal || connection.hostId !== activeHost.id) return;
     if (connection.status !== "connected") return;
 
-    // Include full endpoint key so that same-hostId sessions with
-    // different overrides each get their initial location applied.
     const locationKey = `${connectedKeyRef.current}:${initialLocation.path}`;
     if (lastAppliedInitialLocationKeyRef.current === locationKey) return;
 
+    lastAppliedInitialLocationKeyRef.current = locationKey;
+    onInitialLocationApplied?.(initialLocation);
+
     if (connection.currentPath === initialLocation.path) {
-      lastAppliedInitialLocationKeyRef.current = locationKey;
       return;
     }
 
-    lastAppliedInitialLocationKeyRef.current = locationKey;
     sftpRef.current.navigateTo("left", initialLocation.path);
   }, [
     activeHost,
     initialLocation,
+    onInitialLocationApplied,
     sftp.leftPane,
   ]);
 
@@ -498,6 +410,321 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     t,
   ]);
 
+  return (
+    <SftpSidePanelDeferredMount ready={sftpUiReady} onReady={() => setSftpUiReady(true)}>
+      <SftpSidePanelInteractiveBody
+        hosts={hosts}
+        hostWriteSource={hostWriteSource}
+        updateHosts={updateHosts}
+        sftp={sftp}
+        sftpRef={sftpRef}
+        sftpDefaultViewMode={sftpDefaultViewMode}
+        activeHost={activeHost}
+        showWorkspaceHostHeader={showWorkspaceHostHeader}
+        renderOverlays={renderOverlays}
+        sftpDoubleClickBehavior={sftpDoubleClickBehavior}
+        sftpAutoSync={sftpAutoSync}
+        hotkeyScheme={hotkeyScheme}
+        keyBindings={keyBindings}
+        editorWordWrap={editorWordWrap}
+        setEditorWordWrap={setEditorWordWrap}
+        onGetTerminalCwd={onGetTerminalCwd}
+        activeTerminalCwd={activeTerminalCwd}
+        sftpFollowTerminalCwd={sftpFollowTerminalCwd}
+        onSftpFollowTerminalCwdChange={onSftpFollowTerminalCwdChange}
+        onRequestTerminalFocus={onRequestTerminalFocus}
+        isVisible={isVisible}
+        behaviorRef={behaviorRef}
+        autoSyncRef={autoSyncRef}
+        connectedHostObjRef={connectedHostObjRef}
+        connectedKeyRef={connectedKeyRef}
+        onInteractiveWorkChange={setInteractiveWorkActive}
+        listSftp={listSftp}
+        mkdirLocal={mkdirLocal}
+        deleteLocalFile={deleteLocalFile}
+        showSaveDialog={showSaveDialog}
+        selectDirectory={selectDirectory}
+        startStreamTransfer={startStreamTransfer}
+        listLocalDir={listLocalDir}
+        listDrives={listDrives}
+        openPath={openPath}
+        t={t}
+      />
+    </SftpSidePanelDeferredMount>
+  );
+};
+
+type SftpSidePanelInteractiveBodyProps = {
+  hosts: Host[];
+  hostWriteSource: Host[];
+  updateHosts: (hosts: Host[]) => void;
+  sftp: ReturnType<typeof useSftpState>;
+  sftpRef: MutableRefObject<ReturnType<typeof useSftpState>>;
+  sftpDefaultViewMode: "list" | "tree";
+  activeHost: Host | null;
+  showWorkspaceHostHeader: boolean;
+  renderOverlays: boolean;
+  sftpDoubleClickBehavior: "open" | "transfer";
+  sftpAutoSync: boolean;
+  hotkeyScheme: HotkeyScheme;
+  keyBindings: KeyBinding[];
+  editorWordWrap: boolean;
+  setEditorWordWrap: (value: boolean) => void;
+  onGetTerminalCwd?: (options?: { preferFreshBackend?: boolean }) => Promise<string | null>;
+  activeTerminalCwd?: string | null;
+  sftpFollowTerminalCwd: boolean;
+  onSftpFollowTerminalCwdChange?: (enabled: boolean) => void;
+  onRequestTerminalFocus?: () => void;
+  isVisible: boolean;
+  behaviorRef: MutableRefObject<"open" | "transfer">;
+  autoSyncRef: MutableRefObject<boolean>;
+  connectedHostObjRef: MutableRefObject<Host | null>;
+  connectedKeyRef: MutableRefObject<string | null>;
+  onInteractiveWorkChange: (active: boolean) => void;
+  listSftp: ReturnType<typeof useSftpBackend>["listSftp"];
+  mkdirLocal: ReturnType<typeof useSftpBackend>["mkdirLocal"];
+  deleteLocalFile: ReturnType<typeof useSftpBackend>["deleteLocalFile"];
+  showSaveDialog: ReturnType<typeof useSftpBackend>["showSaveDialog"];
+  selectDirectory: ReturnType<typeof useSftpBackend>["selectDirectory"];
+  startStreamTransfer: ReturnType<typeof useSftpBackend>["startStreamTransfer"];
+  listLocalDir: ReturnType<typeof useSftpBackend>["listLocalDir"];
+  listDrives: ReturnType<typeof useSftpBackend>["listDrives"];
+  openPath: ReturnType<typeof useSftpBackend>["openPath"];
+  t: ReturnType<typeof useI18n>["t"];
+};
+
+const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> = ({
+  hosts,
+  hostWriteSource,
+  updateHosts,
+  sftp,
+  sftpRef,
+  sftpDefaultViewMode,
+  activeHost,
+  showWorkspaceHostHeader,
+  renderOverlays,
+  hotkeyScheme,
+  keyBindings,
+  editorWordWrap,
+  setEditorWordWrap,
+  onGetTerminalCwd,
+  activeTerminalCwd = null,
+  sftpFollowTerminalCwd,
+  onSftpFollowTerminalCwdChange,
+  onRequestTerminalFocus,
+  isVisible,
+  behaviorRef,
+  autoSyncRef,
+  connectedHostObjRef,
+  connectedKeyRef,
+  onInteractiveWorkChange,
+  listSftp,
+  mkdirLocal,
+  deleteLocalFile,
+  showSaveDialog,
+  selectDirectory,
+  startStreamTransfer,
+  listLocalDir,
+  listDrives,
+  openPath,
+  t,
+}) => {
+  const panelRootRef = useRef<HTMLDivElement>(null);
+  const dialogActionScopeIdRef = useRef(`sftp-side-panel:${crypto.randomUUID()}`);
+  const [hasPaneFocus, setHasPaneFocus] = useState(false);
+
+  useSftpKeyboardShortcuts({
+    keyBindings,
+    hotkeyScheme,
+    sftpRef,
+    dialogActionScopeId: dialogActionScopeIdRef.current,
+    isActive: hasPaneFocus,
+  });
+
+  const { getOpenerForFile, setOpenerForExtension } = useSftpFileAssociations();
+  const getOpenerForFileRef = useRef(getOpenerForFile);
+  getOpenerForFileRef.current = getOpenerForFile;
+
+  const handleToggleHiddenFiles = useCallback((paneId: string) => {
+    const pane = sftpRef.current.leftTabs.tabs.find((tab) => tab.id === paneId);
+    if (!pane) return;
+    sftpRef.current.setShowHiddenFiles("left", paneId, !pane.showHiddenFiles);
+  }, [sftpRef]);
+
+  const syncFocusedSelection = useCallback((tabId: string | null) => {
+    if (tabId) {
+      keepOnlyPaneSelections(sftpRef.current, { side: "left", tabId });
+      return;
+    }
+    keepOnlyPaneSelections(sftpRef.current, null);
+  }, [sftpRef]);
+
+  const handlePaneFocus = useCallback(() => {
+    sftpFocusStore.setFocusedSide("left");
+    setHasPaneFocus(true);
+    syncFocusedSelection(sftpRef.current.getActiveTabId("left"));
+  }, [sftpRef, syncFocusedSelection]);
+
+  // NOTE: We intentionally do NOT sync to activeTabStore here.
+  // activeTabStore is a global singleton shared with SftpView.
+  // Writing to it here would corrupt SftpView's left pane visibility.
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      const elementTarget = target instanceof Element ? target : null;
+      const isPortalInteraction = !!elementTarget?.closest(
+        '#netcatty-context-menu-root, [role="dialog"], [data-radix-popper-content-wrapper]',
+      );
+      if (isPortalInteraction) {
+        return;
+      }
+
+      if (panelRootRef.current?.contains(target)) {
+        sftpFocusStore.setFocusedSide("left");
+        setHasPaneFocus(true);
+        syncFocusedSelection(sftpRef.current.getActiveTabId("left"));
+      } else {
+        setHasPaneFocus(false);
+        syncFocusedSelection(null);
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+    };
+  }, [sftpRef, syncFocusedSelection]);
+
+  const {
+    leftCallbacks,
+    rightCallbacks,
+    dragCallbacks,
+    draggedFiles,
+    permissionsState,
+    setPermissionsState,
+    showTextEditor,
+    setShowTextEditor,
+    textEditorTarget,
+    setTextEditorTarget,
+    textEditorContent,
+    setTextEditorContent,
+    showFileOpenerDialog,
+    setShowFileOpenerDialog,
+    fileOpenerTarget,
+    setFileOpenerTarget,
+    handleSaveTextFile,
+    onPromoteToTab,
+    handleFileOpenerSelect,
+    handleSelectSystemApp,
+  } = useSftpViewPaneCallbacks({
+    sftpRef,
+    behaviorRef,
+    autoSyncRef,
+    getOpenerForFileRef,
+    setOpenerForExtension,
+    t,
+    listSftp,
+    mkdirLocal,
+    deleteLocalFile,
+    showSaveDialog,
+    selectDirectory,
+    startStreamTransfer,
+    getSftpIdForConnection: sftp.getSftpIdForConnection,
+    listLocalFiles: listLocalDir,
+    listDrives,
+  });
+
+  const {
+    leftPanes,
+    showHostPickerLeft,
+    showHostPickerRight,
+    hostSearchLeft,
+    hostSearchRight,
+    setShowHostPickerLeft,
+    setShowHostPickerRight,
+    setHostSearchLeft,
+    setHostSearchRight,
+    handleHostSelectLeft,
+    handleHostSelectRight,
+  } = useSftpViewTabs({ sftp, sftpRef });
+
+  useEffect(() => {
+    onInteractiveWorkChange(showTextEditor || !!permissionsState || showFileOpenerDialog);
+  }, [onInteractiveWorkChange, permissionsState, showFileOpenerDialog, showTextEditor]);
+
+  const canFollowTerminalCwd = useMemo(() => {
+    if (!onGetTerminalCwd || !activeHost) return false;
+    const proto = activeHost.protocol;
+    if (proto === "local" || proto === "serial") return false;
+    if (activeHost.id?.startsWith("local-") || activeHost.id?.startsWith("serial-")) return false;
+    return true;
+  }, [activeHost, onGetTerminalCwd]);
+
+  const hasActiveWork = showTextEditor || !!permissionsState || showFileOpenerDialog
+    || (sftp.activeFileWatchCountRef?.current ?? 0) > 0;
+
+  const handleGoToTerminalCwd = useCallback(async () => {
+    if (!onGetTerminalCwd) return;
+    const cwd = await onGetTerminalCwd({ preferFreshBackend: true });
+    if (cwd) {
+      sftpRef.current.navigateTo("left", cwd);
+    }
+  }, [onGetTerminalCwd, sftpRef]);
+
+  const syncFollowToTerminalCwd = useCallback(async () => {
+    if (!onGetTerminalCwd || !sftpFollowTerminalCwd || !canFollowTerminalCwd) {
+      return;
+    }
+
+    let terminalCwd = activeTerminalCwd;
+    if (!terminalCwd) {
+      terminalCwd = await onGetTerminalCwd({ preferFreshBackend: true });
+    }
+    if (!terminalCwd) return;
+
+    const connection = sftpRef.current.leftPane.connection;
+    if (!shouldFollowTerminalCwdNavigate({
+      followEnabled: sftpFollowTerminalCwd,
+      isVisible,
+      terminalCwd,
+      currentPath: connection?.currentPath,
+      hasActiveWork,
+      isConnected: Boolean(connection && !connection.isLocal && connection.status === "connected"),
+    })) {
+      return;
+    }
+
+    await sftpRef.current.navigateTo("left", terminalCwd);
+  }, [
+    activeTerminalCwd,
+    canFollowTerminalCwd,
+    hasActiveWork,
+    isVisible,
+    onGetTerminalCwd,
+    sftpRef,
+    sftpFollowTerminalCwd,
+  ]);
+
+  const handleToggleFollowTerminalCwd = useCallback(() => {
+    onSftpFollowTerminalCwdChange?.(!sftpFollowTerminalCwd);
+  }, [onSftpFollowTerminalCwdChange, sftpFollowTerminalCwd]);
+
+  useEffect(() => {
+    if (!sftpFollowTerminalCwd || !canFollowTerminalCwd || !isVisible || hasActiveWork) return;
+    void syncFollowToTerminalCwd();
+  }, [
+    activeTerminalCwd,
+    canFollowTerminalCwd,
+    hasActiveWork,
+    isVisible,
+    sftpFollowTerminalCwd,
+    sftp.leftPane.connection?.currentPath,
+    sftp.leftPane.connection?.status,
+    sftp.leftPane.connection?.isLocal,
+    syncFollowToTerminalCwd,
+  ]);
+
   const MAX_VISIBLE_TRANSFERS = 5;
   const visibleTransfers = useMemo(() => {
     const connection = sftp.leftPane.connection;
@@ -516,18 +743,35 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
   const handleRevealTransferTarget = useCallback(
     async (task: TransferTask) => {
+      if (!isConcreteTransferTargetPath(task)) return;
       const connection = sftpRef.current.leftPane.connection;
+      const revealPath = task.isDirectory ? task.targetPath : getParentPath(task.targetPath);
+
+      if (task.targetConnectionId === "local") {
+        try {
+          const result = await openPath(revealPath);
+          if (result.success) return;
+        } catch {
+          // Show the localized error below.
+        }
+        toast.error(t("sftp.transfers.openTargetFolderError"), "SFTP");
+        return;
+      }
+
       if (!connection || connection.isLocal) return;
 
-      const revealPath = task.isDirectory ? task.targetPath : getParentPath(task.targetPath);
       await sftpRef.current.navigateTo("left", revealPath, { force: true });
     },
-    [],
+    [openPath, sftpRef, t],
   );
 
   const canRevealTransferTarget = useCallback(
     (task: TransferTask) => {
       if (task.status !== "completed") return false;
+      if (!isConcreteTransferTargetPath(task)) return false;
+      if (task.targetConnectionId === "local") {
+        return true;
+      }
       if (task.direction !== "upload" && task.direction !== "remote-to-remote") return false;
 
       const connection = sftp.leftPane.connection;
@@ -545,7 +789,25 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
       return connection.id === task.targetConnectionId;
     },
-    [sftp.leftPane.connection],
+    [connectedKeyRef, sftp.leftPane.connection],
+  );
+
+  const canCopyTransferTargetPath = useCallback(
+    (task: TransferTask) => task.status === "completed" && isConcreteTransferTargetPath(task),
+    [],
+  );
+
+  const handleCopyTransferTargetPath = useCallback(
+    async (task: TransferTask) => {
+      if (!isConcreteTransferTargetPath(task)) return;
+      try {
+        await navigator.clipboard.writeText(task.targetPath);
+        toast.success(t("sftp.transfers.copyTargetPathSuccess"), "SFTP");
+      } catch {
+        toast.error(t("sftp.transfers.copyTargetPathError"), "SFTP");
+      }
+    },
+    [t],
   );
 
   // When the auto-connect effect defers a switch (active transfers or open
@@ -563,7 +825,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       return hosts.find((h) => h.id === conn.hostId) ?? activeHost;
     }
     return activeHost;
-  }, [sftp.leftPane.connection, hosts, activeHost]);
+  }, [activeHost, connectedHostObjRef, hosts, sftp.leftPane.connection]);
 
   // Determine the active pane to render (without using global activeTabStore)
   const activeLeftPaneId = sftp.leftTabs.activeTabId;
@@ -571,6 +833,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   return (
     <SftpContextProvider
       hosts={hosts}
+      writableHosts={hostWriteSource}
       updateHosts={updateHosts}
       draggedFiles={draggedFiles}
       dragCallbacks={dragCallbacks}
@@ -580,12 +843,14 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       <div
         ref={panelRootRef}
         className="h-full flex flex-col bg-background overflow-hidden"
-        style={isVisible ? undefined : { display: "none" }}
-        aria-hidden={!isVisible}
+        data-section="terminal-sftp-panel"
         onClick={handlePaneFocus}
       >
         {showWorkspaceHostHeader && displayHost && (
-          <div className="shrink-0 border-b border-border/50 bg-muted/20 px-3 py-1.5">
+          <div
+            className="shrink-0 border-b border-border/50 bg-muted/20 px-3 py-1.5"
+            data-section="terminal-sftp-host-header"
+          >
             <div className="flex items-center gap-2 min-w-0">
               <DistroAvatar
                 host={displayHost}
@@ -593,18 +858,22 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
                 size="sm"
                 className="h-5 w-5 rounded-sm shrink-0"
               />
-              <div
-                className="min-w-0 flex-1 max-w-[calc(100%-1.75rem)] text-[11px] leading-5 truncate"
-                title={`${displayHost.label} · ${(displayHost.username || "root")}@${formatHostPort(displayHost.hostname, displayHost.port || 22)}`}
-              >
-                <span className="font-medium">
-                  {displayHost.label}
-                </span>
-                <span className="mx-1 text-muted-foreground">·</span>
-                <span className="font-mono text-muted-foreground">
-                  {(displayHost.username || "root")}@{displayHost.hostname}:{displayHost.port || 22}
-                </span>
-              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="min-w-0 flex-1 max-w-[calc(100%-1.75rem)] text-[11px] leading-5 truncate cursor-default">
+                    <span className="font-medium">
+                      {displayHost.label}
+                    </span>
+                    <span className="mx-1 text-muted-foreground">·</span>
+                    <span className="font-mono text-muted-foreground">
+                      {(displayHost.username || "root")}@{displayHost.hostname}:{displayHost.port || 22}
+                    </span>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {`${displayHost.label} · ${(displayHost.username || "root")}@${formatHostPort(displayHost.hostname, displayHost.port || 22)}`}
+                </TooltipContent>
+              </Tooltip>
             </div>
           </div>
         )}
@@ -623,13 +892,15 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
                   side="left"
                   pane={pane}
                   dialogActionScopeId={dialogActionScopeIdRef.current}
-                  isPaneFocused={isVisible && hasPaneFocus}
+                  isPaneFocused={hasPaneFocus}
                   sftpDefaultViewMode={sftpDefaultViewMode}
                   showHeader
                   showEmptyHeader
                   forceActive
                   onToggleShowHiddenFiles={() => handleToggleHiddenFiles(pane.id)}
                   onGoToTerminalCwd={onGetTerminalCwd ? handleGoToTerminalCwd : undefined}
+                  followTerminalCwd={canFollowTerminalCwd ? sftpFollowTerminalCwd : undefined}
+                  onToggleFollowTerminalCwd={canFollowTerminalCwd ? handleToggleFollowTerminalCwd : undefined}
                 />
               </div>
             );
@@ -641,6 +912,8 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
           allTransfers={sftp.transfers}
           canRevealTransferTarget={canRevealTransferTarget}
           onRevealTransferTarget={handleRevealTransferTarget}
+          canCopyTransferTargetPath={canCopyTransferTargetPath}
+          onCopyTransferTargetPath={handleCopyTransferTargetPath}
         />
       </div>
 
@@ -650,6 +923,10 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
           sftp={sftp}
           visibleTransfers={visibleTransfers}
           showTransferQueue={false}
+          canRevealTransferTarget={canRevealTransferTarget}
+          onRevealTransferTarget={handleRevealTransferTarget}
+          canCopyTransferTargetPath={canCopyTransferTargetPath}
+          onCopyTransferTargetPath={handleCopyTransferTargetPath}
           showHostPickerLeft={showHostPickerLeft}
           showHostPickerRight={showHostPickerRight}
           hostSearchLeft={hostSearchLeft}
@@ -679,6 +956,8 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
           setFileOpenerTarget={setFileOpenerTarget}
           handleFileOpenerSelect={handleFileOpenerSelect}
           handleSelectSystemApp={handleSelectSystemApp}
+          onPromoteToTab={onPromoteToTab}
+          onRequestTerminalFocus={onRequestTerminalFocus}
           t={t}
         />
       )}
@@ -688,11 +967,15 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
 const sidePanelAreEqual = (prev: SftpSidePanelProps, next: SftpSidePanelProps): boolean =>
   prev.hosts === next.hosts &&
+  prev.writableHosts === next.writableHosts &&
   prev.keys === next.keys &&
   prev.identities === next.identities &&
+  prev.knownHosts === next.knownHosts &&
   prev.updateHosts === next.updateHosts &&
+  prev.onAddKnownHost === next.onAddKnownHost &&
   prev.sftpDefaultViewMode === next.sftpDefaultViewMode &&
   prev.activeHost === next.activeHost &&
+  prev.activeSessionId === next.activeSessionId &&
   prev.showWorkspaceHostHeader === next.showWorkspaceHostHeader &&
   prev.isVisible === next.isVisible &&
   prev.renderOverlays === next.renderOverlays &&
@@ -707,8 +990,16 @@ const sidePanelAreEqual = (prev: SftpSidePanelProps, next: SftpSidePanelProps): 
   prev.editorWordWrap === next.editorWordWrap &&
   prev.setEditorWordWrap === next.setEditorWordWrap &&
   prev.onGetTerminalCwd === next.onGetTerminalCwd &&
+  prev.activeTerminalCwd === next.activeTerminalCwd &&
+  prev.sftpFollowTerminalCwd === next.sftpFollowTerminalCwd &&
+  prev.onSftpFollowTerminalCwdChange === next.onSftpFollowTerminalCwdChange &&
+  prev.onRequestTerminalFocus === next.onRequestTerminalFocus &&
   prev.initialLocation?.hostId === next.initialLocation?.hostId &&
-  prev.initialLocation?.path === next.initialLocation?.path;
+  prev.initialLocation?.path === next.initialLocation?.path &&
+  // Only the keepalive fields of terminalSettings affect SFTP connection
+  // resolution today; compare them directly rather than the whole object.
+  prev.terminalSettings?.keepaliveInterval === next.terminalSettings?.keepaliveInterval &&
+  prev.terminalSettings?.keepaliveCountMax === next.terminalSettings?.keepaliveCountMax;
 
 export const SftpSidePanel = memo(SftpSidePanelInner, sidePanelAreEqual);
 SftpSidePanel.displayName = "SftpSidePanel";

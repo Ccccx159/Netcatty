@@ -1,28 +1,27 @@
 import {
   BadgeCheck,
   ChevronDown,
-  ChevronRight,
+  Copy,
   Edit2,
-  Info,
+  ExternalLink,
   Key,
   LayoutGrid,
   List as ListIcon,
-  MoreHorizontal,
   Plus,
-  Search,
   Shield,
   Trash2,
   Upload,
   UserPlus,
 } from "lucide-react";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
-import { resolveHostAuth } from "../domain/sshAuth";
+import type { GroupConfig } from "../domain/models";
+import { reorderVaultItems, sortByVaultOrder } from "../domain/vaultOrder";
 import { STORAGE_KEY_VAULT_KEYS_VIEW_MODE } from "../infrastructure/config/storageKeys";
 import { logger } from "../lib/logger";
 import { cn } from "../lib/utils";
-import { Host, Identity, KeyType, SSHKey } from "../types";
+import { Host, Identity, KeyType, ProxyProfile, SSHKey } from "../types";
 import { ManagedSource } from "../domain/models";
 import { useKeychainBackend } from "../application/state/useKeychainBackend";
 import SelectHostPanel from "./SelectHostPanel";
@@ -33,11 +32,8 @@ import {
   AsidePanelContent,
 } from "./ui/aside-panel";
 import { Button } from "./ui/button";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "./ui/collapsible";
+
+
 import {
   ContextMenu,
   ContextMenuContent,
@@ -46,10 +42,16 @@ import {
   ContextMenuTrigger,
 } from "./ui/context-menu";
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
-import { Input } from "./ui/input";
-import { Label } from "./ui/label";
-import { Textarea } from "./ui/textarea";
 import { toast } from "./ui/toast";
+import { KeychainExportPanel } from "./KeychainExportPanel";
+import { KeychainEditPanel } from "./KeychainEditPanel";
+import {
+  VaultHeaderSearch,
+  VaultPageHeader,
+  vaultHeaderIconButtonClass,
+  vaultSectionTitleClass,
+} from "./vault/VaultPageHeader";
+import { useVaultItemReorder } from "./vault/vaultReorderDrag";
 
 // Import utilities and components from keychain module
 import {
@@ -68,12 +70,22 @@ interface KeychainManagerProps {
   keys: SSHKey[];
   identities?: Identity[];
   hosts?: Host[];
+  proxyProfiles?: ProxyProfile[];
   customGroups?: string[];
+  /**
+   * Group default configurations. Needed by the "export public key to
+   * host" flow so per-host SSH algorithm settings (legacy / skipEcdsa /
+   * overrides) that the host inherits from its group are honored when
+   * the export opens its one-off SSH connection.
+   */
+  groupConfigs?: GroupConfig[];
   managedSources?: ManagedSource[];
   onSave: (key: SSHKey) => void;
   onUpdate: (key: SSHKey) => void;
+  onReorderKeys?: (keys: SSHKey[]) => void;
   onDelete: (id: string) => void;
   onSaveIdentity?: (identity: Identity) => void;
+  onReorderIdentities?: (identities: Identity[]) => void;
   onDeleteIdentity?: (id: string) => void;
   onNewHost?: () => void;
   onSaveHost?: (host: Host) => void;
@@ -84,12 +96,16 @@ const KeychainManager: React.FC<KeychainManagerProps> = ({
   keys,
   identities = [],
   hosts = [],
+  proxyProfiles = [],
   customGroups = [],
+  groupConfigs = [],
   managedSources = [],
   onSave,
   onUpdate,
+  onReorderKeys,
   onDelete,
   onSaveIdentity,
+  onReorderIdentities,
   onDeleteIdentity,
   onNewHost: _onNewHost,
   onSaveHost,
@@ -137,6 +153,7 @@ const KeychainManager: React.FC<KeychainManagerProps> = ({
 
   const [showHostSelector, setShowHostSelector] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   // Export panel state
   const [exportLocation, setExportLocation] = useState(".ssh");
@@ -161,6 +178,27 @@ echo $3 >> "$FILE"`);
   const [showPassphrase, setShowPassphrase] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
 
+  const keyReorder = useVaultItemReorder({
+    containerRef: listRef,
+    viewMode,
+    dragType: "key-id",
+    targetAttribute: "data-key-id",
+    disabled: !onReorderKeys || search.trim().length > 0,
+    onReorder: (sourceId, targetId, position) => {
+      onReorderKeys?.(reorderVaultItems(keys, sourceId, targetId, position));
+    },
+  });
+  const identityReorder = useVaultItemReorder({
+    containerRef: listRef,
+    viewMode,
+    dragType: "identity-id",
+    targetAttribute: "data-identity-id",
+    disabled: !onReorderIdentities || search.trim().length > 0,
+    onReorder: (sourceId, targetId, position) => {
+      onReorderIdentities?.(reorderVaultItems(identities, sourceId, targetId, position));
+    },
+  });
+
   const showError = useCallback((message: string, title = t("common.error")) => {
     toast.error(message, title);
   }, [t]);
@@ -173,7 +211,7 @@ echo $3 >> "$FILE"`);
     switch (activeFilter) {
       case "key":
         result = result.filter(
-          (k) => k.source === "generated" || k.source === "imported",
+          (k) => k.source === "generated" || k.source === "imported" || k.source === "reference",
         );
         break;
       case "certificate":
@@ -194,18 +232,18 @@ echo $3 >> "$FILE"`);
       );
     }
 
-    return result;
+    return sortByVaultOrder(result);
   }, [keys, activeFilter, search]);
 
   // Filter identities based on search
   const filteredIdentities = useMemo(() => {
-    if (!search.trim()) return identities;
+    if (!search.trim()) return sortByVaultOrder(identities);
     const s = search.toLowerCase();
-    return identities.filter(
+    return sortByVaultOrder(identities.filter(
       (i) =>
         i.label.toLowerCase().includes(s) ||
         i.username.toLowerCase().includes(s),
-    );
+    ));
   }, [identities, search]);
 
   // Push a new panel onto the stack
@@ -502,7 +540,7 @@ echo $3 >> "$FILE"`);
   );
 
   return (
-    <div className="h-full flex relative">
+    <div className="h-full min-w-0 w-full overflow-hidden flex relative">
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
@@ -515,12 +553,11 @@ echo $3 >> "$FILE"`);
       {/* Main Content */}
       <div
         className={cn(
-          "flex-1 flex flex-col min-h-0 transition-all duration-200",
+          "flex-1 min-w-0 flex flex-col min-h-0 transition-all duration-200",
           panel.type !== "closed" && "mr-[380px]",
         )}
       >
-        {/* Toolbar */}
-        <div className="flex flex-wrap items-center gap-3 bg-secondary/60 border-b border-border/70 px-3 py-1.5 shrink-0">
+        <VaultPageHeader>
           {/* Filter Tabs */}
           <div className="flex items-center gap-1">
             {/* KEY button with split interaction: left=switch view, right=dropdown */}
@@ -528,16 +565,15 @@ echo $3 >> "$FILE"`);
               <div
                 className={cn(
                   "flex items-center rounded-md transition-colors",
-                  activeFilter === "key" ? "bg-primary/15" : "hover:bg-accent",
+                  activeFilter === "key"
+                    ? "bg-foreground/10 text-foreground hover:bg-foreground/15"
+                    : "bg-foreground/5 text-foreground hover:bg-foreground/10",
                 )}
               >
                 <Button
                   size="sm"
                   variant="ghost"
-                  className={cn(
-                    "h-8 px-3 gap-2 rounded-r-none hover:bg-transparent",
-                    activeFilter === "key" && "text-primary",
-                  )}
+                  className="h-10 px-3 gap-2 rounded-r-none hover:bg-transparent text-inherit"
                   onClick={() => setActiveFilter("key")}
                 >
                   <Key size={14} />
@@ -547,10 +583,7 @@ echo $3 >> "$FILE"`);
                   <Button
                     size="sm"
                     variant="ghost"
-                    className={cn(
-                      "h-8 px-1.5 rounded-l-none hover:bg-transparent",
-                      activeFilter === "key" && "text-primary",
-                    )}
+                    className="h-10 px-1.5 rounded-l-none hover:bg-transparent text-inherit"
                   >
                     <ChevronDown size={12} />
                   </Button>
@@ -589,33 +622,24 @@ echo $3 >> "$FILE"`);
                 className={cn(
                   "flex items-center rounded-md transition-colors",
                   activeFilter === "certificate"
-                    ? "bg-primary/15"
-                    : "hover:bg-accent",
+                    ? "bg-foreground/10 text-foreground hover:bg-foreground/15"
+                    : "bg-foreground/5 text-foreground hover:bg-foreground/10",
                 )}
               >
                 <Button
                   size="sm"
                   variant="ghost"
-                  className={cn(
-                    "h-8 px-3 gap-2 rounded-r-none hover:bg-transparent",
-                    activeFilter === "certificate" && "text-primary",
-                  )}
+                  className="h-10 px-3 gap-2 rounded-r-none hover:bg-transparent text-inherit"
                   onClick={() => setActiveFilter("certificate")}
                 >
                   <BadgeCheck size={14} />
                   {t("keychain.filter.certificate")}
-                  <span className="text-[10px] px-1.5 rounded-full bg-muted text-muted-foreground">
-                    {keys.filter((k) => k.certificate).length}
-                  </span>
                 </Button>
                 <DropdownTrigger asChild>
                   <Button
                     size="sm"
                     variant="ghost"
-                    className={cn(
-                      "h-8 px-1.5 rounded-l-none hover:bg-transparent",
-                      activeFilter === "certificate" && "text-primary",
-                    )}
+                    className="h-10 px-1.5 rounded-l-none hover:bg-transparent text-inherit"
                   >
                     <ChevronDown size={12} />
                   </Button>
@@ -636,25 +660,19 @@ echo $3 >> "$FILE"`);
           {/* Search and View Mode - hide search when panel is open */}
           <div className="ml-auto flex items-center gap-2 min-w-0 flex-shrink">
             {panel.type === "closed" && (
-              <div className="relative flex-shrink min-w-[100px]">
-                <Search
-                  size={14}
-                  className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
-                />
-                <Input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder={t("common.searchPlaceholder")}
-                  className="h-9 pl-8 w-full"
-                />
-              </div>
+              <VaultHeaderSearch
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t("common.searchPlaceholder")}
+                className="flex-shrink w-64"
+              />
             )}
             <Dropdown>
               <DropdownTrigger asChild>
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-9 w-9 flex-shrink-0"
+                  className={cn(vaultHeaderIconButtonClass, "flex-shrink-0")}
                 >
                   {viewMode === "grid" ? (
                     <LayoutGrid size={16} />
@@ -682,20 +700,39 @@ echo $3 >> "$FILE"`);
               </DropdownContent>
             </Dropdown>
           </div>
-        </div>
+        </VaultPageHeader>
 
         {/* Scrollable Content */}
-        <div className="flex-1 overflow-y-auto">
+        <div
+          ref={listRef}
+          className="flex-1 min-w-0 w-full overflow-y-auto"
+          onDragOverCapture={(event) => {
+            keyReorder.handleDragOverCapture(event);
+            identityReorder.handleDragOverCapture(event);
+          }}
+          onDragOver={(event) => {
+            keyReorder.handleDragOver(event);
+            identityReorder.handleDragOver(event);
+          }}
+          onDropCapture={(event) => {
+            keyReorder.handleDropCapture(event);
+            identityReorder.handleDropCapture(event);
+          }}
+          onDragEndCapture={() => {
+            keyReorder.handleDragEndCapture();
+            identityReorder.handleDragEndCapture();
+          }}
+        >
           {/* Keys Section */}
-          <div className="space-y-3 p-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-base font-semibold text-muted-foreground">
-              {t("keychain.section.keys")}
-            </h2>
-            <span className="text-xs text-muted-foreground">
-              {t("keychain.count.items", { count: filteredKeys.length })}
-            </span>
-          </div>
+          <div className="min-w-0 w-full space-y-3 p-3">
+            <div className="flex items-center justify-between">
+              <h2 className={vaultSectionTitleClass}>
+                {t("keychain.section.keys")}
+              </h2>
+              <span className="text-xs text-muted-foreground">
+                {t("keychain.count.items", { count: filteredKeys.length })}
+              </span>
+            </div>
 
           {filteredKeys.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-muted-foreground">
@@ -725,8 +762,8 @@ echo $3 >> "$FILE"`);
             <div
               className={
                 viewMode === "grid"
-                  ? "grid gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-                  : "flex flex-col gap-0"
+                  ? "grid min-w-0 w-full max-w-full gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                  : "flex min-w-0 w-full max-w-full flex-col gap-0"
               }
             >
               {filteredKeys.map((key) => (
@@ -739,6 +776,7 @@ echo $3 >> "$FILE"`);
                     (panel.type === "export" && panel.key.id === key.id)
                   }
                   isMac={isMacOS()}
+                  reorderProps={keyReorder.getItemReorderProps(key.id, `key:${key.id}`)}
                   onClick={() => openKeyView(key)}
                   onEdit={() => openKeyEdit(key)}
                   onExport={() => openKeyExport(key)}
@@ -752,9 +790,9 @@ echo $3 >> "$FILE"`);
 
         {/* Identities Section */}
         {activeFilter === "key" && filteredIdentities.length > 0 && (
-          <div className="space-y-3 px-3 pb-3">
+          <div className="min-w-0 w-full space-y-3 px-3 pb-3">
             <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-muted-foreground">
+              <h2 className={vaultSectionTitleClass}>
                 {t("keychain.section.identities")}
               </h2>
               <span className="text-xs text-muted-foreground">
@@ -764,13 +802,13 @@ echo $3 >> "$FILE"`);
             <div
               className={
                 viewMode === "grid"
-                  ? "grid gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
-                  : "flex flex-col gap-0"
+                  ? "grid min-w-0 w-full max-w-full gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                  : "flex min-w-0 w-full max-w-full flex-col gap-0"
               }
             >
               {filteredIdentities.map((identity) => (
                 <ContextMenu key={identity.id}>
-                  <ContextMenuTrigger>
+                  <ContextMenuTrigger className="block min-w-0 w-full max-w-full">
                     <IdentityCard
                       identity={identity}
                       viewMode={viewMode}
@@ -778,6 +816,7 @@ echo $3 >> "$FILE"`);
                         panel.type === "identity" &&
                         panel.identity?.id === identity.id
                       }
+                      reorderProps={identityReorder.getItemReorderProps(identity.id, `identity:${identity.id}`)}
                       onClick={() => {
                         setPanelStack([{ type: "identity", identity }]);
                         setDraftIdentity({ ...identity });
@@ -850,9 +889,35 @@ echo $3 >> "$FILE"`);
                 </AsideActionMenuItem>
               </AsideActionMenu>
             ) : panel.type === "view" ? (
-              <Button variant="ghost" size="icon" className="h-8 w-8">
-                <MoreHorizontal size={16} />
-              </Button>
+              <AsideActionMenu>
+                {panel.key.publicKey ? (
+                  <AsideActionMenuItem
+                    icon={<Copy size={14} />}
+                    onClick={() => copyPublicKey(panel.key)}
+                  >
+                    {t("action.copyPublicKey")}
+                  </AsideActionMenuItem>
+                ) : null}
+                <AsideActionMenuItem
+                  icon={<ExternalLink size={14} />}
+                  onClick={() => openKeyExport(panel.key)}
+                >
+                  {t("action.keyExport")}
+                </AsideActionMenuItem>
+                <AsideActionMenuItem
+                  icon={<Edit2 size={14} />}
+                  onClick={() => openKeyEdit(panel.key)}
+                >
+                  {t("action.edit")}
+                </AsideActionMenuItem>
+                <AsideActionMenuItem
+                  variant="destructive"
+                  icon={<Trash2 size={14} />}
+                  onClick={() => handleDelete(panel.key.id)}
+                >
+                  {t("action.delete")}
+                </AsideActionMenuItem>
+              </AsideActionMenu>
             ) : undefined
           }
         >
@@ -901,335 +966,46 @@ echo $3 >> "$FILE"`);
               />
             )}
 
-            {/* Key Export Panel */}
             {panel.type === "export" && !showHostSelector && (
-              <>
-                {/* Key info card */}
-                <div className="flex items-center gap-3 p-3 bg-card border border-border/80 rounded-lg">
-                  <div
-                    className={cn(
-                      "h-10 w-10 rounded-md flex items-center justify-center",
-                      panel.key.certificate
-                        ? "bg-emerald-500/15 text-emerald-500"
-                        : "bg-primary/15 text-primary",
-                    )}
-                  >
-                    {getKeyIcon(panel.key)}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-semibold truncate">
-                      {panel.key.label}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {t("auth.keyType", { type: getKeyTypeDisplay(panel.key) })}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Export to field */}
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-muted-foreground">
-                      {t("keychain.export.exportTo")}
-                    </Label>
-                    <Button
-                      variant="link"
-                      className="h-auto p-0 text-primary text-sm"
-                      onClick={() => setShowHostSelector(true)}
-                    >
-                      {t("keychain.export.selectHost")}
-                    </Button>
-                  </div>
-                  <Input
-                    value={exportHost?.label || ""}
-                    readOnly
-                    placeholder={t("common.selectAHostPlaceholder")}
-                    className="bg-muted/50 cursor-pointer"
-                    onClick={() => setShowHostSelector(true)}
-                  />
-                </div>
-
-                {/* Location field */}
-                <div className="space-y-2">
-                  <Label className="text-muted-foreground">
-                    {t("keychain.export.location")}
-                  </Label>
-                  <Input
-                    value={exportLocation}
-                    onChange={(e) => setExportLocation(e.target.value)}
-                    placeholder=".ssh"
-                  />
-                </div>
-
-                {/* Filename field */}
-                <div className="space-y-2">
-                  <Label className="text-muted-foreground">
-                    {t("keychain.export.filename")}
-                  </Label>
-                  <Input
-                    value={exportFilename}
-                    onChange={(e) => setExportFilename(e.target.value)}
-                    placeholder="authorized_keys"
-                  />
-                </div>
-
-                {/* Info note */}
-                <div className="flex items-start gap-2 p-3 bg-muted/50 border border-border/60 rounded-lg">
-                  <Info
-                    size={14}
-                    className="mt-0.5 text-muted-foreground shrink-0"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {t("keychain.export.note", {
-                      unix: "UNIX",
-                      advanced: t("common.advanced"),
-                    })}
-                  </p>
-                </div>
-
-                {/* Advanced collapsible */}
-                <Collapsible
-                  open={exportAdvancedOpen}
-                  onOpenChange={setExportAdvancedOpen}
-                >
-                  <CollapsibleTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      className="w-full justify-between px-0 h-10 hover:bg-transparent hover:text-current"
-                    >
-                      <span className="font-medium">{t("common.advanced")}</span>
-                      <ChevronRight
-                        size={16}
-                        className={cn(
-                          "transition-transform",
-                          exportAdvancedOpen && "rotate-90",
-                        )}
-                      />
-                    </Button>
-                  </CollapsibleTrigger>
-                  <CollapsibleContent className="space-y-2 pt-2">
-                    <Label className="text-muted-foreground">
-                      {t("keychain.export.script")}
-                    </Label>
-                    <Textarea
-                      value={exportScript}
-                      onChange={(e) => setExportScript(e.target.value)}
-                      className="min-h-[180px] font-mono text-xs"
-                      placeholder={t("keychain.export.scriptPlaceholder")}
-                    />
-                  </CollapsibleContent>
-                </Collapsible>
-
-                {/* Export button */}
-                <Button
-                  className="w-full h-11"
-                  disabled={
-                    !exportHost ||
-                    !exportLocation ||
-                    !exportFilename ||
-                    isExporting
-                  }
-                  onClick={async () => {
-                    if (!exportHost || !panel.key.publicKey) return;
-
-                    setIsExporting(true);
-
-                    try {
-                      const exportAuth = resolveHostAuth({
-                        host: exportHost,
-                        keys,
-                        identities,
-                      });
-
-                      // Need either password or a usable key to run remote command.
-                      if (!exportAuth.password && !exportAuth.key?.privateKey) {
-                        throw new Error(
-                          t("keychain.export.missingCredentials"),
-                        );
-                      }
-
-                      const hostPrivateKey = exportAuth.key?.privateKey;
-
-                      // Escape the public key for shell (single quotes, escape existing quotes)
-                      const escapedPublicKey = panel.key.publicKey.replace(
-                        /'/g,
-                        "'\\''",
-                      );
-
-                      // Build the command by replacing $1, $2, $3
-                      const scriptWithVars = exportScript
-                        .replace(/\$1/g, exportLocation)
-                        .replace(/\$2/g, exportFilename)
-                        .replace(/\$3/g, `'${escapedPublicKey}'`);
-
-                      // Execute the script directly - SSH exec handles multiline commands
-                      const command = scriptWithVars;
-
-                      // Execute via SSH
-                      const result = await execCommand({
-                        hostname: exportHost.hostname,
-                        username: exportAuth.username,
-                        port: exportHost.port || 22,
-                        password: exportAuth.password,
-                        privateKey: hostPrivateKey,
-                        command,
-                        timeout: 30000,
-                        enableKeyboardInteractive: true,
-                        sessionId: `export-key:${exportHost.id}:${panel.key.id}`,
-                      });
-
-                      // Check result - code 0, null, or undefined with no stderr is success
-                      const exitCode = result?.code;
-                      const hasError = result?.stderr?.trim();
-                      if (exitCode === 0 || (exitCode == null && !hasError)) {
-                        // Update identity (preferred) or host to use this key for authentication
-                        if (exportHost.identityId && onSaveIdentity) {
-                          const existing = identities.find(
-                            (i) => i.id === exportHost.identityId,
-                          );
-                          if (existing) {
-                            onSaveIdentity({
-                              ...existing,
-                              authMethod: "key",
-                              keyId: panel.key.id,
-                            });
-                          }
-                        } else if (onSaveHost) {
-                          onSaveHost({
-                            ...exportHost,
-                            identityFileId: panel.key.id,
-                            authMethod: "key",
-                          });
-                        }
-                        toast.success(
-                          t("keychain.export.successMessage", {
-                            host: exportHost.label,
-                          }),
-                          t("keychain.export.successTitle"),
-                        );
-                        closePanel();
-                      } else {
-                        const errorMsg =
-                          hasError ||
-                          result?.stdout?.trim() ||
-                          t("keychain.export.exitCode", { code: exitCode });
-                        toast.error(
-                          t("keychain.export.failedMessage", { error: errorMsg }),
-                          t("keychain.export.failedTitle"),
-                        );
-                      }
-                    } catch (err) {
-                      const message =
-                        err instanceof Error ? err.message : String(err);
-                      toast.error(
-                        t("keychain.export.failedPrefix", { error: message }),
-                        t("keychain.export.failedTitle"),
-                      );
-                    } finally {
-                      setIsExporting(false);
-                    }
-                  }}
-                >
-                  {isExporting
-                    ? t("keychain.export.exporting")
-                    : t("keychain.export.exportAndAttach")}
-                </Button>
-              </>
+              <KeychainExportPanel
+                panel={panel}
+                t={t}
+                getKeyIcon={getKeyIcon}
+                getKeyTypeDisplay={getKeyTypeDisplay}
+                setShowHostSelector={setShowHostSelector}
+                exportHost={exportHost}
+                exportLocation={exportLocation}
+                setExportLocation={setExportLocation}
+                exportFilename={exportFilename}
+                setExportFilename={setExportFilename}
+                exportAdvancedOpen={exportAdvancedOpen}
+                setExportAdvancedOpen={setExportAdvancedOpen}
+                exportScript={exportScript}
+                setExportScript={setExportScript}
+                isExporting={isExporting}
+                setIsExporting={setIsExporting}
+                keys={keys}
+                identities={identities}
+                groupConfigs={groupConfigs}
+                execCommand={execCommand}
+                onSaveIdentity={onSaveIdentity}
+                onSaveHost={onSaveHost}
+                closePanel={closePanel}
+              />
             )}
 
-            {/* Edit Key Panel */}
             {panel.type === "edit" && (
-              <>
-                <div className="space-y-2">
-                  <Label>{t("keychain.edit.labelRequired")}</Label>
-                  <Input
-                    value={draftKey.label || ""}
-                    onChange={(e) =>
-                      setDraftKey({ ...draftKey, label: e.target.value })
-                    }
-                    placeholder={t("keychain.edit.keyLabelPlaceholder")}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label className="text-destructive">
-                    {t("keychain.edit.privateKeyRequired")}
-                  </Label>
-                  <Textarea
-                    value={draftKey.privateKey || ""}
-                    onChange={(e) =>
-                      setDraftKey({ ...draftKey, privateKey: e.target.value })
-                    }
-                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-                    className="min-h-[180px] font-mono text-xs"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label className="text-muted-foreground">
-                    {t("keychain.edit.publicKey")}
-                  </Label>
-                  <Textarea
-                    value={draftKey.publicKey || ""}
-                    onChange={(e) =>
-                      setDraftKey({ ...draftKey, publicKey: e.target.value })
-                    }
-                    placeholder="ssh-ed25519 AAAA..."
-                    className="min-h-[80px] font-mono text-xs"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label className="text-muted-foreground">
-                    {t("keychain.edit.certificate")}
-                  </Label>
-                  <Textarea
-                    value={draftKey.certificate || ""}
-                    onChange={(e) =>
-                      setDraftKey({ ...draftKey, certificate: e.target.value })
-                    }
-                    placeholder={t("keychain.edit.certificatePlaceholder")}
-                    className="min-h-[60px] font-mono text-xs"
-                  />
-                </div>
-
-                {/* Key Export section */}
-                <div className="pt-4 mt-4 border-t border-border/60">
-                  <div className="flex items-center gap-2 mb-3">
-                    <span className="text-sm font-medium">
-                      {t("keychain.edit.keyExport")}
-                    </span>
-                    <div className="h-4 w-4 rounded-full bg-muted flex items-center justify-center">
-                      <Info size={10} className="text-muted-foreground" />
-                    </div>
-                  </div>
-                  <Button
-                    className="w-full h-11"
-                    onClick={() => openKeyExport(panel.key)}
-                  >
-                    {t("keychain.edit.exportToHost")}
-                  </Button>
-                </div>
-
-                {/* Save button */}
-                <Button
-                  className="w-full h-11 mt-4"
-                  disabled={
-                    !draftKey.label?.trim() || !draftKey.privateKey?.trim()
-                  }
-                  onClick={() => {
-                    if (draftKey.id) {
-                      onUpdate({
-                        ...panel.key,
-                        ...(draftKey as SSHKey),
-                      });
-                      closePanel();
-                    }
-                  }}
-                >
-                  {t("common.saveChanges")}
-                </Button>
-              </>
+              <KeychainEditPanel
+                panel={panel}
+                t={t}
+                draftKey={draftKey}
+                setDraftKey={setDraftKey}
+                showPassphrase={showPassphrase}
+                setShowPassphrase={setShowPassphrase}
+                openKeyExport={openKeyExport}
+                onUpdate={onUpdate}
+                closePanel={closePanel}
+              />
             )}
           </AsidePanelContent>
 
@@ -1247,6 +1023,7 @@ echo $3 >> "$FILE"`);
               onBack={() => setShowHostSelector(false)}
               onContinue={() => setShowHostSelector(false)}
               availableKeys={keys}
+              proxyProfiles={proxyProfiles}
               managedSources={managedSources}
               onSaveHost={onSaveHost}
               onCreateGroup={onCreateGroup}

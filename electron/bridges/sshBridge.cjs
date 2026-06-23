@@ -6,13 +6,18 @@
 const net = require("node:net");
 const fs = require("node:fs");
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const os = require("node:os");
+const crypto = require("node:crypto");
 const { exec } = require("node:child_process");
 const { Client: SSHClient, utils: sshUtils } = require("ssh2");
 const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
+const hostKeyVerifier = require("./hostKeyVerifier.cjs");
 const { createProxySocket } = require("./proxyUtils.cjs");
+const { attachX11Forwarding } = require("./x11Forwarding.cjs");
+const { createPtyOutputBuffer } = require("./ptyOutputBuffer.cjs");
 const {
   buildAuthHandler,
   createKeyboardInteractiveHandler,
@@ -21,15 +26,39 @@ const {
   requestPassphrasesForEncryptedKeys,
   findAllDefaultPrivateKeys: findAllDefaultPrivateKeysFromHelper,
   getSshAgentSocket,
+  readFileNoFollow,
+  expandIdentityFilePath,
+  isAutoFillablePasswordChallenge,
+  preparePrivateKeyForAuth,
+  loadIdentityFileForAuth,
+  loadFirstIdentityFileForAuth,
+  PassphraseCancelledError,
+  isPassphraseCancelledError,
 } = require("./sshAuthHelper.cjs");
 const sessionLogStreamManager = require("./sessionLogStreamManager.cjs");
-const { trackSessionIdlePrompt } = require("./ai/shellUtils.cjs");
+const { trackSessionIdlePrompt, looksLikeIdleAutoLogout } = require("./ai/shellUtils.cjs");
 const { createZmodemSentry } = require("./zmodemHelper.cjs");
+const tempDirBridge = require("./tempDirBridge.cjs");
+const {
+  buildAlgorithms,
+  _resetAlgorithmSupportCacheForTests,
+} = require("./sshAlgorithms.cjs");
+const { enableSshNoDelay, enableTcpNoDelay } = require("./tcpNoDelay.cjs");
 
 // Default SSH key names in priority order (preferred keys tried first)
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 // Match any private key file: id_* but not *.pub
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
+
+function quoteShellArg(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function hasUsableProxy(proxy) {
+  if (!proxy) return false;
+  if (proxy.type === "command") return !!proxy.command?.trim();
+  return !!(proxy.host && proxy.port);
+}
 
 /**
  * Quick check if file content looks like an SSH private key.
@@ -122,9 +151,8 @@ async function findDefaultPrivateKey() {
   for (const name of sorted) {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) continue;
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) continue;
       if (!looksLikePrivateKey(privateKey)) {
         log("Skipping non-key file", { keyPath, keyName: name });
         continue;
@@ -168,9 +196,8 @@ async function findAllDefaultPrivateKeys() {
   const promises = sorted.map(async (name) => {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) return null;
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) return null;
       if (!looksLikePrivateKey(privateKey)) {
         log("Skipping non-key file", { keyPath, keyName: name });
         return null;
@@ -238,56 +265,116 @@ async function getAvailableAgentSocket() {
   return getSshAgentSocket();
 }
 
-const DEBUG_SSH = process.env.NETCATTY_SSH_DEBUG === "1";
+const SSH_DEBUG_REDACTED_KEYS = new Set([
+  "password",
+  "passphrase",
+  "privateKey",
+  "key",
+  "certificate",
+]);
+let sshDebugLoggingEnabled = process.env.NETCATTY_SSH_DEBUG === "1";
+let sshDebugLogFilePath = tempDirBridge.getTempFilePath("netcatty-ssh.log");
 
-// Debug logger (disabled by default)
-const logFile = DEBUG_SSH
-  ? path.join(require("os").tmpdir(), "netcatty-ssh.log")
-  : null;
-const log = (msg, data) => {
-  if (!DEBUG_SSH) return;
-  const line = `[${new Date().toISOString()}] ${msg} ${data ? JSON.stringify(data) : ""}\n`;
-  try { fs.appendFileSync(logFile, line); } catch { }
-  console.log("[SSH]", msg, data ? JSON.stringify(data, null, 2) : "");
-};
-
-/**
- * Build SSH algorithm configuration.
- * When legacyEnabled is true, legacy algorithms are appended to each list
- * (lower priority than modern ones) for compatibility with older network equipment.
- */
-function buildAlgorithms(legacyEnabled) {
-  const algorithms = {
-    cipher: [
-      'aes128-gcm@openssh.com', 'aes256-gcm@openssh.com',
-      'aes128-ctr', 'aes192-ctr', 'aes256-ctr',
-    ],
-    kex: [
-      'curve25519-sha256', 'curve25519-sha256@libssh.org',
-      'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521',
-      'diffie-hellman-group14-sha256',
-      'diffie-hellman-group16-sha512', 'diffie-hellman-group18-sha512',
-      'diffie-hellman-group-exchange-sha256',
-    ],
-    compress: ['none'],
-  };
-
-  if (legacyEnabled) {
-    algorithms.kex.push(
-      'diffie-hellman-group14-sha1',
-      'diffie-hellman-group1-sha1',
-    );
-    algorithms.cipher.push(
-      'aes128-cbc', 'aes256-cbc', '3des-cbc',
-    );
-    algorithms.serverHostKey = [
-      'ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521',
-      'rsa-sha2-512', 'rsa-sha2-256',
-      'ssh-rsa', 'ssh-dss',
-    ];
+function sanitizeSshDebugValue(value, key = "") {
+  if (SSH_DEBUG_REDACTED_KEYS.has(key)) return "[redacted]";
+  if (Array.isArray(value)) return value.map((item) => sanitizeSshDebugValue(item));
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      result[entryKey] = sanitizeSshDebugValue(entryValue, entryKey);
+    }
+    return result;
   }
+  return value;
+}
 
-  return algorithms;
+function setSshDebugLoggingEnabled(enabled, options = {}) {
+  sshDebugLoggingEnabled = !!enabled;
+  if (typeof options.logFilePath === "string" && options.logFilePath.trim()) {
+    sshDebugLogFilePath = options.logFilePath;
+  }
+}
+
+function isSshDebugLoggingEnabled() {
+  return sshDebugLoggingEnabled;
+}
+
+function getSshDebugLogFilePath() {
+  return sshDebugLogFilePath;
+}
+
+function appendSshDiagnosticLog(msg, data, options = {}) {
+  const enabled = Object.prototype.hasOwnProperty.call(options, "enabled")
+    ? !!options.enabled
+    : isSshDebugLoggingEnabled();
+  if (!enabled) return;
+  const safeData = data ? sanitizeSshDebugValue(data) : undefined;
+  const line = `[${new Date().toISOString()}] ${msg} ${safeData ? JSON.stringify(safeData) : ""}\n`;
+  try { fs.appendFileSync(sshDebugLogFilePath, line); } catch { }
+  console.log("[SSH]", msg, safeData ? JSON.stringify(safeData, null, 2) : "");
+}
+
+const log = appendSshDiagnosticLog;
+log.isEnabled = isSshDebugLoggingEnabled;
+
+function createSshDiagnosticLogger(enabled) {
+  const isEnabled = !!enabled;
+  const logger = (msg, data) => appendSshDiagnosticLog(msg, data, { enabled: isEnabled });
+  logger.isEnabled = () => isEnabled;
+  return logger;
+}
+
+function shouldLogSshDebugMessage(msg) {
+  if (typeof msg !== "string") return false;
+  return /auth|publickey|keyboard|handshake|kex|newkeys|dh gex/i.test(msg);
+}
+
+function attachSshDebugLogger(connectOpts, logger = log) {
+  if (typeof logger.isEnabled === "function" && !logger.isEnabled()) return;
+  connectOpts.debug = (msg) => {
+    if (shouldLogSshDebugMessage(msg)) {
+      logger("ssh2 debug", { msg });
+    }
+  };
+}
+
+function logSshAlgorithms(label, algorithms, extra = {}, logger = log) {
+  logger(`${label} algorithm configuration`, {
+    ...extra,
+    kex: algorithms.kex,
+    cipher: algorithms.cipher,
+    hmac: algorithms.hmac,
+    serverHostKey: algorithms.serverHostKey,
+  });
+}
+
+async function getSshDebugLogInfo() {
+  let size = 0;
+  let exists = false;
+  try {
+    const stat = await fs.promises.stat(sshDebugLogFilePath);
+    exists = stat.isFile();
+    size = stat.size;
+  } catch {
+    exists = false;
+  }
+  return {
+    enabled: isSshDebugLoggingEnabled(),
+    path: sshDebugLogFilePath,
+    exists,
+    size,
+  };
+}
+
+async function openSshDebugLogDir() {
+  if (!electronModule?.shell?.openPath) return { success: false, error: "shell unavailable" };
+  try {
+    await fs.promises.mkdir(path.dirname(sshDebugLogFilePath), { recursive: true });
+    const error = await electronModule.shell.openPath(path.dirname(sshDebugLogFilePath));
+    return error ? { success: false, error } : { success: true };
+  } catch (err) {
+    return { success: false, error: err?.message || String(err) };
+  }
 }
 
 // Session storage - shared reference passed from main
@@ -305,6 +392,7 @@ const sessionEncodings = new Map();
 // Per-session stateful iconv decoders (keyed by sessionId, value: { stdout, stderr })
 const sessionDecoders = new Map();
 const iconv = require("iconv-lite");
+const { encodeTerminalInput } = require("./terminalEncoding.cjs");
 
 function getSessionDecoder(sessionId, stream) {
   let decoders = sessionDecoders.get(sessionId);
@@ -363,6 +451,14 @@ function resolveLangFromCharset(charset) {
 }
 
 const { safeSend } = require("./ipcUtils.cjs");
+const {
+  createConnectionRef,
+  acquireConnectionRef,
+  releaseConnectionRef,
+  findReusableSession,
+} = require("./sshConnectionPool.cjs");
+
+const zmodemOverwritePending = new Map(); // requestId -> (decision) => void
 
 /**
  * Initialize the SSH bridge with dependencies
@@ -378,6 +474,7 @@ function init(deps) {
 async function connectThroughChain(event, options, jumpHosts, targetHost, targetPort, sessionId) {
   const sender = event.sender;
   const connections = options?._connectionsRef || [];
+  const sshDiagnosticLogger = options?._sshDiagnosticLogger || log;
   let currentSocket = null;
 
   const sendProgress = (hop, total, label, status, error) => {
@@ -404,24 +501,103 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         options._tunnelRef.chainConnections = connections;
       }
 
+      // Per-hop keepalive. Each jump entry already carries its own resolved
+      // interval/countMax (see resolveHostKeepalive in domain/host.ts), so
+      // a chain with a router as the bastion and a cloud host at the end
+      // can have keepalive=0 on the bastion and the cloud-friendly values
+      // on the final target — without one stepping on the other. We fall
+      // back to the target-call options for backward compat with older
+      // serializers that don't populate the per-hop fields yet.
+      const hopInterval = jump.keepaliveInterval ?? options.keepaliveInterval ?? 0;
+      const hopCountMax = jump.keepaliveCountMax ?? options.keepaliveCountMax ?? 10;
       // Build connection options
       const connOpts = {
         host: jump.hostname,
         port: jump.port || 22,
         username: jump.username || 'root',
         readyTimeout: 120000, // 2 minutes to allow for keyboard-interactive (2FA/MFA)
-        // Use user-configured keepalive interval from options (in seconds -> convert to ms)
-        // 0 = disabled (no keepalive packets sent)
-        keepaliveInterval: options.keepaliveInterval > 0 ? options.keepaliveInterval * 1000 : 0,
-        keepaliveCountMax: options.keepaliveInterval > 0 ? 3 : 0,
+        keepaliveInterval: hopInterval > 0 ? hopInterval * 1000 : 0,
+        keepaliveCountMax: hopInterval > 0 ? hopCountMax : 0,
         // Enable keyboard-interactive authentication (required for 2FA/MFA)
         tryKeyboard: true,
-        algorithms: buildAlgorithms(options.legacyAlgorithms),
+        // Per-hop algorithm settings. Two distinct semantics:
+        //
+        // - `legacyAlgorithms` is *append-only* — it widens the offered
+        //   list — so falling back to the target's setting when the hop
+        //   didn't override is safe and matches the historic chain-wide
+        //   behavior (a user with a single old leaf only needs to flip
+        //   the toggle on the leaf).
+        //
+        // - `skipEcdsaHostKey` and `algorithmOverrides` *narrow* the
+        //   offered list (the first removes every `ecdsa-sha2-*`, the
+        //   second replaces a category outright). Propagating those to
+        //   a bastion that doesn't need them can lock the hop to
+        //   algorithms it doesn't accept — e.g. an Ed25519-only bastion
+        //   would still negotiate while ECDSA was offered, but breaks
+        //   when the leaf's ECDSA skip is applied to it. Treat both as
+        //   strictly per-host: an unset hop value uses the hop's default
+        //   offer, not the leaf's narrower setting.
+        algorithms: buildAlgorithms(
+          jump.legacyAlgorithms ?? options.legacyAlgorithms,
+          {
+            skipEcdsaHostKey: jump.skipEcdsaHostKey,
+            algorithmOverrides: jump.algorithmOverrides,
+          },
+        ),
       };
+      connOpts.hostVerifier = hostKeyVerifier.createHostVerifier({
+        sender,
+        sessionId,
+        hostname: jump.hostname,
+        port: jump.port || 22,
+        knownHosts: options.knownHosts,
+      });
+      attachSshDebugLogger(connOpts, sshDiagnosticLogger);
+      logSshAlgorithms("Jump host", connOpts.algorithms, {
+        hostname: jump.hostname,
+        port: jump.port || 22,
+        legacyAlgorithms: !!(jump.legacyAlgorithms ?? options.legacyAlgorithms),
+        skipEcdsaHostKey: !!jump.skipEcdsaHostKey,
+        hasAlgorithmOverrides: !!jump.algorithmOverrides,
+      }, sshDiagnosticLogger);
 
       // Auth - support agent (certificate), key, password, and default key fallback
       const hasCertificate =
         typeof jump.certificate === "string" && jump.certificate.trim().length > 0;
+
+      const identityFile = !jump.privateKey
+        ? await loadFirstIdentityFileForAuth({
+          sender,
+          identityFilePaths: jump.identityFilePaths,
+          hostname: hopLabel,
+          initialPassphrase: jump.passphrase,
+          passphraseSignal: options._passphraseSignal,
+          logPrefix: `[Chain] Hop ${i + 1}:`,
+          onLoaded: (loaded) => {
+            if (loaded.passphrase) {
+              sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
+            }
+            console.log(`[Chain] Hop ${i + 1}: loaded identity file ${loaded.keyPath}`);
+          },
+          onError: (err, keyPath) => {
+            console.warn(`[Chain] Hop ${i + 1}: failed to read identity file ${keyPath}:`, err.message);
+          },
+        })
+        : null;
+      const inlineKey = jump.privateKey
+        ? await preparePrivateKeyForAuth({
+          sender,
+          privateKey: jump.privateKey,
+          keyId: jump.keyId,
+          keyName: jump.keyId || jump.label || jump.username,
+          hostname: hopLabel,
+          initialPassphrase: jump.passphrase,
+          passphraseSignal: options._passphraseSignal,
+          logPrefix: `[Chain] Hop ${i + 1}:`,
+        })
+        : null;
+      const effectivePrivateKey = inlineKey?.privateKey || identityFile?.privateKey;
+      const effectivePassphrase = inlineKey?.passphrase || identityFile?.passphrase;
 
       let authAgent = null;
       if (hasCertificate) {
@@ -431,16 +607,16 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           meta: {
             label: jump.keyId || jump.username || "",
             certificate: jump.certificate,
-            privateKey: jump.privateKey,
-            passphrase: jump.passphrase,
+            privateKey: effectivePrivateKey,
+            passphrase: effectivePassphrase,
           },
         });
         connOpts.agent = authAgent;
-      } else if (jump.privateKey) {
-        connOpts.privateKey = jump.privateKey;
-        if (jump.passphrase) {
-          connOpts.passphrase = jump.passphrase;
-        } else if (isKeyEncrypted(jump.privateKey)) {
+      } else if (effectivePrivateKey) {
+        connOpts.privateKey = effectivePrivateKey;
+        if (effectivePassphrase) {
+          connOpts.passphrase = effectivePassphrase;
+        } else if (jump.privateKey && isKeyEncrypted(jump.privateKey)) {
           // Key is encrypted but no passphrase provided — prompt the user
           console.log(`[Chain] Hop ${i + 1}: key is encrypted, requesting passphrase`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
@@ -449,7 +625,9 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
             sender,
             `SSH key for ${keyLabel}`,
             keyLabel,
-            hopLabel
+            hopLabel,
+            false,
+            { signal: options._passphraseSignal }
           );
           if (result?.passphrase) {
             connOpts.passphrase = result.passphrase;
@@ -458,42 +636,8 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
             // key so buildAuthHandler won't try it and stall auth.
             delete connOpts.privateKey;
             if (result?.cancelled) {
-              throw new Error(`Passphrase entry cancelled for ${hopLabel}`);
+              throw new PassphraseCancelledError(hopLabel);
             }
-          }
-        }
-      }
-
-      // Read identity files from local paths (e.g. from SSH config IdentityFile)
-      if (!connOpts.privateKey && !connOpts.agent && jump.identityFilePaths?.length > 0) {
-        for (const keyPath of jump.identityFilePaths) {
-          try {
-            const resolvedPath = keyPath.startsWith("~/")
-              ? path.join(os.homedir(), keyPath.slice(2))
-              : keyPath;
-            const keyContent = await fs.promises.readFile(resolvedPath, "utf8");
-            connOpts.privateKey = keyContent;
-            if (isKeyEncrypted(keyContent)) {
-              console.log(`[Chain] Hop ${i + 1}: identity file ${resolvedPath} is encrypted, requesting passphrase`);
-              sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
-              const result = await passphraseHandler.requestPassphrase(
-                sender,
-                resolvedPath,
-                path.basename(resolvedPath),
-                hopLabel
-              );
-              if (result?.passphrase) {
-                connOpts.passphrase = result.passphrase;
-              } else {
-                // Cancelled/skipped/timeout — clear encrypted key, try next file
-                delete connOpts.privateKey;
-                continue;
-              }
-            }
-            console.log(`[Chain] Hop ${i + 1}: loaded identity file ${resolvedPath}`);
-            break;
-          } catch (err) {
-            console.warn(`[Chain] Hop ${i + 1}: failed to read identity file ${keyPath}:`, err.message);
           }
         }
       }
@@ -521,7 +665,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       applyAuthToConnOpts(connOpts, authConfig);
 
       // If first hop and proxy is configured, connect through proxy
-      const hasUsableJumpProxy = !!(jump.proxy?.host && jump.proxy?.port);
+      const hasUsableJumpProxy = hasUsableProxy(jump.proxy);
       const effectiveHopProxy = isFirst ? ((hasUsableJumpProxy ? jump.proxy : null) || options.proxy) : null;
       if (effectiveHopProxy) {
         currentSocket = await createProxySocket(effectiveHopProxy, jump.hostname, jump.port || 22, {
@@ -573,24 +717,26 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           reject(new Error(errMsg));
         });
         // Handle keyboard-interactive authentication for jump hosts (2FA/MFA)
-        const chainKiHandler = createKeyboardInteractiveHandler({
+        conn.on('keyboard-interactive', createKeyboardInteractiveHandler({
           sender,
           sessionId,
           hostname: hopLabel,
           password: jump.password,
           logPrefix: `[Chain] Hop ${i + 1}/${totalHops}`,
-        });
-        conn.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
-          if (prompts && prompts.length > 0) {
-            sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...');
-          }
-          const wrappedFinish = (...args) => {
-            sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'user responded');
-            finish(...args);
-          };
-          chainKiHandler(name, instructions, lang, prompts, wrappedFinish);
-        });
+          scope: "terminal",
+          onAutoFill: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'using saved password',
+          ),
+          onPromptShown: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...',
+          ),
+          onUserResponded: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'user responded',
+          ),
+        }));
         console.log(`[Chain] Hop ${i + 1}/${totalHops}: Connecting to ${hopLabel}...`);
+        conn.once('connect', () => enableSshNoDelay(conn));
+        if (connOpts.sock) enableTcpNoDelay(connOpts.sock);
         conn.connect(connOpts);
       });
 
@@ -647,1036 +793,34 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 /**
  * Start an SSH session
  */
-async function startSSHSession(event, options) {
-  const sessionId =
-    options.sessionId ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
-  const sender = event.sender;
-
-  const sendProgress = (hop, total, label, status, error) => {
-    if (!sender.isDestroyed()) {
-      sender.send("netcatty:chain:progress", { sessionId, hop, total, label, status, error });
-    }
-  };
-
-  try {
-    const conn = new SSHClient();
-    let chainConnections = [];
-    let connectionSocket = null;
-
-    // Determine if we have jump hosts
-    const jumpHosts = options.jumpHosts || [];
-    const hasJumpHosts = jumpHosts.length > 0;
-    const hasProxy = !!options.proxy;
-    const totalHops = jumpHosts.length + 1; // +1 for final target
-
-    // Build base connection options for final target
-    const connectOpts = {
-      host: options.hostname,
-      port: options.port || 22,
-      username: options.username || "root",
-      // `readyTimeout` covers the entire connection + authentication flow in ssh2.
-      readyTimeout: 20000, // Fast failure for non-interactive auth
-      // Use user-configured keepalive interval (in seconds -> convert to ms)
-      // 0 = disabled (no keepalive packets sent)
-      keepaliveInterval: options.keepaliveInterval > 0 ? options.keepaliveInterval * 1000 : 0,
-      keepaliveCountMax: options.keepaliveInterval > 0 ? 3 : 0,
-      // Enable keyboard-interactive authentication (required for 2FA/MFA)
-      tryKeyboard: true,
-      algorithms: buildAlgorithms(options.legacyAlgorithms),
-    };
-
-    // Authentication for final target
-    const hasCertificate = typeof options.certificate === "string" && options.certificate.trim().length > 0;
-    const effectivePassphrase = options.passphrase;
-
-    console.log("[SSH] Auth configuration:", {
-      hasCertificate,
-      keySource: options.keySource,
-      hasPublicKey: !!options.publicKey,
-      hasPrivateKey: !!options.privateKey,
-      hasPassword: !!options.password,
-      hasEffectivePassphrase: !!effectivePassphrase,
-    });
-
-    log("Auth configuration", {
-      hasCertificate,
-      keySource: options.keySource,
-      hasPublicKey: !!options.publicKey,
-      hasPrivateKey: !!options.privateKey,
-    });
-
-    let authAgent = null;
-    if (hasCertificate) {
-      authAgent = new NetcattyAgent({
-        mode: "certificate",
-        webContents: event.sender,
-        meta: {
-          label: options.keyId || options.username || "",
-          certificate: options.certificate,
-          privateKey: options.privateKey,
-          passphrase: effectivePassphrase,
-        },
-      });
-      connectOpts.agent = authAgent;
-    } else if (options.privateKey) {
-      connectOpts.privateKey = options.privateKey;
-      if (effectivePassphrase) {
-        connectOpts.passphrase = effectivePassphrase;
-      }
-    }
-
-    // Read identity files from local paths (e.g. from SSH config IdentityFile)
-    // Only if no explicit key was already configured
-    if (!connectOpts.privateKey && !connectOpts.agent && options.identityFilePaths?.length > 0) {
-      for (const keyPath of options.identityFilePaths) {
-        try {
-          const resolvedPath = keyPath.startsWith("~/")
-            ? path.join(os.homedir(), keyPath.slice(2))
-            : keyPath;
-          const keyContent = await fs.promises.readFile(resolvedPath, "utf8");
-          connectOpts.privateKey = keyContent;
-          // Check if key is encrypted — if so, prompt for passphrase
-          if (isKeyEncrypted(keyContent)) {
-            log("Identity file is encrypted, requesting passphrase", { keyPath: resolvedPath });
-            const result = await passphraseHandler.requestPassphrase(
-              sender,
-              resolvedPath,
-              path.basename(resolvedPath),
-              options.hostname
-            );
-            if (result?.passphrase) {
-              connectOpts.passphrase = result.passphrase;
-            } else {
-              // Cancelled/skipped/timeout — clear encrypted key, try next file
-              delete connectOpts.privateKey;
-              continue;
-            }
-          }
-          log("Loaded identity file", { keyPath: resolvedPath, encrypted: isKeyEncrypted(keyContent) });
-          break; // Use the first successfully loaded key
-        } catch (err) {
-          log("Failed to read identity file", { keyPath, error: err.message });
-        }
-      }
-    }
-
-    if (options.password && typeof options.password === "string" && options.password.trim().length > 0) {
-      connectOpts.password = options.password;
-    }
-
-    // Always try to find default SSH keys for fallback authentication
-    // This allows fallback even when password auth fails
-    let defaultKeyInfo = null;
-    let allDefaultKeys = [];
-    let usedDefaultKeyAsPrimary = false;
-    const defaultKey = await findDefaultPrivateKey();
-    if (defaultKey) {
-      defaultKeyInfo = defaultKey;
-      log("Found default SSH key for fallback", { keyPath: defaultKey.keyPath, keyName: defaultKey.keyName });
-    }
-    // Also find ALL default keys for comprehensive fallback
-    allDefaultKeys = await findAllDefaultPrivateKeys();
-
-    // Use unlocked encrypted keys if provided (from retry after auth failure)
-    // These are passed via _unlockedEncryptedKeys from startSSHSessionWrapper
-    const unlockedEncryptedKeys = options._unlockedEncryptedKeys || [];
-    if (unlockedEncryptedKeys.length > 0) {
-      log("Using unlocked encrypted keys from retry", {
-        count: unlockedEncryptedKeys.length,
-        keyNames: unlockedEncryptedKeys.map(k => k.keyName)
-      });
-    }
-
-    // If no primary auth method configured, try ssh-agent first, then ALL default keys
-    if (!connectOpts.privateKey && !connectOpts.password && !connectOpts.agent) {
-      // First, try to use ssh-agent if available (this is what regular SSH does)
-      const sshAgentSocket = await getAvailableAgentSocket();
-
-      if (sshAgentSocket) {
-        log("No auth method configured, trying ssh-agent first", { agentSocket: sshAgentSocket });
-        connectOpts.agent = sshAgentSocket;
-      }
-
-      // Mark that we need to try all default keys (handled in authMethods below)
-      if (allDefaultKeys.length > 0) {
-        log("Will try all default SSH keys as fallback", { count: allDefaultKeys.length, keyNames: allDefaultKeys.map(k => k.keyName) });
-        // Set first key for connectOpts.privateKey (required for ssh2 to allow publickey auth)
-        connectOpts.privateKey = allDefaultKeys[0].privateKey;
-        usedDefaultKeyAsPrimary = true;
-      } else {
-        log("No default SSH key found in ~/.ssh directory");
-      }
-    }
-
-    log("Final auth configuration", {
-      hasPrivateKey: !!connectOpts.privateKey,
-      hasPassword: !!connectOpts.password,
-      hasAgent: !!connectOpts.agent,
-      hasDefaultKeyFallback: !!defaultKeyInfo,
-    });
-
-    // Agent forwarding
-    if (options.agentForwarding) {
-      if (!connectOpts.agent) {
-        connectOpts.agent = await getAvailableAgentSocket();
-      }
-      // Only enable forwarding when an agent is actually available
-      if (connectOpts.agent) {
-        connectOpts.agentForward = true;
-      } else {
-        log("Agent forwarding requested but no agent available, skipping");
-      }
-    }
-
-    // Build authentication handler with fallback support
-    // ssh2 authHandler can be a function that returns the next auth method to try
-
-    // Check if we have a cached successful auth method for this host
-    const cachedMethod = getCachedAuthMethod(connectOpts.username, options.hostname, options.port);
-
-    // Track which method succeeded for caching
-    let lastTriedMethod = null;
-
-    if (authAgent) {
-      const order = ["none", "agent"];
-      if (connectOpts.password) order.push("password");
-      // Add default key fallback if available and no user key configured
-      // Must also set connectOpts.privateKey for ssh2 to actually try publickey auth
-      if (defaultKeyInfo && !options.privateKey) {
-        connectOpts.privateKey = defaultKeyInfo.privateKey;
-        order.push("publickey");
-      }
-      order.push("keyboard-interactive");
-      connectOpts.authHandler = order;
-      log("Auth order (agent mode)", { order });
-    } else {
-      // Build dynamic auth handler for fallback support
-      const authMethods = [];
-
-      // First try user-configured key if available (explicit user choice)
-      if (connectOpts.privateKey && !usedDefaultKeyAsPrimary) {
-        authMethods.push({ type: "publickey", key: connectOpts.privateKey, passphrase: connectOpts.passphrase, id: "publickey-user" });
-      }
-
-      // Then try agent if configured (try agent before password since it's usually faster)
-      if (connectOpts.agent) {
-        authMethods.push({ type: "agent", id: "agent" });
-      }
-
-      // Then try password if available (explicit user choice)
-      if (connectOpts.password) {
-        authMethods.push({ type: "password", id: "password" });
-      }
-
-      // Then try ALL default SSH keys as fallback (not just the first one!)
-      // This is critical because different servers may have different keys in authorized_keys
-      if (usedDefaultKeyAsPrimary && allDefaultKeys.length > 0) {
-        for (const keyInfo of allDefaultKeys) {
-          authMethods.push({
-            type: "publickey",
-            key: keyInfo.privateKey,
-            isDefault: true,
-            id: `publickey-default-${keyInfo.keyName}`
-          });
-        }
-      } else if (defaultKeyInfo && !options.privateKey && !usedDefaultKeyAsPrimary) {
-        // Single default key fallback (when user has configured other auth methods)
-        authMethods.push({ type: "publickey", key: defaultKeyInfo.privateKey, isDefault: true, id: "publickey-default" });
-      }
-
-      // Add unlocked encrypted default keys (user provided passphrases for these)
-      for (const keyInfo of unlockedEncryptedKeys) {
-        authMethods.push({
-          type: "publickey",
-          key: keyInfo.privateKey,
-          passphrase: keyInfo.passphrase,
-          isDefault: true,
-          id: `publickey-encrypted-${keyInfo.keyName}`
-        });
-      }
-
-      // Finally try keyboard-interactive
-      authMethods.push({ type: "keyboard-interactive", id: "keyboard-interactive" });
-
-      log("Auth methods configured", {
-        methods: authMethods.map(m => ({ type: m.type, id: m.id, isDefault: m.isDefault || false })),
-        cachedMethod,
-        usedDefaultKeyAsPrimary
-      });
-
-      // Reorder methods based on cached successful method
-      if (cachedMethod) {
-        const cachedIndex = authMethods.findIndex(m => m.id === cachedMethod);
-        if (cachedIndex > 0) {
-          const [cachedAuthMethod] = authMethods.splice(cachedIndex, 1);
-          authMethods.unshift(cachedAuthMethod);
-          log("Reordered auth methods based on cache", {
-            methods: authMethods.map(m => m.id)
-          });
-        }
-      }
-
-      // Always use dynamic authHandler to ensure consistent "none" probing
-      // and auth method logging regardless of how many methods are configured
-      if (authMethods.length >= 1) {
-        let authIndex = 0;
-        // Track methods that have been attempted (to avoid re-trying on failure)
-        // This prevents reusing the same key when server requires multiple publickey auth steps
-        // and also prevents re-attempting failed methods
-        const attemptedMethodIds = new Set();
-        // Track the first successful method for caching (not the last one in multi-step flows)
-        let firstSuccessfulMethod = null;
-        // Track if we've gone through a partialSuccess flow (multi-step auth)
-        let hadPartialSuccess = false;
-
-        connectOpts.authHandler = (methodsLeft, partialSuccess, callback) => {
-          log("authHandler called", { methodsLeft, partialSuccess, authIndex, attemptedMethodIds: Array.from(attemptedMethodIds) });
-
-          // Log rejection of previous method
-          if (lastTriedMethod && !partialSuccess) {
-            sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', `${lastTriedMethod} rejected`);
-          }
-
-          // On the very first call (methodsLeft === null), try "none" auth.
-          // Per RFC 4252, the "none" request is how the client discovers which
-          // methods the server supports.  It also allows passwordless login on
-          // embedded devices.  This matches the behavior of OpenSSH and Tabby.
-          if (methodsLeft === null && !attemptedMethodIds.has("none")) {
-            attemptedMethodIds.add("none");
-            lastTriedMethod = "none";
-            sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'none (no credentials)');
-            return callback("none");
-          }
-
-          // methodsLeft can be null on first call (before server responds with available methods)
-          // Include "agent" for SSH agent-based auth (used with agentForwarding)
-          const availableMethods = methodsLeft || ["publickey", "password", "keyboard-interactive", "agent"];
-
-          // Handle partialSuccess case (e.g., password succeeded but server requires additional auth like MFA)
-          // When partialSuccess is true, we should try the remaining methods the server is asking for
-          if (partialSuccess && methodsLeft && methodsLeft.length > 0) {
-            hadPartialSuccess = true;
-            // Record the first successful method (the one that triggered partialSuccess)
-            if (lastTriedMethod && !firstSuccessfulMethod) {
-              firstSuccessfulMethod = lastTriedMethod;
-              log("Recorded first successful method for caching", { method: firstSuccessfulMethod });
-            }
-            // Mark the last tried method as attempted (it succeeded, so we shouldn't retry it)
-            if (lastTriedMethod) {
-              attemptedMethodIds.add(lastTriedMethod);
-              log("Marked method as attempted (partial success)", { method: lastTriedMethod });
-            }
-
-            log("Partial success - server requires additional auth", { methodsLeft, attemptedMethodIds: Array.from(attemptedMethodIds) });
-
-            // Find a method from our list that matches what the server wants
-            // Skip methods that have already been attempted
-            for (const serverMethod of methodsLeft) {
-              // Map server method names to our method types
-              const matchingMethod = authMethods.find(m => {
-                // Skip already attempted methods
-                if (attemptedMethodIds.has(m.id)) return false;
-                if (serverMethod === "keyboard-interactive" && m.type === "keyboard-interactive") return true;
-                if (serverMethod === "password" && m.type === "password") return true;
-                if (serverMethod === "publickey" && (m.type === "publickey" || m.type === "agent")) return true;
-                return false;
-              });
-
-              if (matchingMethod) {
-                log("Found matching method for partial success", { serverMethod, matchingMethod: matchingMethod.id });
-                // Mark as attempted BEFORE returning to prevent re-use on failure
-                attemptedMethodIds.add(matchingMethod.id);
-                lastTriedMethod = matchingMethod.id;
-
-                if (matchingMethod.type === "keyboard-interactive") {
-                  log("Trying keyboard-interactive auth (partial success)", { id: matchingMethod.id });
-                  return callback("keyboard-interactive");
-                } else if (matchingMethod.type === "password") {
-                  log("Trying password auth (partial success)", { id: matchingMethod.id });
-                  return callback({
-                    type: "password",
-                    username: connectOpts.username,
-                    password: connectOpts.password,
-                  });
-                } else if (matchingMethod.type === "agent") {
-                  const agentType = typeof connectOpts.agent === "string" ? "path" : "NetcattyAgent";
-                  log("Trying agent auth (partial success)", { id: matchingMethod.id, agentType });
-                  return callback("agent");
-                } else if (matchingMethod.type === "publickey") {
-                  log("Trying publickey auth (partial success)", { id: matchingMethod.id });
-                  return callback({
-                    type: "publickey",
-                    username: connectOpts.username,
-                    key: matchingMethod.key,
-                    passphrase: matchingMethod.passphrase,
-                  });
-                }
-              }
-            }
-            // No matching method found for partial success
-            log("No matching method found for partial success requirements", { methodsLeft });
-            return callback(false);
-          }
-
-          while (authIndex < authMethods.length) {
-            const method = authMethods[authIndex];
-            authIndex++;
-
-            // Skip methods that have already been attempted (e.g., during partial success handling)
-            if (attemptedMethodIds.has(method.id)) {
-              log("Skipping already attempted method", { method: method.id });
-              continue;
-            }
-
-            // Check if this method is still available on server
-            // Note: "agent" uses "publickey" as the underlying method type
-            const methodName = method.type === "password" ? "password" :
-              method.type === "publickey" ? "publickey" :
-                method.type === "agent" ? "publickey" : "keyboard-interactive";
-            if (!availableMethods.includes(methodName) && !availableMethods.includes(method.type)) {
-              log("Auth method not available on server, skipping", { method: method.id });
-              continue;
-            }
-
-            // Mark as attempted BEFORE returning
-            attemptedMethodIds.add(method.id);
-            lastTriedMethod = method.id;
-
-            if (method.type === "agent") {
-              // Only log safe identifier, not the full agent object which may contain private keys
-              const agentType = typeof connectOpts.agent === "string" ? "path" : "NetcattyAgent";
-              log("Trying agent auth", { id: method.id, agentType });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'SSH agent');
-              // Return "agent" string to use SSH agent for authentication
-              return callback("agent");
-            } else if (method.type === "publickey") {
-              log("Trying publickey auth", { id: method.id, isDefault: method.isDefault || false });
-              const keyLabel = method.id.startsWith("publickey-default-")
-                ? `key ${method.id.replace("publickey-default-", "")}`
-                : method.id.startsWith("publickey-encrypted-")
-                  ? `key ${method.id.replace("publickey-encrypted-", "")} (encrypted)`
-                  : method.id === "publickey-user"
-                    ? "configured key"
-                    : method.id;
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', keyLabel);
-              return callback({
-                type: "publickey",
-                username: connectOpts.username,
-                key: method.key,
-                passphrase: method.passphrase,
-              });
-            } else if (method.type === "password") {
-              log("Trying password auth", { id: method.id });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'password');
-              return callback({
-                type: "password",
-                username: connectOpts.username,
-                password: connectOpts.password,
-              });
-            } else if (method.type === "keyboard-interactive") {
-              log("Trying keyboard-interactive auth", { id: method.id });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'keyboard-interactive');
-              // Return string instead of object - ssh2 requires a prompt function
-              // for keyboard-interactive objects. Returning the string lets ssh2
-              // use its default handling and trigger the keyboard-interactive event.
-              return callback("keyboard-interactive");
-            }
-          }
-
-          log("All auth methods exhausted");
-          sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'all methods exhausted');
-          return callback(false);
-        };
-
-        // Store method reference for success callback
-        // For multi-step auth (partialSuccess), cache the first successful method, not the last
-        // This ensures next connection starts with the correct first factor
-        connectOpts._lastTriedMethodRef = () => {
-          if (hadPartialSuccess && firstSuccessfulMethod) {
-            log("Using first successful method for cache (multi-step auth)", { firstSuccessfulMethod });
-            return firstSuccessfulMethod;
-          }
-          return lastTriedMethod;
-        };
-      }
-    }
-
-    // Handle chain/proxy connections
-    if (hasJumpHosts) {
-      // Pass fetched keys to chain connection to avoid re-reading files
-      options._defaultKeys = allDefaultKeys;
-
-      const chainResult = await connectThroughChain(
-        event,
-        options,
-        jumpHosts,
-        options.hostname,
-        options.port || 22,
-        sessionId
-      );
-      connectionSocket = chainResult.socket;
-      chainConnections = chainResult.connections;
-
-      connectOpts.sock = connectionSocket;
-      delete connectOpts.host;
-      delete connectOpts.port;
-
-      sendProgress(totalHops, totalHops, options.hostname, 'connecting');
-    } else if (hasProxy) {
-      sendProgress(1, 1, options.hostname, 'connecting');
-      connectionSocket = await createProxySocket(
-        options.proxy,
-        options.hostname,
-        options.port || 22
-      );
-      connectOpts.sock = connectionSocket;
-      delete connectOpts.host;
-      delete connectOpts.port;
-    } else {
-      // Direct connection (no jump hosts, no proxy)
-      sendProgress(1, 1, options.hostname, 'connecting');
-    }
-
-    return new Promise((resolve, reject) => {
-      const logPrefix = hasJumpHosts ? '[Chain]' : '[SSH]';
-      let settled = false;
-
-      conn.once("handshake", () => {
-        console.log(`${logPrefix} ${options.hostname} handshake complete`);
-        sendProgress(totalHops, totalHops, options.hostname, 'authenticating');
-      });
-
-      conn.once("ready", () => {
-        console.log(`${logPrefix} ${options.hostname} ready`);
-
-        // Cache the successful auth method
-        if (connectOpts._lastTriedMethodRef) {
-          const successMethod = connectOpts._lastTriedMethodRef();
-          if (successMethod) {
-            setCachedAuthMethod(connectOpts.username, options.hostname, options.port, successMethod);
-          }
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'authenticated');
-        sendProgress(totalHops, totalHops, options.hostname, 'shell');
-
-        conn.shell(
-          {
-            term: "xterm-256color",
-            cols,
-            rows,
-          },
-          {
-            env: {
-              LANG: resolveLangFromCharset(options.charset),
-              COLORTERM: "truecolor",
-              ...(options.env || {}),
-            },
-          },
-          (err, stream) => {
-            if (err) {
-              settled = true;
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-              sendProgress(totalHops, totalHops, options.hostname, 'error', `Failed to open shell: ${err.message}`);
-              reject(err);
-              return;
-            }
-
-            sendProgress(totalHops, totalHops, options.hostname, 'connected');
-
-            const session = {
-              conn,
-              stream,
-              chainConnections,
-              webContentsId: event.sender.id,
-              // Store connection info for MCP host discovery
-              hostname: options.host || options.hostname || '',
-              username: options.username || '',
-              label: options.label || '',
-              lastIdlePrompt: '',
-              lastIdlePromptAt: 0,
-              _promptTrackTail: '',
-              // SSH server identification string (the `software` part of
-              // `SSH-2.0-<software>`). ssh2 captures this during the header
-              // exchange and stores it on the client as `_remoteVer` — it
-              // is available by the time 'ready' fires, so the renderer can
-              // use it to detect network-device vendors without running any
-              // additional exec channels. See domain/host.ts
-              // `detectVendorFromSshVersion`.
-              remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
-            };
-            sessions.set(sessionId, session);
-
-            // Start real-time session log stream if configured
-            if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-              sessionLogStreamManager.startStream(sessionId, {
-                hostLabel: options.hostLabel || options.hostname || '',
-                hostname: options.hostname || '',
-                directory: options.sessionLog.directory,
-                format: options.sessionLog.format || 'txt',
-                startTime: Date.now(),
-              });
-            }
-
-            // Data buffering for reduced IPC overhead
-            let dataBuffer = '';
-            let flushTimeout = null;
-            const FLUSH_INTERVAL = 8; // ms - flush every 8ms for ~120fps equivalent
-            const MAX_BUFFER_SIZE = 16384; // 16KB - flush immediately if buffer gets too large
-
-            const flushBuffer = () => {
-              if (dataBuffer.length > 0) {
-                const contents = event.sender;
-                safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
-                dataBuffer = '';
-              }
-              flushTimeout = null;
-            };
-
-            const bufferData = (data) => {
-              dataBuffer += data;
-              // Immediate flush for large chunks
-              if (dataBuffer.length >= MAX_BUFFER_SIZE) {
-                if (flushTimeout) {
-                  clearTimeout(flushTimeout);
-                  flushTimeout = null;
-                }
-                flushBuffer();
-              } else if (!flushTimeout) {
-                // Schedule flush
-                flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
-              }
-            };
-
-            const sshZmodemSentry = createZmodemSentry({
-              sessionId,
-              onData(buf) {
-                const decoder = getSessionDecoder(sessionId, "stdout");
-                const decoded = decoder.write(buf);
-                trackSessionIdlePrompt(session, decoded);
-                bufferData(decoded);
-                sessionLogStreamManager.appendData(sessionId, decoded);
-              },
-              writeToRemote(buf) {
-                try { return stream.write(buf); } catch { return true; /* ignore */ }
-              },
-              interruptRemote() {
-                try { stream.signal?.("INT"); } catch { /* ignore */ }
-              },
-              getWebContents() {
-                return event.sender;
-              },
-              label: "SSH",
-            });
-            session.zmodemSentry = sshZmodemSentry;
-
-            stream.on("data", (data) => {
-              // data is Buffer from ssh2 — feed raw bytes to ZMODEM sentry.
-              // In normal mode, sentry's onData callback handles decoding and buffering.
-              sshZmodemSentry.consume(data);
-            });
-
-            stream.stderr?.on("data", (data) => {
-              // stderr is not used for ZMODEM — decode normally
-              const decoder = getSessionDecoder(sessionId, "stderr");
-              const decoded = decoder.write(data);
-              bufferData(decoded);
-              sessionLogStreamManager.appendData(sessionId, decoded);
-            });
-
-            // Capture the real exit code from the remote process.
-            // "exit" fires when the remote shell/process exits normally;
-            // "close" fires whenever the channel closes (could be network drop).
-            // Only treat it as user-initiated exit if "exit" fired with a numeric
-            // code and no signal. Signal terminations (e.g. server kill, idle
-            // timeout) have code=null and signal set — those are not user exits.
-            let streamExitCode = 0;
-            let streamExited = false;
-            stream.on("exit", (code, signal) => {
-              streamExitCode = typeof code === "number" ? code : 0;
-              streamExited = typeof code === "number" && !signal;
-            });
-
-            stream.on("close", () => {
-              // Always flush buffered data regardless of session state
-              if (flushTimeout) {
-                clearTimeout(flushTimeout);
-              }
-              flushBuffer();
-              sessionLogStreamManager.stopStream(sessionId);
-
-              // Only send exit if session hasn't already been cleaned up by
-              // conn.once("close") — which fires before stream.on("close")
-              // in ssh2 when the transport drops.
-              if (sessions.has(sessionId)) {
-                const contents = event.sender;
-                const session = sessions.get(sessionId);
-                const transportError = session?._transportError;
-                if (transportError) {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-                } else {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: streamExitCode, reason: streamExited ? "exited" : "closed" });
-                }
-                sessions.get(sessionId)?.zmodemSentry?.cancel();
-                sessions.delete(sessionId);
-                sessionEncodings.delete(sessionId);
-                sessionDecoders.delete(sessionId);
-              }
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-            });
-
-            // Pre-seed encoding from host charset if it's a GB variant
-            if (options.charset && /^gb/i.test(String(options.charset).trim())) {
-              sessionEncodings.set(sessionId, "gb18030");
-            }
-
-            // Run startup command if specified
-            if (options.startupCommand) {
-              setTimeout(() => {
-                stream.write(`${options.startupCommand}\n`);
-              }, 300);
-            }
-
-            settled = true;
-            resolve({ sessionId });
-          }
-        );
-      });
-
-      conn.on("error", (err) => {
-        // After the promise is settled, we can't reject again. But if the
-        // session was already established (resolved), we still need to notify
-        // the renderer about transport errors so the session shows as failed
-        // rather than silently closing.
-        // Don't send netcatty:exit here — the stream close handler will flush
-        // any buffered data first and then send exit with this error info.
-        if (settled) {
-          console.warn(`${logPrefix} ${options.hostname} post-settle error:`, err.message);
-          // Store the error so the close handler can include it in the exit event
-          if (sessions.has(sessionId)) {
-            const session = sessions.get(sessionId);
-            if (session) session._transportError = err.message;
-          }
-          return;
-        }
-
-        const contents = event.sender;
-
-        const isAuthError = err.message?.toLowerCase().includes('authentication') ||
-          err.message?.toLowerCase().includes('auth') ||
-          err.message?.toLowerCase().includes('password') ||
-          err.level === 'client-authentication';
-
-        // Clear cached auth method on auth failure so next attempt tries all methods
-        if (isAuthError) {
-          clearCachedAuthMethod(connectOpts.username, options.hostname, options.port);
-          console.log(`${logPrefix} ${options.hostname} auth failed:`, err.message);
-          safeSend(contents, "netcatty:auth:failed", {
-            sessionId,
-            error: err.message,
-            hostname: options.hostname
-          });
-        } else {
-          console.error(`${logPrefix} ${options.hostname} error:`, err.message);
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
-        safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
-        sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
-        }
-        // Destroy the connection to prevent further socket errors from leaking
-        // as uncaught exceptions (e.g. ECONNRESET on embedded devices).
-        try { conn.destroy(); } catch { }
-        settled = true;
-        reject(err);
-      });
-
-      conn.once("timeout", () => {
-        console.error(`${logPrefix} ${options.hostname} connection timeout`);
-        const err = new Error(`Connection timeout to ${options.hostname}`);
-        const contents = event.sender;
-        sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
-        safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "timeout" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
-        sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
-        }
-        try { conn.destroy(); } catch { }
-        settled = true;
-        reject(err);
-      });
-
-      conn.once("close", () => {
-        const contents = event.sender;
-        if (!settled) {
-          sendProgress(totalHops, totalHops, options.hostname, 'error', `Connection to ${options.hostname} closed unexpectedly`);
-        }
-        // Only send exit if the session hasn't already been cleaned up by the
-        // error handler (avoids sending a misleading exitCode:0 "closed" after
-        // a real transport error was already reported).
-        if (sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          const transportError = session?._transportError;
-          if (transportError) {
-            // A transport error was recorded — report it as an error exit
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-          } else {
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 0, reason: "closed" });
-          }
-        }
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
-        sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
-        }
-        if (!settled) {
-          settled = true;
-          reject(new Error(`Connection to ${options.hostname} closed unexpectedly`));
-        }
-      });
-
-      // Handle keyboard-interactive authentication (2FA/MFA)
-      conn.on("keyboard-interactive", (name, instructions, instructionsLang, prompts, finish) => {
-        console.log(`${logPrefix} ${options.hostname} keyboard-interactive auth requested`, {
-          name,
-          instructions,
-          promptCount: prompts?.length || 0,
-          prompts: prompts?.map(p => ({ prompt: p.prompt, echo: p.echo })),
-        });
-
-        // If there are no prompts, just call finish with empty array
-        if (!prompts || prompts.length === 0) {
-          console.log(`${logPrefix} No prompts, finishing keyboard-interactive`);
-          finish([]);
-          return;
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'waiting for user input...');
-
-        // Forward ALL prompts to user - no auto-fill to avoid semantic detection issues
-        // (Prompt text is admin-customizable and may not contain expected keywords)
-        const requestId = keyboardInteractiveHandler.generateRequestId('ssh');
-
-        keyboardInteractiveHandler.storeRequest(requestId, (userResponses) => {
-          console.log(`${logPrefix} Received user responses, finishing keyboard-interactive`);
-          sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'user responded');
-          finish(userResponses);
-        }, sender.id, sessionId);
-
-        const promptsData = prompts.map((p) => ({
-          prompt: p.prompt,
-          echo: p.echo,
-        }));
-
-        console.log(`${logPrefix} Showing modal for ${promptsData.length} prompts`);
-
-        safeSend(sender, "netcatty:keyboard-interactive", {
-          requestId,
-          sessionId,
-          name: name || "",
-          instructions: instructions || "",
-          prompts: promptsData,
-          hostname: options.hostname,
-          savedPassword: options.password || null, // Pass saved password for optional fill button
-        });
-      });
-
-
-      // Enable keyboard-interactive authentication in authHandler
-      // Note: If authHandler is a function (for fallback support), keyboard-interactive
-      // is already included in the auth methods list
-      if (Array.isArray(connectOpts.authHandler)) {
-        // Add keyboard-interactive after the existing methods
-        if (!connectOpts.authHandler.includes("keyboard-interactive")) {
-          connectOpts.authHandler.push("keyboard-interactive");
-        }
-      } else if (typeof connectOpts.authHandler !== "function") {
-        // Create authHandler with keyboard-interactive support
-        // This path is taken when usedDefaultKeyAsPrimary=true (only keyboard-interactive in authMethods)
-        // Using array format is more reliable - ssh2 uses connectOpts credentials directly
-        const authMethods = [];
-        // Try agent FIRST (this is what regular SSH does - it checks ssh-agent before key files)
-        if (connectOpts.agent) authMethods.push("agent");
-        if (connectOpts.privateKey) authMethods.push("publickey");
-        if (connectOpts.password) authMethods.push("password");
-        authMethods.push("keyboard-interactive");
-        connectOpts.authHandler = authMethods;
-        log("Using simple array authHandler", { authMethods, usedDefaultKeyAsPrimary });
-      }
-      // If authHandler is a function, it already handles keyboard-interactive
-
-      // Increase timeout to allow for keyboard-interactive auth
-      connectOpts.readyTimeout = 120000; // 2 minutes for 2FA input
-
-      // Enable debug logging for ssh2 to diagnose auth issues
-      connectOpts.debug = (msg) => {
-        // Only log auth-related messages to avoid noise
-        if (msg.includes('Auth') || msg.includes('auth') || msg.includes('publickey') || msg.includes('keyboard')) {
-          log("ssh2 debug", { msg });
-        }
-      };
-
-      console.log(`${logPrefix} Connecting to ${options.hostname}...`);
-      conn.connect(connectOpts);
-    });
-  } catch (err) {
-    console.error("[Chain] SSH chain connection error:", err.message);
-    const contents = event.sender;
-    safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message });
-    throw err;
-  }
-}
-
-/**
- * Execute a one-off command via SSH
- */
-async function execCommand(event, payload) {
-  const enableKeyboardInteractive = !!payload.enableKeyboardInteractive;
-  const baseTimeoutMs = payload.timeout || 10000;
-  const timeoutMs = enableKeyboardInteractive ? Math.max(baseTimeoutMs, 120000) : baseTimeoutMs;
-  const sender = event.sender;
-  const sessionId = payload.sessionId || `exec-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const defaultKeys = enableKeyboardInteractive ? await findAllDefaultPrivateKeysFromHelper() : [];
-
-  return new Promise((resolve, reject) => {
-    const conn = new SSHClient();
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      conn.end();
-      reject(new Error("SSH exec timeout"));
-    }, timeoutMs);
-
-    conn
-      .once("ready", () => {
-        conn.exec(payload.command, (err, stream) => {
-          if (err) {
-            clearTimeout(timer);
-            settled = true;
-            conn.end();
-            return reject(err);
-          }
-          stream
-            .on("data", (data) => {
-              stdout += data.toString();
-            })
-            .stderr.on("data", (data) => {
-              stderr += data.toString();
-            })
-            .on("close", (code) => {
-              if (settled) return;
-              clearTimeout(timer);
-              settled = true;
-              conn.end();
-              resolve({ stdout, stderr, code: code ?? (stderr ? 1 : 0) });
-            });
-        });
-      })
-      .on("error", (err) => {
-        if (settled) return;
-        clearTimeout(timer);
-        settled = true;
-        conn.end();
-        reject(err);
-      })
-      .once("end", () => {
-        if (settled) return;
-        clearTimeout(timer);
-        settled = true;
-        if (stderr || stdout) {
-          resolve({ stdout, stderr, code: 0 });
-        } else {
-          reject(new Error("SSH connection closed unexpectedly"));
-        }
-      });
-
-    const hasCertificate = typeof payload.certificate === "string" && payload.certificate.trim().length > 0;
-
-    const connectOpts = {
-      host: payload.hostname,
-      port: payload.port || 22,
-      username: payload.username,
-      readyTimeout: enableKeyboardInteractive ? Math.max(timeoutMs, 120000) : timeoutMs,
-      keepaliveInterval: 0,
-    };
-
-    let authAgent = null;
-    if (hasCertificate) {
-      authAgent = new NetcattyAgent({
-        mode: "certificate",
-        webContents: event.sender,
-        meta: {
-          label: payload.keyId || payload.username || "",
-          certificate: payload.certificate,
-          privateKey: payload.privateKey,
-          passphrase: payload.passphrase,
-        },
-      });
-      connectOpts.agent = authAgent;
-    } else if (payload.privateKey) {
-      connectOpts.privateKey = payload.privateKey;
-      if (payload.passphrase) connectOpts.passphrase = payload.passphrase;
-    }
-
-    if (payload.password) connectOpts.password = payload.password;
-
-    if (enableKeyboardInteractive) {
-      connectOpts.tryKeyboard = true;
-
-      const authConfig = buildAuthHandler({
-        privateKey: connectOpts.privateKey,
-        password: connectOpts.password,
-        passphrase: connectOpts.passphrase,
-        agent: connectOpts.agent,
-        username: connectOpts.username,
-        logPrefix: "[SSH Exec]",
-        defaultKeys,
-      });
-
-      applyAuthToConnOpts(connectOpts, authConfig);
-
-      conn.on("keyboard-interactive", createKeyboardInteractiveHandler({
-        sender,
-        sessionId,
-        hostname: payload.hostname,
-        password: payload.password,
-        logPrefix: "[SSH Exec]",
-      }));
-    } else if (authAgent) {
-      const order = ["agent"];
-      if (connectOpts.password) order.push("password");
-      connectOpts.authHandler = order;
-    }
-
-    conn.connect(connectOpts);
-  });
-}
+const { createStartSessionApi } = require("./sshBridge/startSession.cjs");
+const startSessionApi = createStartSessionApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  SSHClient, sshUtils, NetcattyAgent, keyboardInteractiveHandler, passphraseHandler, hostKeyVerifier,
+  fs, path, os, net, crypto, Buffer, process, console, setTimeout, clearTimeout,
+  createProxySocket, attachX11Forwarding, createPtyOutputBuffer, sessionLogStreamManager,
+  trackSessionIdlePrompt, looksLikeIdleAutoLogout, createZmodemSentry, enableSshNoDelay, enableTcpNoDelay,
+  iconv, getSessionDecoder, resetSessionDecoders, sessionEncodings, sessionDecoders, encodeTerminalInput,
+  connectThroughChain, getAvailableAgentSocket, getCachedAuthMethod, setCachedAuthMethod, clearCachedAuthMethod,
+  attachSshDebugLogger, logSshAlgorithms, resolveLangFromCharset, safeSend, zmodemOverwritePending,
+  shouldLogSshDebugMessage, log, createSshDiagnosticLogger,
+  buildAlgorithms, randomUUID, findDefaultPrivateKey, findAllDefaultPrivateKeys,
+  preparePrivateKeyForAuth, loadFirstIdentityFileForAuth, createKeyboardInteractiveHandler,
+  createConnectionRef, acquireConnectionRef, releaseConnectionRef, findReusableSession,
+  get probeReceiveConflicts() { return probeReceiveConflicts; },
+  get removeRemoteFiles() { return removeRemoteFiles; },
+  get restoreRemoteModes() { return restoreRemoteModes; },
+});
+const { startSSHSession } = startSessionApi;
+const { createExecCommandApi } = require("./sshBridge/execCommand.cjs");
+const execCommandApi = createExecCommandApi({
+  SSHClient, NetcattyAgent, randomUUID, console, setTimeout, clearTimeout, Error,
+  findAllDefaultPrivateKeysFromHelper, preparePrivateKeyForAuth, loadIdentityFileForAuth,
+  isPassphraseCancelledError, buildAlgorithms, buildAuthHandler, applyAuthToConnOpts,
+  createKeyboardInteractiveHandler,
+});
+const { execCommand } = execCommandApi;
 
 /**
  * Generate SSH key pair
@@ -1773,6 +917,19 @@ async function startSSHSessionWrapper(event, options) {
                 _unlockedEncryptedKeys: passphraseResult.keys,
               });
             } catch (retryErr) {
+              // Only purge cached passphrases if the error is specifically
+              // a passphrase/key-parsing failure, not a generic auth rejection.
+              const retryMsg = (retryErr.message || '').toLowerCase();
+              const isPassphraseError = retryMsg.includes('bad passphrase') ||
+                retryMsg.includes('integrity check failed') ||
+                retryMsg.includes('cannot parse privatekey');
+              if (isPassphraseError) {
+                try {
+                  const failedKeyPaths = passphraseResult.keys.map(k => k.keyPath);
+                  event.sender.send('netcatty:passphrase-auth-failed', { keyPaths: failedKeyPaths });
+                } catch (_) { /* sender may be destroyed */ }
+              }
+
               // Re-wrap retry errors the same way as initial errors
               const isRetryAuthError = retryErr.message?.toLowerCase().includes('authentication') ||
                 retryErr.message?.toLowerCase().includes('auth') ||
@@ -1827,662 +984,49 @@ async function startSSHSessionWrapper(event, options) {
  * classify network devices from the banner without running any additional
  * exec channels.
  */
-async function getSessionRemoteInfo(_event, payload) {
-  const { sessionId } = payload || {};
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return { success: false, error: 'Session not found' };
-  }
-  return {
-    success: true,
-    remoteSshVersion: session.remoteSshVersion || '',
-  };
-}
+// Companion stats connection for Mosh sessions (issue #1198). Mosh runs over
+// UDP and has no ssh2 connection, so getServerStats cannot open an exec
+// channel. This helper lazily establishes a best-effort, non-interactive
+// SSH connection reusing the handshake credentials and assigns it to
+// session.conn so the existing stats path works unchanged.
+const { createSystemKnownHostsApi } = require("./sshBridge/systemKnownHosts.cjs");
+// Lets the Mosh stats companion trust a host whose key is already recorded in
+// the user's system OpenSSH known_hosts (the trust source the Mosh handshake's
+// system `ssh` actually uses), in addition to Netcatty's in-app vault.
+const { isHostKeyTrustedBySystem } = createSystemKnownHostsApi({
+  fs, path, os, crypto, log,
+});
 
-/**
- * Run the distro-identification probe on an already-connected SSH
- * session's connection. Uses an exec channel on the existing conn —
- * which is still one extra channel (and therefore one extra AAA
- * session on vendor CLIs that don't multiplex channels cleanly), but
- * avoids the full auth round-trip that `execCommand` would do by
- * creating a brand new SSHClient. The renderer only falls through to
- * this when banner classification returned no vendor, so in practice
- * it never runs against Cisco/Huawei/HPE/etc. — only against
- * Linux-like hosts and OpenSSH-fronted network devices (JUNOS,
- * NX-OS, EOS) that are already handled by the useServerStats
- * failure-counter path downstream.
- */
-async function getSessionDistroInfo(_event, payload) {
-  const { sessionId } = payload || {};
-  const session = sessions.get(sessionId);
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-  const command = "cat /etc/os-release 2>/dev/null || uname -a";
-  return new Promise((resolve) => {
-    let settled = false;
-    const settle = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = setTimeout(() => {
-      settle({ success: false, error: 'Timeout probing distro' });
-      // Clean up the exec channel so it doesn't linger.
-      try { if (activeStream) activeStream.close(); } catch { /* ignore */ }
-    }, 5000);
-    let activeStream = null;
-    try {
-      session.conn.exec(command, (err, stream) => {
-        if (err) {
-          settle({ success: false, error: err.message || String(err) });
-          return;
-        }
-        activeStream = stream;
-        let stdout = '';
-        let stderr = '';
-        stream.on('data', (chunk) => { stdout += chunk.toString(); });
-        stream.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-        stream.on('close', () => {
-          settle({ success: true, stdout, stderr });
-        });
-      });
-    } catch (err) {
-      settle({ success: false, error: err?.message || String(err) });
-    }
-  });
-}
+const { createMoshStatsConnectionApi } = require("./sshBridge/moshStatsConnection.cjs");
+const { ensureMoshStatsConnection, ensureEtStatsConnection } = createMoshStatsConnectionApi({
+  get sessions() { return sessions; },
+  SSHClient, sshUtils, NetcattyAgent, buildAlgorithms, getSshAgentSocket,
+  readFileNoFollow, expandIdentityFilePath, isAutoFillablePasswordChallenge,
+  hostKeyVerifier, isHostKeyTrustedBySystem, log,
+});
 
-async function getSessionPwd(event, payload) {
-  const { sessionId } = payload;
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-
-  // Completely silent: uses a separate exec channel, nothing is printed
-  // in the interactive terminal. The exec channel and the interactive
-  // shell are both children of the same per-connection sshd process,
-  // so we find the shell as a sibling via $PPID.
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      resolve({ success: false, error: 'Timeout getting pwd' });
-    }, 5000);
-
-    // Find the interactive shell's cwd silently via a separate exec channel.
-    // Both the exec channel and the interactive shell share the same sshd
-    // parent ($PPID). We exclude our own PID ($$) to avoid reading our own cwd.
-    const cmd = `p=$(ps --ppid $PPID -o pid=,comm= 2>/dev/null | awk -v self=$$ '$1!=self && $2~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$p" ] && readlink /proc/$p/cwd 2>/dev/null && exit 0; p=$(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v pp=$PPID -v self=$$ '$1!=self && $2==pp && $3~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$p" ] && readlink /proc/$p/cwd 2>/dev/null && exit 0; eval echo "~"`;
-
-    session.conn.exec(cmd, (err, stream) => {
-      if (err) {
-        clearTimeout(timer);
-        log('[getSessionPwd] exec error:', err.message);
-        resolve({ success: false, error: err.message });
-        return;
-      }
-      let out = '';
-      let errOut = '';
-      stream.on('data', (d) => { out += d.toString(); });
-      stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-      stream.on('close', (code) => {
-        clearTimeout(timer);
-        const path = out.trim();
-        log('[getSessionPwd]', { stdout: path, stderr: errOut.trim(), exitCode: code });
-        if (path && path.startsWith('/')) {
-          resolve({ success: true, cwd: path });
-        } else {
-          resolve({ success: false, error: 'Could not determine cwd' });
-        }
-      });
-    });
-  });
-}
-
-/**
- * List directory contents on remote machine for path autocomplete.
- * Uses a separate exec channel — does not touch the interactive shell.
- */
-async function listSessionDir(_event, payload) {
-  const {
-    sessionId,
-    path: dirPath,
-    foldersOnly,
-    filterPrefix = "",
-    limit = 100,
-  } = payload || {};
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, entries: [], error: 'Session not found' };
-  }
-
-  if (typeof dirPath !== "string" || dirPath.length === 0) {
-    return { success: false, entries: [], error: 'Invalid directory path' };
-  }
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let streamRef = null;
-    const resolveOnce = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = setTimeout(() => {
-      try {
-        streamRef?.close?.();
-        streamRef?.destroy?.();
-      } catch {}
-      resolveOnce({ success: false, entries: [], error: 'Timeout listing directory' });
-    }, 3000);
-
-    // Emit a NUL-delimited stream from plain POSIX shell/find so we don't depend on
-    // Python/Perl, while still preserving whitespace and newline characters in filenames.
-    const safePath = dirPath.replace(/'/g, "'\\''");
-    const tildePathSuffix = dirPath.startsWith("~/")
-      ? dirPath.slice(2).replace(/(["\\$`])/g, "\\$1")
-      : "";
-    const normalizedPrefix = typeof filterPrefix === "string" ? filterPrefix.toLowerCase() : "";
-    const safePrefix = normalizedPrefix.replace(/'/g, "'\\''");
-    const maxEntries = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 200) : 100;
-    const pathExpr = dirPath === "~"
-      ? '"$HOME"'
-      : dirPath.startsWith("~/")
-        ? `"$HOME/${tildePathSuffix}"`
-        : `'${safePath}'`;
-    // When dirPath is relative (not absolute and not ~/...), exec channels default
-    // to the user's home directory. Resolve the interactive shell's actual cwd first
-    // so that relative paths like "." or "src" are resolved correctly.
-    const needsCwdResolve = !dirPath.startsWith('/') && dirPath !== '~' && !dirPath.startsWith('~/');
-    const cwdResolveCmd = needsCwdResolve
-      ? `_sc_p=$(ps --ppid $PPID -o pid=,comm= 2>/dev/null | awk -v self=$$ '$1!=self && $2~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -z "$_sc_p" ] && _sc_p=$(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v pp=$PPID -v self=$$ '$1!=self && $2==pp && $3~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$_sc_p" ] && { _sc_d=$(readlink /proc/$_sc_p/cwd 2>/dev/null); [ -n "$_sc_d" ] && cd "$_sc_d" 2>/dev/null; }; `
-      : '';
-    const cmd = `${cwdResolveCmd}find ${pathExpr} -mindepth 1 -maxdepth 1 -exec sh -c '
-      prefix="$1"
-      folders_only="$2"
-      limit="$3"
-      shift 3
-      count=0
-      for path do
-        name=\${path##*/}
-        lower_name=$(printf "%s" "$name" | tr "[:upper:]" "[:lower:]")
-        if [ -n "$prefix" ]; then
-          case "$lower_name" in
-            "$prefix"*) ;;
-            *) continue ;;
-          esac
-        fi
-        if [ "$folders_only" -eq 1 ] && [ ! -d "$path" ]; then
-          continue
-        fi
-        if [ -L "$path" ]; then
-          type="symlink"
-        elif [ -d "$path" ]; then
-          type="directory"
-        else
-          type="file"
-        fi
-        printf "%s\\0%s\\0" "$name" "$type"
-        count=$((count + 1))
-        if [ "$count" -ge "$limit" ]; then
-          break
-        fi
-      done
-    ' sh '${safePrefix}' ${foldersOnly ? 1 : 0} ${maxEntries} {} + 2>/dev/null`;
-
-    session.conn.exec(cmd, (err, stream) => {
-      if (err) {
-        resolveOnce({ success: false, entries: [], error: err.message });
-        return;
-      }
-      streamRef = stream;
-      const chunks = [];
-      let errOut = '';
-      stream.on('data', (d) => { chunks.push(Buffer.from(d)); });
-      stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-      stream.on('close', () => {
-        if (settled) return;
-        try {
-          const output = Buffer.concat(chunks);
-          const entries = [];
-          let fieldStart = 0;
-          let pendingName = null;
-
-          for (let i = 0; i < output.length; i++) {
-            if (output[i] !== 0) continue;
-            const field = output.toString('utf8', fieldStart, i);
-            fieldStart = i + 1;
-            if (pendingName === null) {
-              pendingName = field;
-            } else {
-              entries.push({ name: pendingName, type: field });
-              pendingName = null;
-              if (entries.length >= maxEntries) break;
-            }
-          }
-
-          if (pendingName !== null) {
-            resolveOnce({ success: false, entries: [], error: 'Invalid directory listing response' });
-            return;
-          }
-
-          resolveOnce({ success: true, entries });
-        } catch {
-          resolveOnce({
-            success: false,
-            entries: [],
-            error: errOut.trim() || 'Failed to parse directory listing',
-          });
-        }
-      });
-    });
-  });
-}
-
-/**
- * Get server stats (CPU, Memory, Disk) from an active SSH session
- * Only works for Linux servers
- */
-async function getServerStats(event, payload) {
-  const { sessionId } = payload;
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-
-  const conn = session.conn;
-
-  // macOS stats command: uses sysctl, vm_stat, top, ps, df, netstat
-  // CPU reported as direct percentage (top computes delta internally)
-  // cpuPerCore not available on macOS without sudo
-  const macosStatsCommand = [
-    `cores=$(sysctl -n hw.logicalcpu 2>/dev/null || echo "1")`,
-    `pagesize=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")`,
-    `memsize=$(sysctl -n hw.memsize 2>/dev/null || echo "0")`,
-    // CPU usage: top -l 1 gives one logging sample, parse idle%
-    `cpuline=$(top -l 1 -s 0 -n 0 2>/dev/null | grep "CPU usage:" | head -1)`,
-    `cpupct=$(echo "$cpuline" | awk '{for(i=1;i<=NF;i++){if($(i+1)~/^idle/){v=$i;gsub(/%/,"",v);idle=v+0;found=1}};if(found)printf "%.0f",100-idle}')`,
-    // Memory: single vm_stat pipe → awk extracts all page counts (strip trailing dots with gsub)
-    // Outputs: "memfree memcached" in MB
-    `vmmem=$(vm_stat 2>/dev/null | awk -v ps="$pagesize" '/^Pages free:/{gsub(/[^0-9]/,"",$NF);free=$NF+0} /^Pages speculative:/{gsub(/[^0-9]/,"",$NF);spec=$NF+0} /^Pages inactive:/{gsub(/[^0-9]/,"",$NF);inact=$NF+0} /^Pages purgeable:/{gsub(/[^0-9]/,"",$NF);purg=$NF+0} END{mfree=int((free+spec)*ps/1024/1024);mcached=int((inact+purg)*ps/1024/1024);printf "%d %d",mfree,mcached}')`,
-    `memtotal=$(echo "$memsize" | awk '{printf "%d",$1/1024/1024}')`,
-    `memfree=$(echo "$vmmem" | awk '{print $1}')`,
-    `memcached=$(echo "$vmmem" | awk '{print $2}')`,
-    // Swap
-    `swapraw=$(sysctl vm.swapusage 2>/dev/null)`,
-    `swaptotal=$(echo "$swapraw" | awk '{for(i=1;i<=NF;i++){if($i=="total"&&$(i+1)=="="){v=$(i+2);m=1;if(v~/G/)m=1024;gsub(/[MmGg]/,"",v);st=v*m}};printf "%.0f",st+0}')`,
-    `swapused=$(echo "$swapraw" | awk '{for(i=1;i<=NF;i++){if($i=="used"&&$(i+1)=="="){v=$(i+2);m=1;if(v~/G/)m=1024;gsub(/[MmGg]/,"",v);su=v*m}};printf "%.0f",su+0}')`,
-    `swapfree=$(echo "$swaptotal $swapused" | awk '{printf "%.0f",$1-$2}')`,
-    // Top processes by memory%
-    `procs=$(ps -A -o pid=,%mem=,comm= 2>/dev/null | sort -k2 -rn | head -10 | awk '{gsub(/;/,"_",$3);printf "%s;%.1f;%s,",$1,$2,$3}' | sed 's/,$//')`,
-    // Disk: only show root "/" and external volumes "/Volumes/*", skip system APFS snapshots
-    `disks=$(df -k 2>/dev/null | awk 'NR>1&&index($1,"/dev/")==1&&NF>=9&&($NF=="/"||index($NF,"/Volumes/")==1){u=$3/1048576;t=$2/1048576;p=$5;gsub(/%/,"",p);printf "%s:%.0f:%.0f:%s,",$NF,u,t,p}' | sed 's/,$//')`,
-    // Network: Link# lines only, exclude loopback, detect column shift (no MAC addr → cols shift left)
-    `net=$(netstat -ib 2>/dev/null | awk '/^[a-z]/&&$3~/Link/&&$1!~/^lo/{if($4~/:/){rx=$7;tx=$10}else{rx=$6;tx=$9};if((rx+0)>0){gsub(/[*]/,"",$1);printf "%s:%s:%s,",$1,rx,tx}}' | sed 's/,$//')`,
-    `echo "CPU:$cpupct|CORES:$cores|MEMINFO:$memtotal $memfree 0 $memcached $swaptotal $swapfree|PROCS:$procs|DISKS:$disks|NET:$net"`,
-  ].join('; ');
-
-  // Command to get CPU (overall + per-core), Memory, Disk, and Network stats
-  // This command is designed to work across most Linux distributions
-  // Note: Using semicolons and avoiding comments for single-line execution
-  // CPU: Output raw values (total and idle) instead of percentage - we calculate delta on backend
-  const linuxStatsCommand = [
-    // Get number of CPU cores
-    `cores=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "1")`,
-    // Get raw CPU values from /proc/stat: "total idle" for overall CPU
-    // We output raw values and calculate delta-based percentage on the backend
-    `cpuraw=$(awk '/^cpu / {total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d %d", total, $5}' /proc/stat 2>/dev/null || echo "")`,
-    // Get raw per-core CPU values from /proc/stat: "total:idle,total:idle,..."
-    `percoreraw=$(awk '/^cpu[0-9]/ {total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d:%d,", total, $5}' /proc/stat 2>/dev/null | sed 's/,$//' || echo "")`,
-    // Get memory details from /proc/meminfo (total, free, buffers, cached, swapTotal, swapFree in KB)
-    `meminfo=$(awk '/^MemTotal:/{t=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} /^SReclaimable:/{s=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2} END{printf "%d %d %d %d %d %d", t/1024, f/1024, b/1024, (c+s)/1024, st/1024, sf/1024}' /proc/meminfo 2>/dev/null || echo "")`,
-    // Get top 10 processes by memory - with BusyBox fallback
-    // GNU ps: ps -eo pid,%mem,comm --sort=-%mem
-    // BusyBox fallback: ps -o pid,vsz,comm and sort manually (BusyBox ps doesn't have %mem, use vsz instead)
-    `procs=$(ps -eo pid,%mem,comm --sort=-%mem 2>/dev/null | awk 'NR>1 && NR<=11 {gsub(/;/, "_", $3); printf "%s;%.1f;%s,", $1, $2, $3}' | sed 's/,$//' || ps -o pid,vsz,comm 2>/dev/null | awk 'NR>1 {gsub(/;/, "_", $3); print $2, $1, $3}' | sort -rn | head -10 | awk -v total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo) '{if(total>0) pct=$1*100/total; else pct=0; printf "%s;%.1f;%s,", $2, pct, $3}' | sed 's/,$//' || echo "")`,
-    // Get all mounted disk info - with BusyBox fallback
-    // GNU df: df -BG (block size in GB)
-    // BusyBox fallback: df and calculate from 1K blocks, or df -h and parse units
-    `disks=$(df -BG 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); printf "%s:%s:%s:%s,", $6, $3, $2, $5}' | sed 's/,$//' || df 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {total=$2/1048576; used=$3/1048576; pct=$5; gsub(/%/,"",pct); printf "%s:%.0f:%.0f:%s,", $6, used, total, pct}' | sed 's/,$//' || echo "")`,
-    // Get network interface stats from /proc/net/dev (interface:rx_bytes:tx_bytes), excluding lo and virtual interfaces
-    `net=$(cat /proc/net/dev 2>/dev/null | awk 'NR>2 {gsub(/^[ \\t]+/, ""); split($0, a, ":"); iface=a[1]; if(iface != "lo" && iface !~ /^veth/ && iface !~ /^docker/ && iface !~ /^br-/) {split(a[2], b); printf "%s:%s:%s,", iface, b[1], b[9]}}' | sed 's/,$//' || echo "")`,
-    // Output all stats (using CPURAW and PERCORERAW instead of CPU and PERCORE)
-    `echo "CPURAW:$cpuraw|CORES:$cores|PERCORERAW:$percoreraw|MEMINFO:$meminfo|PROCS:$procs|DISKS:$disks|NET:$net"`
-  ].join('; ');
-
-  // Auto-detect OS via uname — only Linux and macOS are supported
-  const statsCommand = `ostype=$(uname -s 2>/dev/null || echo "Unknown"); if [ "$ostype" = "Darwin" ]; then ${macosStatsCommand}; elif [ "$ostype" = "Linux" ]; then ${linuxStatsCommand}; else echo "UNSUPPORTED_OS:$ostype"; fi`;
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      resolve({ success: false, error: 'Timeout getting server stats' });
-    }, 5000);
-
-    conn.exec(statsCommand, (err, stream) => {
-      if (err) {
-        clearTimeout(timeout);
-        resolve({ success: false, error: err.message });
-        return;
-      }
-
-      let stdout = '';
-      let stderr = '';
-
-      stream.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      stream.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      stream.on('close', () => {
-        clearTimeout(timeout);
-
-        // Parse the output
-        const output = stdout.trim();
-
-        // Unsupported OS — stop polling this session
-        if (output.startsWith('UNSUPPORTED_OS:')) {
-          resolve({ success: false, error: `Server stats not supported on this OS (${output.substring(15)})` });
-          return;
-        }
-
-        const parts = output.split('|');
-
-        let cpuDirect = null;    // macOS: direct CPU percentage from top
-        let cpuRawTotal = null;
-        let cpuRawIdle = null;
-        let cpuPerCoreRaw = [];  // Array of { total, idle }
-        let cpuCores = null;
-        let memTotal = null;
-        let memFree = null;
-        let memBuffers = null;
-        let memCached = null;
-        let memUsed = null;
-        let swapTotal = null;
-        let swapUsed = null;
-        let topProcesses = [];  // Array of { pid, memPercent, command }
-        let disks = [];  // Array of { mountPoint, used, total, percent }
-        let networkInterfaces = [];  // Array of { name, rxBytes, txBytes }
-
-        for (const part of parts) {
-          if (part.startsWith('CPU:')) {
-            // macOS: top reports CPU% directly (no delta needed)
-            const val = parseFloat(part.substring(4).trim());
-            if (!isNaN(val)) cpuDirect = Math.min(100, Math.max(0, Math.round(val)));
-          } else if (part.startsWith('CPURAW:')) {
-            const rawParts = part.substring(7).trim().split(/\s+/);
-            if (rawParts.length >= 2) {
-              cpuRawTotal = parseInt(rawParts[0], 10);
-              cpuRawIdle = parseInt(rawParts[1], 10);
-            }
-          } else if (part.startsWith('CORES:')) {
-            const coreStr = part.substring(6).trim();
-            const val = parseInt(coreStr, 10);
-            if (!isNaN(val) && val > 0) cpuCores = val;
-          } else if (part.startsWith('PERCORERAW:')) {
-            const coreStr = part.substring(11).trim();
-            if (coreStr && coreStr !== '') {
-              cpuPerCoreRaw = coreStr.split(',').map(v => {
-                const coreParts = v.trim().split(':');
-                if (coreParts.length >= 2) {
-                  const total = parseInt(coreParts[0], 10);
-                  const idle = parseInt(coreParts[1], 10);
-                  if (!isNaN(total) && !isNaN(idle)) {
-                    return { total, idle };
-                  }
-                }
-                return null;
-              }).filter(v => v !== null);
-            }
-          } else if (part.startsWith('MEMINFO:')) {
-            const memParts = part.substring(8).trim().split(/\s+/);
-            if (memParts.length >= 4) {
-              const total = parseInt(memParts[0], 10);
-              const free = parseInt(memParts[1], 10);
-              const buffers = parseInt(memParts[2], 10);
-              const cached = parseInt(memParts[3], 10);
-              if (!isNaN(total)) memTotal = total;
-              if (!isNaN(free)) memFree = free;
-              if (!isNaN(buffers)) memBuffers = buffers;
-              if (!isNaN(cached)) memCached = cached;
-              // Calculate used memory (excluding buffers/cache)
-              if (memTotal !== null && memFree !== null && memBuffers !== null && memCached !== null) {
-                memUsed = memTotal - memFree - memBuffers - memCached;
-                if (memUsed < 0) memUsed = 0;
-              }
-              // Parse swap info (fields 5 and 6)
-              if (memParts.length >= 6) {
-                const st = parseInt(memParts[4], 10);
-                const sf = parseInt(memParts[5], 10);
-                if (!isNaN(st)) swapTotal = st;
-                if (!isNaN(sf)) {
-                  swapUsed = (swapTotal !== null) ? swapTotal - sf : null;
-                  if (swapUsed !== null && swapUsed < 0) swapUsed = 0;
-                }
-              }
-            }
-          } else if (part.startsWith('PROCS:')) {
-            const procsStr = part.substring(6).trim();
-            if (procsStr && procsStr !== '') {
-              const procEntries = procsStr.split(',');
-              for (const entry of procEntries) {
-                const procParts = entry.split(';');  // Using ; as delimiter
-                if (procParts.length >= 3) {
-                  const pid = procParts[0];
-                  const memPercent = parseFloat(procParts[1]);
-                  const command = procParts.slice(2).join(';');  // Command might contain semicolons
-                  if (!isNaN(memPercent)) {
-                    topProcesses.push({ pid, memPercent, command });
-                  }
-                }
-              }
-            }
-          } else if (part.startsWith('DISKS:')) {
-            const disksStr = part.substring(6).trim();
-            if (disksStr && disksStr !== '') {
-              const diskEntries = disksStr.split(',');
-              for (const entry of diskEntries) {
-                const diskParts = entry.split(':');
-                if (diskParts.length >= 4) {
-                  const mountPoint = diskParts[0];
-                  const used = parseInt(diskParts[1], 10);
-                  const total = parseInt(diskParts[2], 10);
-                  const percent = parseInt(diskParts[3], 10);
-                  if (!isNaN(used) && !isNaN(total) && !isNaN(percent)) {
-                    disks.push({ mountPoint, used, total, percent });
-                  }
-                }
-              }
-            }
-          } else if (part.startsWith('NET:')) {
-            const netStr = part.substring(4).trim();
-            if (netStr && netStr !== '') {
-              const netEntries = netStr.split(',');
-              for (const entry of netEntries) {
-                const netParts = entry.split(':');
-                if (netParts.length >= 3) {
-                  const name = netParts[0];
-                  const rxBytes = parseInt(netParts[1], 10);
-                  const txBytes = parseInt(netParts[2], 10);
-                  if (!isNaN(rxBytes) && !isNaN(txBytes)) {
-                    networkInterfaces.push({ name, rxBytes, txBytes });
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        // Calculate network speed based on previous reading
-        const now = Date.now();
-        const prevNet = session.prevNetStats || { interfaces: [], timestamp: 0 };
-        const timeDelta = (now - prevNet.timestamp) / 1000; // seconds
-
-        let netRxSpeed = 0;  // bytes per second
-        let netTxSpeed = 0;  // bytes per second
-        const netInterfaces = [];
-
-        if (timeDelta > 0 && prevNet.interfaces.length > 0) {
-          for (const iface of networkInterfaces) {
-            const prevIface = prevNet.interfaces.find(p => p.name === iface.name);
-            if (prevIface) {
-              const rxDelta = iface.rxBytes - prevIface.rxBytes;
-              const txDelta = iface.txBytes - prevIface.txBytes;
-              // Only count positive deltas (handles counter reset)
-              const rxSpeed = rxDelta > 0 ? Math.round(rxDelta / timeDelta) : 0;
-              const txSpeed = txDelta > 0 ? Math.round(txDelta / timeDelta) : 0;
-              netRxSpeed += rxSpeed;
-              netTxSpeed += txSpeed;
-              netInterfaces.push({
-                name: iface.name,
-                rxBytes: iface.rxBytes,
-                txBytes: iface.txBytes,
-                rxSpeed,
-                txSpeed,
-              });
-            } else {
-              netInterfaces.push({
-                name: iface.name,
-                rxBytes: iface.rxBytes,
-                txBytes: iface.txBytes,
-                rxSpeed: 0,
-                txSpeed: 0,
-              });
-            }
-          }
-        } else {
-          // First reading - no speed data yet
-          for (const iface of networkInterfaces) {
-            netInterfaces.push({
-              name: iface.name,
-              rxBytes: iface.rxBytes,
-              txBytes: iface.txBytes,
-              rxSpeed: 0,
-              txSpeed: 0,
-            });
-          }
-        }
-
-        // Store current reading for next calculation
-        session.prevNetStats = {
-          interfaces: networkInterfaces,
-          timestamp: now,
-        };
-
-        // Calculate CPU usage based on delta from previous reading
-        const prevCpu = session.prevCpuStats || { total: 0, idle: 0, perCore: [], timestamp: 0 };
-        let cpu = null;
-        let cpuPerCore = [];
-
-        if (cpuRawTotal !== null && cpuRawIdle !== null && prevCpu.total > 0) {
-          const totalDelta = cpuRawTotal - prevCpu.total;
-          const idleDelta = cpuRawIdle - prevCpu.idle;
-          if (totalDelta > 0) {
-            // CPU% = 100 - (idleDelta / totalDelta * 100)
-            cpu = Math.round(100 - (idleDelta / totalDelta * 100));
-            // Clamp to valid range
-            if (cpu < 0) cpu = 0;
-            if (cpu > 100) cpu = 100;
-          }
-        }
-
-        // macOS: use direct percentage from top (no delta needed)
-        if (cpu === null && cpuDirect !== null) {
-          cpu = cpuDirect;
-        }
-
-        // Calculate per-core CPU usage from deltas
-        if (cpuPerCoreRaw.length > 0 && prevCpu.perCore.length > 0) {
-          cpuPerCore = cpuPerCoreRaw.map((core, index) => {
-            const prevCore = prevCpu.perCore[index];
-            if (prevCore) {
-              const totalDelta = core.total - prevCore.total;
-              const idleDelta = core.idle - prevCore.idle;
-              if (totalDelta > 0) {
-                let usage = Math.round(100 - (idleDelta / totalDelta * 100));
-                if (usage < 0) usage = 0;
-                if (usage > 100) usage = 100;
-                return usage;
-              }
-            }
-            return 0;
-          });
-        } else if (cpuPerCoreRaw.length > 0) {
-          // First reading - no delta data yet, return zeros
-          cpuPerCore = cpuPerCoreRaw.map(() => 0);
-        }
-
-        // Store current CPU reading for next calculation
-        session.prevCpuStats = {
-          total: cpuRawTotal || 0,
-          idle: cpuRawIdle || 0,
-          perCore: cpuPerCoreRaw,
-          timestamp: now,
-        };
-
-        // For backward compatibility, extract root disk info
-        const rootDisk = disks.find(d => d.mountPoint === '/');
-        const diskPercent = rootDisk ? rootDisk.percent : null;
-        const diskUsed = rootDisk ? rootDisk.used : null;
-        const diskTotal = rootDisk ? rootDisk.total : null;
-
-        // If no meaningful data was parsed, treat as failure to stop futile polling
-        if (cpu === null && memTotal === null && cpuCores === null) {
-          resolve({ success: false, error: 'Unable to parse server stats (unsupported OS or shell)' });
-          return;
-        }
-
-        resolve({
-          success: true,
-          stats: {
-            cpu,           // CPU usage percentage (0-100)
-            cpuCores,      // Number of CPU cores
-            cpuPerCore,    // Per-core CPU usage array
-            memTotal,      // Total memory in MB
-            memUsed,       // Used memory in MB (excluding buffers/cache)
-            memFree,       // Free memory in MB
-            memBuffers,    // Buffers in MB
-            memCached,     // Cached in MB
-            swapTotal,     // Swap total in MB
-            swapUsed,      // Swap used in MB
-            topProcesses,  // Top 10 processes by memory
-            diskPercent,   // Disk usage percentage for root partition (backward compat)
-            diskUsed,      // Disk used in GB for root partition (backward compat)
-            diskTotal,     // Total disk in GB for root partition (backward compat)
-            disks,         // Array of all mounted disks
-            netRxSpeed,    // Total network receive speed (bytes/sec)
-            netTxSpeed,    // Total network transmit speed (bytes/sec)
-            netInterfaces, // Per-interface network stats
-          },
-        });
-      });
-    });
-  });
-}
-
-/**
- * Set terminal encoding for an active SSH session
- */
-async function setSessionEncoding(_event, { sessionId, encoding }) {
-  const session = sessions?.get(sessionId);
-  if (!session || !session.stream) {
-    return { ok: false, encoding: encoding || "utf-8" };
-  }
-  const enc = String(encoding || "utf-8").toLowerCase();
-  if (!iconv.encodingExists(enc)) {
-    return { ok: false, encoding: enc };
-  }
-  sessionEncodings.set(sessionId, enc);
-  // Reset stateful decoders so new data uses the updated encoding
-  resetSessionDecoders(sessionId);
-  return { ok: true, encoding: enc };
-}
+const { createSessionOpsApi } = require("./sshBridge/sessionOps.cjs");
+const sessionOpsApi = createSessionOpsApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  fs, path, os, exec, randomUUID, iconv, Buffer, process, console, setTimeout, clearTimeout,
+  getSessionDecoder, resetSessionDecoders, sessionEncodings, resolveLangFromCharset, safeSend,
+  quoteShellArg, log, ensureMoshStatsConnection, ensureEtStatsConnection,
+  execOnEtSession: (...args) => require("./terminalBridge.cjs").execOnEtSession(...args),
+  getServerStats: undefined,
+});
+const {
+  getSessionRemoteInfo,
+  getSessionDistroInfo,
+  readRemoteHistory,
+  getSessionPwd,
+  probeReceiveConflicts,
+  removeRemoteFiles,
+  restoreRemoteModes,
+  listSessionDir,
+  getServerStats,
+  setSessionEncoding,
+} = sessionOpsApi;
 
 /**
  * Register IPC handlers for SSH operations
@@ -2493,10 +1037,13 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
   ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
   ipcMain.handle("netcatty:ssh:distroInfo", getSessionDistroInfo);
+  ipcMain.handle("netcatty:ssh:readRemoteHistory", readRemoteHistory);
   ipcMain.handle("netcatty:ssh:listdir", listSessionDir);
   ipcMain.handle("netcatty:ssh:stats", getServerStats);
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
   ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);
+  ipcMain.handle("netcatty:sshDebugLog:info", getSshDebugLogInfo);
+  ipcMain.handle("netcatty:sshDebugLog:openDir", openSshDebugLogDir);
   ipcMain.handle("netcatty:ssh:check-agent", async () => {
     return await checkWindowsSshAgent();
   });
@@ -2517,10 +1064,16 @@ function registerHandlers(ipcMain) {
     }
     return keys;
   });
+  ipcMain.on("netcatty:zmodem:overwrite-response", (_event, payload) => {
+    const resolve = zmodemOverwritePending.get(payload?.requestId);
+    if (resolve) { zmodemOverwritePending.delete(payload.requestId); resolve(payload); }
+  });
   // Register the shared keyboard-interactive response handler
   keyboardInteractiveHandler.registerHandler(ipcMain);
   // Register the passphrase response handler
   passphraseHandler.registerHandler(ipcMain);
+  // Register the SSH host key verification response handler
+  hostKeyVerifier.registerHandler(ipcMain);
 }
 
 module.exports = {
@@ -2528,4 +1081,15 @@ module.exports = {
   registerHandlers,
   connectThroughChain,
   buildAlgorithms,
+  _resetAlgorithmSupportCacheForTests,
+  _appendSshDiagnosticLog: appendSshDiagnosticLog,
+  _createSshDiagnosticLogger: createSshDiagnosticLogger,
+  _getSshDebugLogFilePath: getSshDebugLogFilePath,
+  _setSshDebugLoggingEnabled: setSshDebugLoggingEnabled,
+  _shouldLogSshDebugMessage: shouldLogSshDebugMessage,
+  // Exposed for the default-key dedupe characterization test (the connect path
+  // derives the preferred default key from findAllDefaultPrivateKeys()[0]).
+  _findDefaultPrivateKey: findDefaultPrivateKey,
+  _findAllDefaultPrivateKeys: findAllDefaultPrivateKeys,
+  ensureMoshStatsConnection,
 };

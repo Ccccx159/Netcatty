@@ -1,7 +1,20 @@
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import type { ProviderConfig } from '../types';
+import type { ProviderConfig, ProviderStyle } from '../types';
+import { resolveProviderStyle } from '../types';
+import {
+  applyOpenAIChatContinuationToBody,
+  extractProviderContinuationFromRawChunk,
+  mergeProviderContinuation,
+  rawOpenAIChatChunkHasToolCalls,
+  repairOpenAIChatToolResultPairsInBody,
+  type OpenAIChatAssistantFields,
+} from '../providerContinuation';
+
+export interface ProviderRequestContext {
+  getOpenAIChatAssistantFields?: () => Array<OpenAIChatAssistantFields | undefined>;
+}
 
 /**
  * Bridge API subset used for SDK fetch adapter.
@@ -53,6 +66,188 @@ function isStreamingRequest(init?: RequestInit): boolean {
   }
 }
 
+function mergeOpenAIChatAssistantFields(
+  current: OpenAIChatAssistantFields | undefined,
+  incoming: OpenAIChatAssistantFields | undefined,
+): OpenAIChatAssistantFields | undefined {
+  return mergeProviderContinuation(
+    { openAIChatAssistantFields: current },
+    { openAIChatAssistantFields: incoming },
+  )?.openAIChatAssistantFields;
+}
+
+function createOpenAIChatStreamFieldCapture(
+  requestContext?: ProviderRequestContext,
+): (data: string) => void {
+  const assistantFields = requestContext?.getOpenAIChatAssistantFields?.();
+  if (!assistantFields) return () => undefined;
+
+  let streamFieldIndex: number | undefined;
+  let pendingFields: OpenAIChatAssistantFields | undefined;
+
+  const ensureStreamFieldSlot = (): number => {
+    if (streamFieldIndex !== undefined) return streamFieldIndex;
+    streamFieldIndex = assistantFields.length;
+    assistantFields.push(undefined);
+    return streamFieldIndex;
+  };
+
+  const flushPendingFields = (fieldIndex: number) => {
+    if (!pendingFields) return;
+    assistantFields[fieldIndex] = mergeOpenAIChatAssistantFields(
+      assistantFields[fieldIndex],
+      pendingFields,
+    );
+    pendingFields = undefined;
+  };
+
+  return (data: string) => {
+    const continuation = extractProviderContinuationFromRawChunk(data);
+    const fields = continuation?.openAIChatAssistantFields;
+    if (fields) {
+      pendingFields = mergeOpenAIChatAssistantFields(pendingFields, fields);
+      if (streamFieldIndex !== undefined) {
+        flushPendingFields(streamFieldIndex);
+      }
+    }
+
+    if (rawOpenAIChatChunkHasToolCalls(data)) {
+      flushPendingFields(ensureStreamFieldSlot());
+    }
+  };
+}
+
+function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) => string {
+  const toolCallIdsByChoiceAndIndex = new Map<string, string>();
+  const pendingToolCallsByChoiceAndIndex = new Map<string, Record<string, unknown>>();
+  const requestIdToken = requestId.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  return (data: string): string => {
+    if (!data || data.trim() === '[DONE]') return data;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return data;
+    }
+
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as Record<string, unknown>).choices)) {
+      return data;
+    }
+
+    let changed = false;
+    const normalizedChoices = ((parsed as Record<string, unknown>).choices as unknown[]).map((choice, choicePosition) => {
+      if (!choice || typeof choice !== 'object') return choice;
+      const choiceRecord = choice as Record<string, unknown>;
+      const delta = choiceRecord.delta;
+      if (!delta || typeof delta !== 'object') return choice;
+
+      const deltaRecord = delta as Record<string, unknown>;
+      if (!Array.isArray(deltaRecord.tool_calls)) return choice;
+
+      const choiceIndex = typeof choiceRecord.index === 'number' ? choiceRecord.index : choicePosition;
+      let deltaChanged = false;
+      const normalizedToolCalls: unknown[] = [];
+      for (const [toolCallPosition, toolCall] of deltaRecord.tool_calls.entries()) {
+        if (!toolCall || typeof toolCall !== 'object') {
+          normalizedToolCalls.push(toolCall);
+          continue;
+        }
+        const toolCallRecord = toolCall as Record<string, unknown>;
+        const toolCallIndex = typeof toolCallRecord.index === 'number' ? toolCallRecord.index : toolCallPosition;
+        const key = `${choiceIndex}:${toolCallIndex}`;
+        const existingId = toolCallIdsByChoiceAndIndex.get(key);
+        const pendingToolCall = pendingToolCallsByChoiceAndIndex.get(key);
+        const candidateToolCall = pendingToolCall
+          ? mergeOpenAIChatToolCallDeltas(pendingToolCall, toolCallRecord)
+          : toolCallRecord;
+
+        if (existingId) {
+          normalizedToolCalls.push(toolCall);
+          continue;
+        }
+
+        if (!hasFunctionName(candidateToolCall)) {
+          pendingToolCallsByChoiceAndIndex.set(key, candidateToolCall);
+          changed = true;
+          deltaChanged = true;
+          continue;
+        }
+
+        const toolCallId = typeof candidateToolCall.id === 'string' && candidateToolCall.id
+          ? candidateToolCall.id
+          : `call_netcatty_${requestIdToken}_${choiceIndex}_${toolCallIndex}`;
+        toolCallIdsByChoiceAndIndex.set(key, toolCallId);
+        pendingToolCallsByChoiceAndIndex.delete(key);
+
+        if (candidateToolCall === toolCallRecord && toolCallId === toolCallRecord.id) {
+          normalizedToolCalls.push(toolCall);
+          continue;
+        }
+
+        changed = true;
+        deltaChanged = true;
+        normalizedToolCalls.push({ ...candidateToolCall, id: toolCallId });
+      }
+
+      if (!deltaChanged) return choice;
+      return {
+        ...choiceRecord,
+        delta: {
+          ...deltaRecord,
+          tool_calls: normalizedToolCalls,
+        },
+      };
+    });
+
+    if (!changed) return data;
+    return JSON.stringify({
+      ...(parsed as Record<string, unknown>),
+      choices: normalizedChoices,
+    });
+  };
+}
+
+function mergeOpenAIChatToolCallDeltas(
+  current: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const currentFn = current.function;
+  const incomingFn = incoming.function;
+  const currentFunction = currentFn && typeof currentFn === 'object'
+    ? currentFn as Record<string, unknown>
+    : undefined;
+  const incomingFunction = incomingFn && typeof incomingFn === 'object'
+    ? incomingFn as Record<string, unknown>
+    : undefined;
+  const mergedFunction = {
+    ...(currentFunction ?? {}),
+    ...(incomingFunction ?? {}),
+  };
+  const currentArgs = currentFunction?.arguments;
+  const incomingArgs = incomingFunction?.arguments;
+  if (typeof currentArgs === 'string' && typeof incomingArgs === 'string') {
+    mergedFunction.arguments = currentArgs + incomingArgs;
+  }
+
+  return {
+    ...current,
+    ...incoming,
+    function: mergedFunction,
+  };
+}
+
+function hasFunctionName(toolCall: Record<string, unknown>): boolean {
+  const fn = toolCall.function;
+  return Boolean(
+    fn &&
+    typeof fn === 'object' &&
+    typeof (fn as Record<string, unknown>).name === 'string' &&
+    (fn as Record<string, unknown>).name,
+  );
+}
+
 /**
  * Extract headers as a plain Record<string, string> from various header formats.
  */
@@ -100,7 +295,10 @@ function toSafeStatusText(message: string, fallback: string): string {
   return byteStringSafe.slice(0, 120) || fallback;
 }
 
-export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.fetch {
+export function createBridgeFetchForSDK(
+  providerId?: string,
+  requestContext?: ProviderRequestContext,
+): typeof globalThis.fetch {
   return async (
     input: string | URL | Request,
     init?: RequestInit,
@@ -132,10 +330,18 @@ export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.
     const headers = extractHeaders(resolvedInit?.headers);
     const body =
       resolvedInit?.body != null ? String(resolvedInit.body) : undefined;
+    const requestBody = body != null
+      ? repairOpenAIChatToolResultPairsInBody(applyOpenAIChatContinuationToBody(
+          body,
+          requestContext?.getOpenAIChatAssistantFields?.() ?? [],
+        ))
+      : undefined;
 
     // Streaming path
     if (isStreamingRequest(resolvedInit)) {
       const requestId = `sdk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const captureOpenAIChatFields = createOpenAIChatStreamFieldCapture(requestContext);
+      const normalizeOpenAIChatToolCalls = createOpenAIChatToolCallNormalizer(requestId);
 
       // Set up IPC event listeners BEFORE starting the stream to avoid
       // missing early events.
@@ -144,8 +350,10 @@ export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.
       let cleanedUp = false;
 
       const unsubData = bridge.onAiStreamData(requestId, (data: string) => {
+        const normalizedData = normalizeOpenAIChatToolCalls(data);
+        captureOpenAIChatFields(normalizedData);
         // Re-wrap as SSE so the SDK can parse it
-        streamController?.enqueue(encoder.encode(`data: ${data}\n\n`));
+        streamController?.enqueue(encoder.encode(`data: ${normalizedData}\n\n`));
       });
       const unsubEnd = bridge.onAiStreamEnd(requestId, () => {
         try { streamController?.close(); } catch { /* already closed */ }
@@ -186,7 +394,7 @@ export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.
         requestId,
         url,
         headers,
-        body || '',
+        requestBody || '',
         providerId,
       );
 
@@ -231,7 +439,7 @@ export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.
     }
 
     // Non-streaming path
-    const result = await bridge.aiFetch(url, method, headers, body, providerId);
+    const result = await bridge.aiFetch(url, method, headers, requestBody, providerId);
 
     return new Response(result.data, {
       status: result.status,
@@ -249,62 +457,72 @@ export function createBridgeFetchForSDK(providerId?: string): typeof globalThis.
  * process replaces the placeholder with the real decrypted key before
  * making the HTTP request.
  */
-export function createModelFromConfig(config: ProviderConfig) {
+/**
+ * Apply per-vendor URL and apiKey quirks on top of the style-based
+ * wire-protocol routing. Exported so it can be unit-tested without spinning
+ * up the Vercel AI SDK clients.
+ *
+ * The URL fallback fires regardless of style — the user picked this
+ * providerId for a reason, even if they overrode the wire format. The
+ * ollama `'ollama'` throwaway apiKey is style-specific: it's only meaningful
+ * to the OpenAI-compat client, since Anthropic/Google clients need a real
+ * key on their own URL.
+ */
+export function resolveProviderEndpoint(
+  config: ProviderConfig,
+  style: ProviderStyle,
+  safeApiKey: string | undefined,
+): { baseURL: string | undefined; apiKey: string | undefined } {
+  let baseURL = config.baseURL;
+  let apiKey = safeApiKey;
+  if (config.providerId === 'ollama') {
+    baseURL = baseURL || 'http://localhost:11434/v1';
+    if (style === 'openai') {
+      apiKey = 'ollama';
+    }
+  } else if (config.providerId === 'openrouter') {
+    baseURL = baseURL || 'https://openrouter.ai/api/v1';
+  }
+  return { baseURL, apiKey };
+}
+
+export function createModelFromConfig(
+  config: ProviderConfig,
+  requestContext?: ProviderRequestContext,
+) {
   // Use placeholder API key — the main process will inject the real key
   const safeApiKey = config.apiKey ? API_KEY_PLACEHOLDER : undefined;
-  const customFetch = createBridgeFetchForSDK(config.id);
+  const customFetch = createBridgeFetchForSDK(config.id, requestContext);
   const modelId = config.defaultModel || '';
+  const style = resolveProviderStyle(config);
+  const { baseURL, apiKey } = resolveProviderEndpoint(config, style, safeApiKey);
 
-  switch (config.providerId) {
+  switch (style) {
     case 'openai':
       // Use .chat() to force Chat Completions API (not Responses API)
       return createOpenAI({
-        apiKey: safeApiKey,
-        baseURL: config.baseURL,
+        apiKey,
+        baseURL,
         fetch: customFetch,
       }).chat(modelId);
 
     case 'anthropic':
       return createAnthropic({
-        apiKey: safeApiKey,
-        baseURL: config.baseURL,
+        apiKey,
+        baseURL,
         fetch: customFetch,
       })(modelId);
 
     case 'google':
       return createGoogleGenerativeAI({
-        apiKey: safeApiKey,
-        baseURL: config.baseURL,
+        apiKey,
+        baseURL,
         fetch: customFetch,
       })(modelId);
 
-    case 'ollama':
-      // Ollama uses OpenAI-compatible Chat Completions API
-      return createOpenAI({
-        apiKey: 'ollama',
-        baseURL: config.baseURL || 'http://localhost:11434/v1',
-        fetch: customFetch,
-      }).chat(modelId);
-
-    case 'openrouter':
-      // OpenRouter uses OpenAI-compatible Chat Completions API
-      return createOpenAI({
-        apiKey: safeApiKey,
-        baseURL: config.baseURL || 'https://openrouter.ai/api/v1',
-        fetch: customFetch,
-      }).chat(modelId);
-
-    case 'custom':
-      // Custom providers use OpenAI-compatible Chat Completions API
-      return createOpenAI({
-        apiKey: safeApiKey,
-        baseURL: config.baseURL,
-        fetch: customFetch,
-      }).chat(modelId);
-
     default: {
-      const _exhaustive: never = config.providerId;
-      throw new Error(`Unsupported provider: ${_exhaustive}`);
+      const _exhaustive: never = style;
+      throw new Error(`Unsupported provider style: ${_exhaustive}`);
     }
   }
 }

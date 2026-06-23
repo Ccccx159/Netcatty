@@ -2,16 +2,18 @@
  * Terminal Connection Dialog
  * Full connection overlay with host info, progress indicator, and auth/progress content
  */
-import { Loader2, Plug, TerminalSquare, X } from 'lucide-react';
+import { Fingerprint, Loader2, Plug, TerminalSquare, X } from 'lucide-react';
 import React from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { cn } from '../../lib/utils';
 import { Host, SSHKey } from '../../types';
-import { formatHostPort } from '../../domain/host';
+import { formatHostPort, resolveTelnetPort } from '../../domain/host';
 import { DistroAvatar } from '../DistroAvatar';
 import { Button } from '../ui/button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { TerminalAuthDialog, TerminalAuthDialogProps } from './TerminalAuthDialog';
 import { TerminalConnectionProgress, TerminalConnectionProgressProps } from './TerminalConnectionProgress';
+import { HostKeyInfo, TerminalHostKeyVerification } from './TerminalHostKeyVerification';
 
 export interface ChainProgress {
     currentHop: number;
@@ -22,6 +24,7 @@ export interface ChainProgress {
 export interface TerminalConnectionDialogProps {
     host: Host;
     status: 'connecting' | 'connected' | 'disconnected';
+    restoreState?: 'restored-disconnected';
     error: string | null;
     progressValue: number;
     chainProgress: ChainProgress | null;
@@ -32,6 +35,12 @@ export interface TerminalConnectionDialogProps {
     authProps: Omit<TerminalAuthDialogProps, 'keys'>;
     keys: SSHKey[];
     onDismissDisconnected?: () => void;
+    hostKeyVerification?: {
+        hostKeyInfo: HostKeyInfo;
+        onClose: () => void;
+        onContinue: () => void;
+        onAddAndContinue: () => void;
+    };
     // Progress props
     progressProps: Omit<TerminalConnectionProgressProps, 'status' | 'error' | 'showLogs'>;
 }
@@ -42,13 +51,21 @@ const getProtocolInfo = (host: Host): { i18nKey: string; showPort: boolean; port
     if (host.moshEnabled) {
         return { i18nKey: 'terminal.connection.protocol.mosh', showPort: true, port: host.port || 22 };
     }
+    // ET likewise uses protocol: "ssh" with etEnabled: true. Show the ET
+    // server port (default 2022) rather than the SSH port: ET connectivity
+    // hinges on the etserver port, so surfacing the SSH port (22) here is
+    // misleading when troubleshooting a connection that is actually stuck on
+    // the ET port.
+    if (host.etEnabled) {
+        return { i18nKey: 'terminal.connection.protocol.et', showPort: true, port: host.etPort || 2022 };
+    }
     const protocol = host.protocol || 'ssh';
     switch (protocol) {
         case 'local':
             return { i18nKey: 'terminal.connection.protocol.local', showPort: false, port: 0 };
         case 'telnet':
             // Telnet uses telnetPort, not port (which is SSH port)
-            return { i18nKey: 'terminal.connection.protocol.telnet', showPort: true, port: host.telnetPort ?? host.port ?? 23 };
+            return { i18nKey: 'terminal.connection.protocol.telnet', showPort: true, port: resolveTelnetPort(host) };
         case 'mosh':
             return { i18nKey: 'terminal.connection.protocol.mosh', showPort: true, port: host.port || 22 };
         case 'serial':
@@ -62,6 +79,7 @@ const getProtocolInfo = (host: Host): { i18nKey: string; showPort: boolean; port
 export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> = ({
     host,
     status,
+    restoreState,
     error,
     progressValue,
     chainProgress,
@@ -71,13 +89,59 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
     authProps,
     keys,
     onDismissDisconnected,
+    hostKeyVerification,
     progressProps,
 }) => {
     const { t } = useI18n();
     const hasError = Boolean(error);
+    const isRestoredDisconnected = status === 'disconnected' && restoreState === 'restored-disconnected';
     const isConnecting = status === 'connecting';
     const canDismissDisconnected = status === 'disconnected' && !needsAuth && !!onDismissDisconnected;
     const protocolInfo = getProtocolInfo(host);
+    const isVerifyingHostKey = Boolean(hostKeyVerification);
+    const isHostKeyChanged = hostKeyVerification?.hostKeyInfo.status === 'changed';
+    const shouldCompleteProgress = hasError || (!isConnecting && !needsAuth);
+    const targetFirstSegmentWidth = isVerifyingHostKey || shouldCompleteProgress
+        ? 100
+        : Math.min(100, progressValue * 2);
+    const targetSecondSegmentWidth = isVerifyingHostKey
+        ? 0
+        : shouldCompleteProgress
+            ? 100
+            : Math.max(0, Math.min(100, (progressValue - 50) * 2));
+    const [secondSegmentUnlocked, setSecondSegmentUnlocked] = React.useState(
+        () => shouldCompleteProgress || targetSecondSegmentWidth <= 0
+    );
+    const secondSegmentUnlockTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    React.useEffect(() => {
+        return () => {
+            if (secondSegmentUnlockTimerRef.current) {
+                clearTimeout(secondSegmentUnlockTimerRef.current);
+            }
+        };
+    }, []);
+
+    React.useEffect(() => {
+        if (needsAuth || isVerifyingHostKey || targetSecondSegmentWidth <= 0 || shouldCompleteProgress) {
+            if (secondSegmentUnlockTimerRef.current) {
+                clearTimeout(secondSegmentUnlockTimerRef.current);
+                secondSegmentUnlockTimerRef.current = null;
+            }
+            setSecondSegmentUnlocked(shouldCompleteProgress);
+            return;
+        }
+
+        if (secondSegmentUnlocked || secondSegmentUnlockTimerRef.current) return;
+
+        secondSegmentUnlockTimerRef.current = setTimeout(() => {
+            secondSegmentUnlockTimerRef.current = null;
+            setSecondSegmentUnlocked(true);
+        }, 320);
+    }, [isVerifyingHostKey, needsAuth, secondSegmentUnlocked, shouldCompleteProgress, targetSecondSegmentWidth]);
+
+    const firstSegmentWidth = targetFirstSegmentWidth;
+    const secondSegmentWidth = shouldCompleteProgress || secondSegmentUnlocked ? targetSecondSegmentWidth : 0;
 
     return (
         <div className={cn(
@@ -85,7 +149,7 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
             needsAuth ? "bg-black" : "bg-black/30"
         )}>
             <div
-                className="w-[480px] max-w-[88vw] rounded-xl shadow-xl p-4 space-y-3"
+                className="w-[540px] max-w-[88vw] rounded-xl shadow-xl p-4 space-y-3 transition-all duration-200"
                 style={{
                     backgroundColor: 'color-mix(in srgb, var(--terminal-ui-bg, var(--background)) 95%, transparent)',
                     border: '1px solid color-mix(in srgb, var(--terminal-ui-fg, var(--foreground)) 12%, var(--terminal-ui-bg, var(--background)) 88%)',
@@ -94,7 +158,7 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
             >
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                        <DistroAvatar host={host} fallback={host.label.slice(0, 2).toUpperCase()} className="h-8 w-8 rounded-md shrink-0" />
+                        <DistroAvatar host={host} fallback={host.label.slice(0, 2).toUpperCase()} size="md" className="shrink-0" />
                         <div className="min-w-0">
                             {chainProgress ? (
                                 <>
@@ -139,7 +203,7 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
                                 {showLogs ? t('terminal.connection.hideLogs') : t('terminal.connection.showLogs')}
                             </Button>
                         )}
-                        {status === 'connecting' && !needsAuth && (
+                        {status === 'connecting' && !needsAuth && !isVerifyingHostKey && (
                             <Button
                                 size="sm"
                                 variant="outline"
@@ -151,16 +215,20 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
                             </Button>
                         )}
                         {canDismissDisconnected && (
-                            <Button
-                                size="icon"
-                                variant="ghost"
-                                className="h-7 w-7"
-                                aria-label={t('terminal.connection.dismissDisconnectedDialog')}
-                                title={t('terminal.connection.dismissDisconnectedDialog')}
-                                onClick={onDismissDisconnected}
-                            >
-                                <X size={14} />
-                            </Button>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <Button
+                                        size="icon"
+                                        variant="ghost"
+                                        className="h-7 w-7"
+                                        aria-label={t('terminal.connection.dismissDisconnectedDialog')}
+                                        onClick={onDismissDisconnected}
+                                    >
+                                        <X size={14} />
+                                    </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>{t('terminal.connection.dismissDisconnectedDialog')}</TooltipContent>
+                            </Tooltip>
                         )}
                     </div>
                 </div>
@@ -169,11 +237,11 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
                     <div className="flex items-center gap-3">
                         <div className={cn(
                             "h-7 w-7 rounded-md flex items-center justify-center flex-shrink-0",
-                            needsAuth
+                            needsAuth || isVerifyingHostKey
                                 ? "bg-primary text-primary-foreground"
                                 : hasError
                                     ? "bg-destructive/20 text-destructive"
-                                : isConnecting
+                                    : isConnecting
                                         ? "bg-primary/15 text-primary"
                                         : "bg-muted text-muted-foreground"
                         )}>
@@ -185,9 +253,30 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
                                     "absolute inset-y-0 left-0 rounded-full transition-all duration-300",
                                     error ? "bg-destructive" : "bg-primary"
                                 )}
-                                style={{
-                                    width: needsAuth ? '0%' : status === 'connecting' ? `${progressValue}%` : error ? '100%' : '100%',
-                                }}
+                                style={{ width: needsAuth ? '0%' : `${firstSegmentWidth}%` }}
+                            />
+                        </div>
+                        <div className={cn(
+                            "h-7 w-7 rounded-md flex items-center justify-center flex-shrink-0 transition-all duration-200",
+                            isHostKeyChanged
+                                ? "bg-destructive/15 text-destructive ring-2 ring-destructive/25 animate-pulse"
+                                : isVerifyingHostKey
+                                    ? "bg-amber-500/15 text-amber-400 ring-2 ring-amber-400/25 animate-pulse"
+                                    : progressValue > 50 && !hasError
+                                        ? "bg-primary/15 text-primary"
+                                        : hasError
+                                            ? "bg-destructive/20 text-destructive"
+                                            : "bg-muted text-muted-foreground"
+                        )}>
+                            <Fingerprint size={13} />
+                        </div>
+                        <div className="flex-1 h-1.5 rounded-full bg-border/60 overflow-hidden relative">
+                            <div
+                                className={cn(
+                                    "absolute inset-y-0 left-0 rounded-full transition-all duration-300",
+                                    error ? "bg-destructive" : "bg-primary"
+                                )}
+                                style={{ width: needsAuth || isVerifyingHostKey ? '0%' : `${secondSegmentWidth}%` }}
                             />
                         </div>
                         <div className={cn(
@@ -205,13 +294,36 @@ export const TerminalConnectionDialog: React.FC<TerminalConnectionDialogProps> =
 
                 {needsAuth ? (
                     <TerminalAuthDialog {...authProps} keys={keys} />
-                ) : (
-                    <TerminalConnectionProgress
-                        status={status}
-                        error={error}
+                ) : hostKeyVerification ? (
+                    <TerminalHostKeyVerification
+                        hostKeyInfo={hostKeyVerification.hostKeyInfo}
                         showLogs={showLogs}
-                        {...progressProps}
+                        progressLogs={progressProps.progressLogs}
+                        onClose={hostKeyVerification.onClose}
+                        onContinue={hostKeyVerification.onContinue}
+                        onAddAndContinue={hostKeyVerification.onAddAndContinue}
                     />
+                ) : (
+                    <>
+                        {isRestoredDisconnected && (
+                            <div className="rounded-md border border-border/35 bg-background/35 p-3 text-xs leading-5">
+                                <div className="font-semibold">{t('terminal.restore.placeholder.title')}</div>
+                                <div
+                                    className="mt-1"
+                                    style={{ color: 'color-mix(in srgb, var(--terminal-ui-fg, var(--foreground)) 68%, transparent)' }}
+                                >
+                                    {t('terminal.restore.placeholder.desc')}
+                                </div>
+                            </div>
+                        )}
+                        <TerminalConnectionProgress
+                            status={status}
+                            error={error}
+                            showLogs={showLogs}
+                            reconnectLabel={isRestoredDisconnected ? t('terminal.restore.placeholder.reconnect') : undefined}
+                            {...progressProps}
+                        />
+                    </>
                 )}
             </div>
         </div>

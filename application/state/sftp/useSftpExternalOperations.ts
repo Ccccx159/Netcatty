@@ -1,67 +1,34 @@
-import React, { useCallback, useRef, useMemo } from "react";
-import { TransferTask, TransferStatus } from "../../../domain/models";
+import { useCallback, useRef, useMemo, useState } from "react";
+import { FileConflict, FileConflictAction, TransferStatus, SftpFilenameEncoding } from "../../../domain/models";
+import { getSftpConflictTypeKey } from "../../../domain/sftpConflict";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import { logger } from "../../../lib/logger";
-import { SftpPane } from "./types";
+import { notify } from "../../notification";
 import { joinPath } from "./utils";
+import { createUploadTaskCallbacks } from "./uploadTaskCallbacks";
 import {
   UploadController,
   uploadFromDataTransfer,
+  uploadFromFileList,
   uploadEntriesDirect,
   UploadBridge,
   UploadCallbacks,
   UploadResult,
-  UploadTaskInfo,
+  startUploadScanningTask,
 } from "../../../lib/uploadService";
 import type { DropEntry } from "../../../lib/sftpFileUtils";
 
 // Re-export UploadResult for external usage
 export type { UploadResult };
 
-interface UseSftpExternalOperationsParams {
-  getActivePane: (side: "left" | "right") => SftpPane | null;
-  refresh: (side: "left" | "right", options?: { tabId?: string }) => Promise<void>;
-  sftpSessionsRef: React.MutableRefObject<Map<string, string>>;
-  connectionCacheKeyMapRef: React.MutableRefObject<Map<string, string>>;
-  clearDirCacheEntry?: (connectionId: string, path: string) => void;
-  useCompressedUpload?: boolean;
-  addExternalUpload?: (task: TransferTask) => void;
-  updateExternalUpload?: (taskId: string, updates: Partial<TransferTask>) => void;
-  isTransferCancelled?: (taskId: string) => boolean;
-  dismissExternalUpload?: (taskId: string) => void;
-}
-
-interface SftpExternalOperationsResult {
-  readTextFile: (side: "left" | "right", filePath: string) => Promise<string>;
-  readBinaryFile: (side: "left" | "right", filePath: string) => Promise<ArrayBuffer>;
-  writeTextFile: (side: "left" | "right", filePath: string, content: string) => Promise<void>;
-  downloadToTempAndOpen: (
-    side: "left" | "right",
-    remotePath: string,
-    fileName: string,
-    appPath: string,
-    options?: { enableWatch?: boolean }
-  ) => Promise<{ localTempPath: string; watchId?: string }>;
-  activeFileWatchCountRef: React.MutableRefObject<number>;
-  uploadExternalFiles: (
-    side: "left" | "right",
-    dataTransfer: DataTransfer,
-    targetPath?: string
-  ) => Promise<UploadResult[]>;
-  uploadExternalEntries: (
-    side: "left" | "right",
-    entries: DropEntry[],
-    options?: { targetPath?: string }
-  ) => Promise<UploadResult[]>;
-  cancelExternalUpload: () => Promise<void>;
-  selectApplication: () => Promise<{ path: string; name: string } | null>;
-}
+import type { UseSftpExternalOperationsParams, SftpExternalOperationsResult } from "./useSftpExternalOperations.types";
 
 export const useSftpExternalOperations = (
   params: UseSftpExternalOperationsParams
 ): SftpExternalOperationsResult => {
   const {
     getActivePane,
+    getPaneByConnectionId,
     refresh,
     sftpSessionsRef,
     connectionCacheKeyMapRef,
@@ -79,6 +46,11 @@ export const useSftpExternalOperations = (
   // Track active file watches so the side panel can block host-switching.
   // Reset to 0 when the SFTP session disconnects (handled in SftpSidePanel).
   const activeFileWatchCountRef = useRef(0);
+  const [uploadConflicts, setUploadConflicts] = useState<FileConflict[]>([]);
+  const uploadConflictResolversRef = useRef(new Map<string, {
+    resolve: (action: FileConflictAction) => void;
+    setDefault: (action: FileConflictAction) => void;
+  }>());
 
   const readTextFile = useCallback(
     async (side: "left" | "right", filePath: string): Promise<string> => {
@@ -173,27 +145,59 @@ export const useSftpExternalOperations = (
     [getActivePane, sftpSessionsRef],
   );
 
-  const downloadToTempAndOpen = useCallback(
+  const writeTextFileByConnection = useCallback(
+    async (
+      connectionId: string,
+      expectedHostId: string,
+      filePath: string,
+      content: string,
+      filenameEncoding?: SftpFilenameEncoding,
+    ): Promise<void> => {
+      const pane = getPaneByConnectionId(connectionId);
+      if (!pane?.connection) {
+        throw new Error("SFTP connection is no longer available");
+      }
+      if (pane.connection.hostId !== expectedHostId) {
+        throw new Error("SFTP connection changed while editing — file not saved to prevent writing to wrong host");
+      }
+
+      if (pane.connection.isLocal) {
+        const bridge = netcattyBridge.get();
+        if (!bridge?.writeLocalFile) throw new Error("Local file writing not supported");
+        const data = new TextEncoder().encode(content);
+        await bridge.writeLocalFile(filePath, data.buffer);
+        return;
+      }
+
+      const sftpId = sftpSessionsRef.current.get(pane.connection.id);
+      if (!sftpId) throw new Error("SFTP session not found");
+
+      const bridge = netcattyBridge.get();
+      if (!bridge) throw new Error("Bridge not available");
+
+      await bridge.writeSftp(sftpId, filePath, content, filenameEncoding ?? pane.filenameEncoding);
+    },
+    [getPaneByConnectionId, sftpSessionsRef],
+  );
+
+  const downloadToTemp = useCallback(
     async (
       side: "left" | "right",
       remotePath: string,
       fileName: string,
-      appPath: string,
-      options?: { enableWatch?: boolean }
-    ): Promise<{ localTempPath: string; watchId?: string }> => {
+    ): Promise<{ localTempPath: string; sftpId: string; externalTransferId?: string }> => {
       const pane = getActivePane(side);
       if (!pane?.connection) {
         throw new Error("No connection available");
       }
 
       const bridge = netcattyBridge.get();
-      if (!bridge?.downloadSftpToTemp || !bridge?.openWithApplication) {
-        throw new Error("System app opening not supported");
+      if (!bridge?.downloadSftpToTemp) {
+        throw new Error("SFTP temp download not supported");
       }
 
       if (pane.connection.isLocal) {
-        await bridge.openWithApplication(remotePath, appPath);
-        return { localTempPath: remotePath };
+        throw new Error("Temp download is only available for remote files");
       }
 
       const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -282,12 +286,12 @@ export const useSftpExternalOperations = (
           if (localTempPath && bridge.deleteTempFile) {
             bridge.deleteTempFile(localTempPath).catch(() => {});
           }
-          return { localTempPath: "" };
+          return { localTempPath: "", sftpId, externalTransferId };
         }
 
         if (isLocalTempDownloadCancelled()) {
           await cleanupTempDownload(localTempPath);
-          return { localTempPath: "" };
+          return { localTempPath: "", sftpId, externalTransferId };
         }
 
         updateExternalUpload(externalTransferId, {
@@ -306,7 +310,7 @@ export const useSftpExternalOperations = (
 
       if (isLocalTempDownloadCancelled()) {
         await cleanupTempDownload(localTempPath);
-        return { localTempPath: "" };
+        return { localTempPath: "", sftpId, externalTransferId };
       }
 
       if (bridge.registerTempFile) {
@@ -317,11 +321,44 @@ export const useSftpExternalOperations = (
         }
       }
 
+      return { localTempPath, sftpId, externalTransferId };
+    },
+    [getActivePane, sftpSessionsRef, addExternalUpload, updateExternalUpload, isTransferCancelled],
+  );
+
+  const downloadToTempAndOpen = useCallback(
+    async (
+      side: "left" | "right",
+      remotePath: string,
+      fileName: string,
+      appPath: string,
+      options?: { enableWatch?: boolean }
+    ): Promise<{ localTempPath: string; watchId?: string }> => {
+      const pane = getActivePane(side);
+      if (!pane?.connection) {
+        throw new Error("No connection available");
+      }
+
+      const bridge = netcattyBridge.get();
+      if (!bridge?.openWithApplication) {
+        throw new Error("System app opening not supported");
+      }
+
+      if (pane.connection.isLocal) {
+        await bridge.openWithApplication(remotePath, appPath);
+        return { localTempPath: remotePath };
+      }
+
+      const { localTempPath, sftpId, externalTransferId } = await downloadToTemp(side, remotePath, fileName);
+      if (!localTempPath) {
+        return { localTempPath: "" };
+      }
+
       try {
         await bridge.openWithApplication(localTempPath, appPath);
       } catch (err) {
         if (externalTransferId) {
-          updateExternalUpload(externalTransferId, {
+          updateExternalUpload?.(externalTransferId, {
             status: "failed" as TransferStatus,
             endTime: Date.now(),
             error: err instanceof Error ? err.message : String(err),
@@ -349,7 +386,67 @@ export const useSftpExternalOperations = (
 
       return { localTempPath, watchId };
     },
-    [getActivePane, sftpSessionsRef, addExternalUpload, updateExternalUpload, isTransferCancelled],
+    [downloadToTemp, getActivePane, updateExternalUpload],
+  );
+
+  const openWithSystemDefault = useCallback(
+    async (
+      side: "left" | "right",
+      remotePath: string,
+      fileName: string,
+      options?: { enableWatch?: boolean }
+    ): Promise<void> => {
+      try {
+        const pane = getActivePane(side);
+        if (!pane?.connection) {
+          throw new Error("No connection available");
+        }
+
+        const bridge = netcattyBridge.get();
+        if (!bridge?.openWithSystemDefault) {
+          throw new Error("System default opening not supported");
+        }
+
+        const bridgeMethods = bridge;
+
+        const { localTempPath, sftpId, externalTransferId } = pane.connection.isLocal
+          ? { localTempPath: remotePath, sftpId: "", externalTransferId: undefined }
+          : await downloadToTemp(side, remotePath, fileName);
+
+        if (!localTempPath) return;
+
+        const result = await bridgeMethods.openWithSystemDefault(localTempPath);
+        if (!result.success) {
+          if (externalTransferId) {
+            updateExternalUpload?.(externalTransferId, {
+              status: "failed" as TransferStatus,
+              endTime: Date.now(),
+              error: result.error || "Failed to open file",
+              speed: 0,
+            });
+          }
+          throw new Error(result.error || "Failed to open file");
+        }
+
+        // Start file watch for remote SFTP auto-sync (mirrors downloadToTempAndOpen behavior)
+        if (options?.enableWatch && !pane.connection.isLocal && bridgeMethods.startFileWatch) {
+          try {
+            await bridgeMethods.startFileWatch(
+              localTempPath,
+              remotePath,
+              sftpId,
+              pane.filenameEncoding,
+            );
+            activeFileWatchCountRef.current += 1;
+          } catch (err) {
+            console.warn("[SFTP] Failed to start file watch for default app open:", err);
+          }
+        }
+      } catch (err) {
+        notify.error(err instanceof Error ? err.message : String(err), "SFTP");
+      }
+    },
+    [downloadToTemp, getActivePane, updateExternalUpload],
   );
 
   // Create upload callbacks that translate to TransferTask updates
@@ -358,99 +455,83 @@ export const useSftpExternalOperations = (
     targetPath: string,
     targetHostId?: string,
     targetConnectionKey?: string,
-  ): UploadCallbacks => {
-    return {
-      onScanningStart: (taskId: string) => {
-        if (addExternalUpload) {
-          const scanningTask: TransferTask = {
-            id: taskId,
-            fileName: "Scanning files...",
-            sourcePath: "local",
-            targetPath,
-            sourceConnectionId: "external",
-            targetConnectionId: connectionId,
-            targetHostId,
-            targetConnectionKey,
-            direction: "upload",
-            status: "pending" as TransferStatus,
-            totalBytes: 0,
-            transferredBytes: 0,
-            speed: 0,
-            startTime: Date.now(),
-            isDirectory: true,
-            progressMode: "bytes",
-          };
-          addExternalUpload(scanningTask);
-        }
-      },
-      onScanningEnd: (taskId: string) => {
-        if (dismissExternalUpload) {
-          dismissExternalUpload(taskId);
-        }
-      },
-      onTaskCreated: (task: UploadTaskInfo) => {
-        if (addExternalUpload) {
-          const transferTask: TransferTask = {
-            id: task.id,
-            fileName: task.displayName,
-            sourcePath: "local",
-            targetPath: joinPath(targetPath, task.fileName),
-            sourceConnectionId: "external",
-            targetConnectionId: connectionId,
-            targetHostId,
-            targetConnectionKey,
-            direction: "upload",
-            status: "transferring" as TransferStatus,
-            totalBytes: task.totalBytes,
-            transferredBytes: 0,
-            speed: 0,
-            startTime: Date.now(),
-            isDirectory: task.isDirectory,
-            progressMode: task.progressMode ?? "bytes",
-            parentTaskId: task.parentTaskId,
-          };
-          addExternalUpload(transferTask);
-        }
-      },
-      onTaskProgress: (taskId: string, progress) => {
-        if (updateExternalUpload) {
-          updateExternalUpload(taskId, {
-            transferredBytes: progress.transferred,
-            speed: progress.speed,
-          });
-        }
-      },
-      onTaskCompleted: (taskId: string, totalBytes: number) => {
-        if (updateExternalUpload) {
-          updateExternalUpload(taskId, {
-            status: "completed" as TransferStatus,
-            endTime: Date.now(),
-            transferredBytes: totalBytes,
-            speed: 0,
-          });
-        }
-      },
-      onTaskFailed: (taskId: string, error: string) => {
-        if (updateExternalUpload) {
-          updateExternalUpload(taskId, {
-            status: "failed" as TransferStatus,
-            endTime: Date.now(),
-            error,
-            speed: 0,
-          });
-        }
-      },
-      onTaskCancelled: (taskId: string) => {
-        if (updateExternalUpload) {
-          updateExternalUpload(taskId, {
-            status: "cancelled" as TransferStatus,
-            endTime: Date.now(),
-            speed: 0,
-          });
-        }
-      },
+  ): UploadCallbacks => createUploadTaskCallbacks({
+    connectionId,
+    targetPath,
+    targetHostId,
+    targetConnectionKey,
+    addExternalUpload,
+    updateExternalUpload,
+    dismissExternalUpload,
+  }), [addExternalUpload, updateExternalUpload, dismissExternalUpload]);
+
+  const resolveUploadConflict = useCallback((conflictId: string, action: FileConflictAction, applyToAll = false) => {
+    const conflict = uploadConflicts.find((item) => item.transferId === conflictId);
+    setUploadConflicts((prev) => prev.filter((item) => item.transferId !== conflictId));
+    const resolver = uploadConflictResolversRef.current.get(conflictId);
+    if (!resolver) return;
+    uploadConflictResolversRef.current.delete(conflictId);
+    if (conflict && applyToAll) {
+      resolver.setDefault(action);
+    }
+    resolver.resolve(action);
+  }, [uploadConflicts]);
+
+  const cancelPendingUploadConflicts = useCallback(() => {
+    const resolvers = Array.from(uploadConflictResolversRef.current.values());
+    if (resolvers.length === 0) return;
+
+    uploadConflictResolversRef.current.clear();
+    setUploadConflicts([]);
+    for (const resolver of resolvers) {
+      resolver.resolve("stop");
+    }
+  }, []);
+
+  const createUploadConflictResolver = useCallback(() => {
+    const conflictDefaults = new Map<string, FileConflictAction>();
+
+    return async (conflict: {
+      fileName: string;
+      targetPath: string;
+      isDirectory: boolean;
+      existingType?: 'file' | 'directory' | 'symlink';
+      existingSize: number;
+      newSize: number;
+      existingModified: number;
+      newModified: number;
+      applyToAllCount: number;
+    }): Promise<FileConflictAction> => {
+      const conflictType = getSftpConflictTypeKey(conflict.isDirectory, conflict.existingType);
+      const defaultAction = conflictDefaults.get(conflictType);
+      if (defaultAction) return defaultAction;
+
+      const conflictId = `upload-conflict-${crypto.randomUUID()}`;
+      const fileConflict: FileConflict = {
+        transferId: conflictId,
+        fileName: conflict.fileName,
+        sourcePath: "local",
+        targetPath: conflict.targetPath,
+        isDirectory: conflict.isDirectory,
+        existingType: conflict.existingType,
+        applyToAllCount: conflict.applyToAllCount,
+        existingSize: conflict.existingSize,
+        newSize: conflict.newSize,
+        existingModified: conflict.existingModified,
+        newModified: conflict.newModified,
+      };
+
+      setUploadConflicts((prev) => [...prev, fileConflict]);
+      return new Promise<FileConflictAction>((resolve) => {
+        uploadConflictResolversRef.current.set(conflictId, {
+          resolve,
+          setDefault: (action) => {
+            conflictDefaults.set(conflictType, action);
+          },
+        });
+      });
     };
-  }, [addExternalUpload, updateExternalUpload, dismissExternalUpload]);
+  }, []);
 
   // Create upload bridge that wraps netcattyBridge
   const createUploadBridge = useMemo((): UploadBridge => {
@@ -458,10 +539,23 @@ export const useSftpExternalOperations = (
     return {
       writeLocalFile: bridge?.writeLocalFile,
       mkdirLocal: bridge?.mkdirLocal,
+      statLocal: bridge?.statLocal,
+      deleteLocalFile: bridge?.deleteLocalFile,
       mkdirSftp: async (sftpId: string, path: string) => {
         const b = netcattyBridge.get();
         if (b?.mkdirSftp) {
           await b.mkdirSftp(sftpId, path);
+        }
+      },
+      statSftp: async (sftpId: string, path: string) => {
+        const b = netcattyBridge.get();
+        if (!b?.statSftp) return null;
+        return b.statSftp(sftpId, path);
+      },
+      deleteSftp: async (sftpId: string, path: string) => {
+        const b = netcattyBridge.get();
+        if (b?.deleteSftp) {
+          await b.deleteSftp(sftpId, path);
         }
       },
       writeSftpBinary: bridge?.writeSftpBinary,
@@ -552,6 +646,7 @@ export const useSftpExternalOperations = (
             joinPath,
             callbacks,
             useCompressedUpload,
+            resolveConflict: createUploadConflictResolver(),
           },
           controller
         );
@@ -580,6 +675,217 @@ export const useSftpExternalOperations = (
       sftpSessionsRef,
       createUploadCallbacks,
       createUploadBridge,
+      createUploadConflictResolver,
+      useCompressedUpload,
+    ],
+  );
+
+  // Upload from a FileList. This keeps the original File objects from the file
+  // picker so Electron can resolve local file paths for stream uploads.
+  const uploadExternalFileList = useCallback(
+    async (
+      side: "left" | "right",
+      fileList: FileList | File[],
+      targetPath?: string,
+    ): Promise<UploadResult[]> => {
+      const pane = getActivePane(side);
+      if (!pane?.connection) {
+        throw new Error("No active connection");
+      }
+
+      const bridge = netcattyBridge.get();
+      if (!bridge) {
+        throw new Error("Bridge not available");
+      }
+
+      const sftpId = pane.connection.isLocal
+        ? null
+        : sftpSessionsRef.current.get(pane.connection.id) || null;
+
+      if (!pane.connection.isLocal && !sftpId) {
+        throw new Error("SFTP session not found");
+      }
+
+      const uploadPaneId = pane.id;
+      const uploadTargetPath = targetPath || pane.connection.currentPath;
+      const controller = new UploadController();
+      uploadControllerRef.current = controller;
+
+      const callbacks = createUploadCallbacks(
+        pane.connection.id,
+        uploadTargetPath,
+        pane.connection.isLocal ? undefined : pane.connection.hostId,
+        pane.connection.isLocal ? undefined : connectionCacheKeyMapRef.current.get(pane.connection.id),
+      );
+
+      try {
+        const results = await uploadFromFileList(
+          fileList,
+          {
+            targetPath: uploadTargetPath,
+            sftpId,
+            isLocal: pane.connection.isLocal,
+            bridge: createUploadBridge,
+            joinPath,
+            callbacks,
+            useCompressedUpload,
+            resolveConflict: createUploadConflictResolver(),
+          },
+          controller,
+        );
+
+        if (clearDirCacheEntry && targetPath) {
+          clearDirCacheEntry(pane.connection.id, uploadTargetPath);
+        }
+        if (uploadTargetPath === pane.connection.currentPath) {
+          await refresh(side, { tabId: uploadPaneId });
+        }
+        return results;
+      } catch (error) {
+        logger.error("[SFTP] File picker upload failed:", error);
+        throw error;
+      } finally {
+        uploadControllerRef.current = null;
+      }
+    },
+    [
+      clearDirCacheEntry,
+      connectionCacheKeyMapRef,
+      getActivePane,
+      refresh,
+      sftpSessionsRef,
+      createUploadCallbacks,
+      createUploadBridge,
+      createUploadConflictResolver,
+      useCompressedUpload,
+    ],
+  );
+
+  const uploadExternalFolderPath = useCallback(
+    async (
+      side: "left" | "right",
+      folderPath: string,
+      targetPath?: string,
+    ): Promise<UploadResult[]> => {
+      const pane = getActivePane(side);
+      if (!pane?.connection) {
+        throw new Error("No active connection");
+      }
+
+      const bridge = netcattyBridge.get();
+      if (!bridge) {
+        throw new Error("Bridge not available");
+      }
+      if (!bridge.listLocalTree) {
+        throw new Error("Folder upload not supported");
+      }
+
+      const sftpId = pane.connection.isLocal
+        ? null
+        : sftpSessionsRef.current.get(pane.connection.id) || null;
+
+      if (!pane.connection.isLocal && !sftpId) {
+        throw new Error("SFTP session not found");
+      }
+
+      const uploadPaneId = pane.id;
+      const uploadTargetPath = targetPath || pane.connection.currentPath;
+      const controller = new UploadController();
+      uploadControllerRef.current = controller;
+
+      const callbacks = createUploadCallbacks(
+        pane.connection.id,
+        uploadTargetPath,
+        pane.connection.isLocal ? undefined : pane.connection.hostId,
+        pane.connection.isLocal ? undefined : connectionCacheKeyMapRef.current.get(pane.connection.id),
+      );
+
+      const scanningTask = startUploadScanningTask(callbacks);
+
+      try {
+        const localEntries = await bridge.listLocalTree(folderPath);
+        if (controller.isCancelled()) {
+          scanningTask.cancel();
+          return [{ fileName: "", success: false, cancelled: true }];
+        }
+        scanningTask.complete();
+
+        const entries: DropEntry[] = localEntries.map((entry) => {
+          if (entry.type === "directory") {
+            return {
+              file: null,
+              relativePath: entry.relativePath,
+              isDirectory: true,
+            };
+          }
+
+          const file = {
+            name: entry.relativePath.split("/").pop() || entry.relativePath,
+            size: entry.size,
+            lastModified: entry.lastModified,
+            type: "",
+            path: entry.localPath,
+            arrayBuffer: async () => {
+              const currentBridge = netcattyBridge.get();
+              if (!currentBridge?.readLocalFile) {
+                throw new Error("Local file reading not supported");
+              }
+              return currentBridge.readLocalFile(entry.localPath);
+            },
+          } as File & { path?: string };
+
+          return {
+            file,
+            relativePath: entry.relativePath,
+            isDirectory: false,
+          };
+        });
+
+        const results = await uploadEntriesDirect(
+          entries,
+          {
+            targetPath: uploadTargetPath,
+            sftpId,
+            isLocal: pane.connection.isLocal,
+            bridge: createUploadBridge,
+            joinPath,
+            callbacks,
+            useCompressedUpload,
+            resolveConflict: createUploadConflictResolver(),
+          },
+          controller,
+        );
+
+        if (clearDirCacheEntry) {
+          clearDirCacheEntry(pane.connection.id, uploadTargetPath);
+        }
+        if (uploadTargetPath === pane.connection.currentPath) {
+          await refresh(side, { tabId: uploadPaneId });
+        }
+        return results;
+      } catch (error) {
+        if (controller.isCancelled()) {
+          scanningTask.cancel();
+          return [{ fileName: "", success: false, cancelled: true }];
+        }
+        if (scanningTask.isOpen()) {
+          scanningTask.fail(error);
+        }
+        logger.error("[SFTP] Folder picker upload failed:", error);
+        throw error;
+      } finally {
+        uploadControllerRef.current = null;
+      }
+    },
+    [
+      clearDirCacheEntry,
+      connectionCacheKeyMapRef,
+      createUploadCallbacks,
+      createUploadBridge,
+      createUploadConflictResolver,
+      getActivePane,
+      refresh,
+      sftpSessionsRef,
       useCompressedUpload,
     ],
   );
@@ -636,6 +942,7 @@ export const useSftpExternalOperations = (
             joinPath,
             callbacks,
             useCompressedUpload,
+            resolveConflict: createUploadConflictResolver(),
           },
           controller,
         );
@@ -663,6 +970,7 @@ export const useSftpExternalOperations = (
       connectionCacheKeyMapRef,
       createUploadCallbacks,
       createUploadBridge,
+      createUploadConflictResolver,
       getActivePane,
       refresh,
       sftpSessionsRef,
@@ -672,11 +980,14 @@ export const useSftpExternalOperations = (
 
   const cancelExternalUpload = useCallback(async () => {
     const controller = uploadControllerRef.current;
+    let cancelPromise: Promise<void> | undefined;
     if (controller) {
       logger.info("[SFTP] Cancelling external upload");
-      await controller.cancel();
+      cancelPromise = controller.cancel();
     }
-  }, []);
+    cancelPendingUploadConflicts();
+    await cancelPromise;
+  }, [cancelPendingUploadConflicts]);
 
   const selectApplication = useCallback(
     async (): Promise<{ path: string; name: string } | null> => {
@@ -693,11 +1004,17 @@ export const useSftpExternalOperations = (
     readTextFile,
     readBinaryFile,
     writeTextFile,
+    writeTextFileByConnection,
     downloadToTempAndOpen,
+    openWithSystemDefault,
     uploadExternalFiles,
+    uploadExternalFileList,
+    uploadExternalFolderPath,
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
     activeFileWatchCountRef,
+    uploadConflicts,
+    resolveUploadConflict,
   };
 };

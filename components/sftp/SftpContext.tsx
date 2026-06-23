@@ -20,7 +20,10 @@ export interface SftpTransferSource {
 // Types for the context
 export interface SftpPaneCallbacks {
     onConnect: (host: Host | "local") => void;
-    onDisconnect: () => void;
+    /** Resolves true if disconnect completed, false if the user canceled the
+     * dirty-editor prompt. Callers that follow up with a replacement connect
+     * must gate on the result. */
+    onDisconnect: () => Promise<boolean>;
     onPrepareSelection: () => void;
     onNavigateTo: (path: string) => void;
     onNavigateUp: () => void;
@@ -47,11 +50,18 @@ export interface SftpPaneCallbacks {
     // File operations
     onEditFile?: (entry: SftpFileEntry, fullPath?: string) => void;
     onOpenFile?: (entry: SftpFileEntry, fullPath?: string) => void;
+    onOpenFileWithSystemDefault?: (entry: SftpFileEntry, fullPath?: string) => void;
     onOpenFileWith?: (entry: SftpFileEntry, fullPath?: string) => void;  // Always show opener dialog
     onDownloadFile?: (entry: SftpFileEntry, fullPath?: string) => void;  // Download to local filesystem
+    onDownloadFiles?: (entries: SftpFileEntry[]) => void;  // Batch download — picks one target directory for remote panes
     // External file upload (supports folders via DataTransfer)
     onUploadExternalFiles?: (dataTransfer: DataTransfer, targetPath?: string) => Promise<void>;
+    // External file upload from <input type="file" multiple> picker (FileList).
+    onUploadExternalFileList?: (fileList: FileList, targetPath?: string) => Promise<void>;
+    // External folder upload from native directory picker.
+    onUploadExternalFolder?: (targetPath?: string) => Promise<void>;
     onListDirectory: (path: string) => Promise<SftpFileEntry[]>;
+    onListDrives: () => Promise<string[]>;
 }
 
 export interface SftpDragCallbacks {
@@ -95,15 +105,11 @@ export const useActiveTabId = (side: "left" | "right"): string | null => {
     );
 };
 
-// Hook to check if a specific pane is active (for CSS control)
-export const useIsPaneActive = (side: "left" | "right", paneId: string): boolean => {
-    const activeTabId = useActiveTabId(side);
-    return activeTabId === paneId || (activeTabId === null && paneId !== null);
-};
-
 export interface SftpContextValue {
     // Hosts list for connection picker
     hosts: Host[];
+    // Raw hosts list for bookmark persistence and other host writes.
+    writableHosts: Host[];
     // Host updater for bookmark persistence
     updateHosts: (hosts: Host[]) => void;
 
@@ -155,6 +161,12 @@ export const useSftpHosts = () => {
     return context.hosts;
 };
 
+// Hook to get raw hosts for writeback
+export const useSftpWritableHosts = () => {
+    const context = useSftpContext();
+    return context.writableHosts;
+};
+
 // Hook to get host updater
 export const useSftpUpdateHosts = () => {
     const context = useSftpContext();
@@ -163,6 +175,7 @@ export const useSftpUpdateHosts = () => {
 
 interface SftpContextProviderProps {
     hosts: Host[];
+    writableHosts?: Host[];
     updateHosts: (hosts: Host[]) => void;
     draggedFiles: (SftpTransferSource & { side: "left" | "right" })[] | null;
     dragCallbacks: SftpDragCallbacks;
@@ -173,6 +186,7 @@ interface SftpContextProviderProps {
 
 export const SftpContextProvider: React.FC<SftpContextProviderProps> = ({
     hosts,
+    writableHosts,
     updateHosts,
     draggedFiles,
     dragCallbacks,
@@ -184,11 +198,12 @@ export const SftpContextProvider: React.FC<SftpContextProviderProps> = ({
     const value = useMemo<SftpContextValue>(
         () => ({
             hosts,
+            writableHosts: writableHosts ?? hosts,
             updateHosts,
             leftCallbacks,
             rightCallbacks,
         }),
-        [hosts, updateHosts, leftCallbacks, rightCallbacks],
+        [hosts, writableHosts, updateHosts, leftCallbacks, rightCallbacks],
     );
 
     // Memoize drag context separately so only drag consumers re-render on drag state changes

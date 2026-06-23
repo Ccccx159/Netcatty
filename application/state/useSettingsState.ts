@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
+
+import { runThemeTransition } from './themeTransition';
 import { SyncConfig, TerminalSettings, HotkeyScheme, CustomKeyBindings, DEFAULT_KEY_BINDINGS, KeyBinding, UILanguage, SessionLogFormat, normalizeTerminalSettings } from '../../domain/models';
 import {
   STORAGE_KEY_COLOR,
   STORAGE_KEY_SYNC,
   STORAGE_KEY_TERM_THEME,
   STORAGE_KEY_TERM_FOLLOW_APP_THEME,
+  STORAGE_KEY_TERM_THEME_DARK,
+  STORAGE_KEY_TERM_THEME_LIGHT,
   STORAGE_KEY_THEME,
   STORAGE_KEY_TERM_FONT_FAMILY,
   STORAGE_KEY_TERM_FONT_SIZE,
@@ -23,147 +27,105 @@ import {
   STORAGE_KEY_SFTP_SHOW_HIDDEN_FILES,
   STORAGE_KEY_SFTP_USE_COMPRESSED_UPLOAD,
   STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR,
+  STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD,
   STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY,
   STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE,
   STORAGE_KEY_EDITOR_WORD_WRAP,
   STORAGE_KEY_SESSION_LOGS_ENABLED,
+  STORAGE_KEY_RESTORE_PREVIOUS_SESSION,
+  STORAGE_KEY_RESTORE_TERMINAL_CWD,
   STORAGE_KEY_SESSION_LOGS_DIR,
   STORAGE_KEY_SESSION_LOGS_FORMAT,
+  STORAGE_KEY_SESSION_LOGS_TIMESTAMPS_ENABLED,
+  STORAGE_KEY_SSH_DEBUG_LOGS_ENABLED,
+  STORAGE_KEY_SSH_DEEP_LINK_ENABLED,
   STORAGE_KEY_TOGGLE_WINDOW_HOTKEY,
   STORAGE_KEY_CLOSE_TO_TRAY,
   STORAGE_KEY_GLOBAL_HOTKEY_ENABLED,
+  STORAGE_KEY_WINDOW_OPACITY,
   STORAGE_KEY_AUTO_UPDATE_ENABLED,
   STORAGE_KEY_WORKSPACE_FOCUS_STYLE,
-
+  STORAGE_KEY_SHOW_RECENT_HOSTS,
+  STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
+  STORAGE_KEY_SHOW_SFTP_TAB,
+  STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR,
+  STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS,
+  STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM,
 } from '../../infrastructure/config/storageKeys';
 import { DEFAULT_UI_LOCALE, resolveSupportedLocale } from '../../infrastructure/config/i18n';
-import { TERMINAL_THEMES } from '../../infrastructure/config/terminalThemes';
-import { getTerminalThemeForUiTheme } from '../../domain/terminalAppearance';
+import {
+  areCustomKeyBindingsEqual,
+  nextCustomKeyBindingsSyncVersion,
+  parseCustomKeyBindingsStorageRecord,
+  resetCustomKeyBinding,
+  serializeCustomKeyBindingsStorageRecord,
+  shouldApplyIncomingCustomKeyBindingsRecord,
+  updateCustomKeyBinding as updateCustomKeyBindingRecord,
+} from '../../domain/customKeyBindings';
+import { TERMINAL_THEME_AUTO } from '../../domain/terminalAppearance';
 import { customThemeStore, useCustomThemes } from '../state/customThemeStore';
 import { DEFAULT_FONT_SIZE } from '../../infrastructure/config/fonts';
-import { DARK_UI_THEMES, LIGHT_UI_THEMES, UiThemeTokens, getUiThemeById } from '../../infrastructure/config/uiThemes';
-import { UI_FONTS, DEFAULT_UI_FONT_ID } from '../../infrastructure/config/uiFonts';
+import { getUiThemeById } from '../../infrastructure/config/uiThemes';
+import { DEFAULT_UI_FONT_ID } from '../../infrastructure/config/uiFonts';
 import { uiFontStore, useUIFontsLoaded } from './uiFontStore';
 import { localStorageAdapter } from '../../infrastructure/persistence/localStorageAdapter';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
+import { resolveSftpTransferConcurrency } from './sftp/transferConcurrency';
+import {
+  DEFAULT_ACCENT_MODE,
+  DEFAULT_CUSTOM_ACCENT,
+  DEFAULT_DARK_UI_THEME,
+  DEFAULT_EDITOR_WORD_WRAP,
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_HOTKEY_SCHEME,
+  DEFAULT_LIGHT_UI_THEME,
+  DEFAULT_SESSION_LOGS_ENABLED,
+  DEFAULT_SESSION_LOGS_FORMAT,
+  DEFAULT_SESSION_LOGS_TIMESTAMPS_ENABLED,
+  DEFAULT_SFTP_AUTO_OPEN_SIDEBAR,
+  DEFAULT_SFTP_FOLLOW_TERMINAL_CWD,
+  DEFAULT_SFTP_AUTO_SYNC,
+  DEFAULT_SFTP_DEFAULT_VIEW_MODE,
+  DEFAULT_SFTP_DOUBLE_CLICK_BEHAVIOR,
+  DEFAULT_SFTP_SHOW_HIDDEN_FILES,
+  DEFAULT_SFTP_USE_COMPRESSED_UPLOAD,
+  DEFAULT_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
+  DEFAULT_SHOW_RECENT_HOSTS,
+  DEFAULT_SHOW_SFTP_TAB,
+  DEFAULT_SHOW_HOST_TREE_SIDEBAR,
+  DEFAULT_SHELL_ONLY_TAB_NUMBER_SHORTCUTS,
+  DEFAULT_DISABLE_TERMINAL_FONT_ZOOM,
+  DEFAULT_SSH_DEBUG_LOGS_ENABLED,
+  DEFAULT_SSH_DEEP_LINK_ENABLED,
+  DEFAULT_TERMINAL_THEME,
+  DEFAULT_THEME,
+  DEFAULT_WINDOW_OPACITY,
+  clampWindowOpacity,
+  applyThemeTokens,
+  areTerminalSettingsEqual,
+  createCustomKeyBindingsSyncOrigin,
+  getSystemPreference,
+  isValidHslToken,
+  isValidTheme,
+  isValidUiFontId,
+  isValidUiThemeId,
+  migrateIncomingTerminalFontId,
+  readStoredString,
+  serializeTerminalSettings,
+} from './settingsStateDefaults';
+import { resolveRestorePreviousSessionSetting, resolveRestoreTerminalCwdSetting } from './sessionRestoreSettings';
+import { sessionRestoreStorage } from './sessionRestoreStorage';
+import { useSettingsStorageSync } from './settingsStorageSync';
+import { useSettingsIpcSync } from './settingsIpcSync';
+import { resolveCurrentTerminalTheme } from './settingsTerminalTheme';
+import { useSystemSettingsEffects } from './systemSettingsEffects';
+import { applyCustomCssToDocument } from '../../lib/customCss';
 
-const DEFAULT_THEME: 'light' | 'dark' | 'system' = 'dark';
-
-/** Resolve the current OS color scheme preference. */
-const getSystemPreference = (): 'light' | 'dark' =>
-  typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches
-    ? 'dark'
-    : 'light';
-const DEFAULT_LIGHT_UI_THEME = 'snow';
-const DEFAULT_DARK_UI_THEME = 'midnight';
-const DEFAULT_ACCENT_MODE: 'theme' | 'custom' = 'theme';
-const DEFAULT_CUSTOM_ACCENT = '221.2 83.2% 53.3%';
-const DEFAULT_TERMINAL_THEME = 'netcatty-dark';
-const DEFAULT_FONT_FAMILY = 'menlo';
-// Auto-detect default hotkey scheme based on platform
-const DEFAULT_HOTKEY_SCHEME: HotkeyScheme =
-  typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/i.test(navigator.platform)
-    ? 'mac'
-    : 'pc';
-const DEFAULT_SFTP_DOUBLE_CLICK_BEHAVIOR: 'open' | 'transfer' = 'open';
-const DEFAULT_SFTP_AUTO_SYNC = false;
-const DEFAULT_SFTP_SHOW_HIDDEN_FILES = false;
-const DEFAULT_SFTP_USE_COMPRESSED_UPLOAD = true;
-const DEFAULT_SFTP_AUTO_OPEN_SIDEBAR = false;
-const DEFAULT_SFTP_DEFAULT_VIEW_MODE: 'list' | 'tree' = 'list';
-
-// Editor defaults
-const DEFAULT_EDITOR_WORD_WRAP = false;
-
-// Session Logs defaults
-const DEFAULT_SESSION_LOGS_ENABLED = false;
-const DEFAULT_SESSION_LOGS_FORMAT: SessionLogFormat = 'txt';
-
-const readStoredString = (key: string): string | null => {
-  const raw = localStorageAdapter.readString(key);
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  try {
-    const parsed = JSON.parse(trimmed);
-    return typeof parsed === 'string' ? parsed : trimmed;
-  } catch {
-    return trimmed;
-  }
-};
-
-const isValidTheme = (value: unknown): value is 'light' | 'dark' | 'system' => value === 'light' || value === 'dark' || value === 'system';
-
-const isValidHslToken = (value: string): boolean => {
-  // Expect: "<h> <s>% <l>%", e.g. "221.2 83.2% 53.3%"
-  return /^\s*\d+(\.\d+)?\s+\d+(\.\d+)?%\s+\d+(\.\d+)?%\s*$/.test(value);
-};
-
-const isValidUiThemeId = (theme: 'light' | 'dark', value: string): boolean => {
-  const list = theme === 'dark' ? DARK_UI_THEMES : LIGHT_UI_THEMES;
-  return list.some((preset) => preset.id === value);
-};
-
-const isValidUiFontId = (value: string): boolean => {
-  // Local fonts are always considered valid
-  if (value.startsWith('local-')) return true;
-  // Check bundled fonts first, then check dynamically loaded fonts
-  return UI_FONTS.some((font) => font.id === value) ||
-    uiFontStore.getAvailableFonts().some((font) => font.id === value);
-};
-
-const serializeTerminalSettings = (settings: TerminalSettings): string =>
-  JSON.stringify(settings);
-
-const areTerminalSettingsEqual = (a: TerminalSettings, b: TerminalSettings): boolean =>
-  serializeTerminalSettings(a) === serializeTerminalSettings(b);
-
-const applyThemeTokens = (
-  themeSource: 'light' | 'dark' | 'system',
-  resolvedTheme: 'light' | 'dark',
-  tokens: UiThemeTokens,
-  accentMode: 'theme' | 'custom',
-  accentOverride: string,
-) => {
-  const root = window.document.documentElement;
-  // If immersive override is active (style tag present), it owns the dark/light class — don't override
-  if (!document.getElementById('netcatty-immersive-override')) {
-    root.classList.remove('light', 'dark');
-    root.classList.add(resolvedTheme);
-  }
-  root.style.setProperty('--background', tokens.background);
-  root.style.setProperty('--foreground', tokens.foreground);
-  root.style.setProperty('--card', tokens.card);
-  root.style.setProperty('--card-foreground', tokens.cardForeground);
-  root.style.setProperty('--popover', tokens.popover);
-  root.style.setProperty('--popover-foreground', tokens.popoverForeground);
-  const accentToken = accentMode === 'custom' ? accentOverride : tokens.accent;
-  const accentLightness = parseFloat(accentToken.split(/\s+/)[2]?.replace('%', '') || '');
-  const computedAccentForeground = resolvedTheme === 'dark'
-    ? '220 40% 96%'
-    : (!Number.isNaN(accentLightness) && accentLightness < 55 ? '0 0% 98%' : '222 47% 12%');
-
-  root.style.setProperty('--primary', accentToken);
-  root.style.setProperty('--primary-foreground', accentMode === 'custom' ? computedAccentForeground : tokens.primaryForeground);
-  root.style.setProperty('--secondary', tokens.secondary);
-  root.style.setProperty('--secondary-foreground', tokens.secondaryForeground);
-  root.style.setProperty('--muted', tokens.muted);
-  root.style.setProperty('--muted-foreground', tokens.mutedForeground);
-  root.style.setProperty('--accent', accentToken);
-  root.style.setProperty('--accent-foreground', accentMode === 'custom' ? computedAccentForeground : tokens.accentForeground);
-  root.style.setProperty('--destructive', tokens.destructive);
-  root.style.setProperty('--destructive-foreground', tokens.destructiveForeground);
-  root.style.setProperty('--border', tokens.border);
-  root.style.setProperty('--input', tokens.input);
-  root.style.setProperty('--ring', accentToken);
-
-  // Sync with native window title bar (Electron)
-  netcattyBridge.get()?.setTheme?.(themeSource);
-  netcattyBridge.get()?.setBackgroundColor?.(tokens.background);
-};
-
-export const useSettingsState = () => {
+export const useSettingsState = (options: { enableSettingsSync?: boolean; enableSystemEffects?: boolean } = {}) => {
+  const enableSettingsSync = options.enableSettingsSync !== false;
+  const enableSystemEffects = options.enableSystemEffects !== false;
+  const initialCustomKeyBindingsRecord =
+    parseCustomKeyBindingsStorageRecord(localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS));
   const uiFontsLoaded = useUIFontsLoaded();
   const [theme, setTheme] = useState<'dark' | 'light' | 'system'>(() => {
     const stored = readStoredString(STORAGE_KEY_THEME);
@@ -208,7 +170,16 @@ export const useSettingsState = () => {
     const isUpgrade = !!localStorageAdapter.readString(STORAGE_KEY_TERM_THEME);
     return !isUpgrade;
   });
-  const [terminalFontFamilyId, setTerminalFontFamilyId] = useState<string>(() => localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_FAMILY) || DEFAULT_FONT_FAMILY);
+  const [terminalThemeDarkId, setTerminalThemeDarkId] = useState<string>(
+    () => localStorageAdapter.readString(STORAGE_KEY_TERM_THEME_DARK) || TERMINAL_THEME_AUTO,
+  );
+  const [terminalThemeLightId, setTerminalThemeLightId] = useState<string>(
+    () => localStorageAdapter.readString(STORAGE_KEY_TERM_THEME_LIGHT) || TERMINAL_THEME_AUTO,
+  );
+  const [terminalFontFamilyId, setTerminalFontFamilyId] = useState<string>(() => {
+    const stored = localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_FAMILY);
+    return migrateIncomingTerminalFontId(stored) ?? DEFAULT_FONT_FAMILY;
+  });
   const [terminalFontSize, setTerminalFontSize] = useState<number>(() => localStorageAdapter.readNumber(STORAGE_KEY_TERM_FONT_SIZE) || DEFAULT_FONT_SIZE);
   const [uiLanguage, setUiLanguage] = useState<UILanguage>(() => {
     const stored = readStoredString(STORAGE_KEY_UI_LANGUAGE);
@@ -226,8 +197,8 @@ export const useSettingsState = () => {
     }
     return DEFAULT_HOTKEY_SCHEME;
   });
-  const [customKeyBindings, setCustomKeyBindings] = useState<CustomKeyBindings>(() =>
-    localStorageAdapter.read<CustomKeyBindings>(STORAGE_KEY_CUSTOM_KEY_BINDINGS) || {}
+  const [customKeyBindings, setCustomKeyBindingsState] = useState<CustomKeyBindings>(() =>
+    initialCustomKeyBindingsRecord?.bindings || {}
   );
   const [isHotkeyRecording, setIsHotkeyRecordingState] = useState(false);
   const [customCSS, setCustomCSS] = useState<string>(() =>
@@ -256,13 +227,50 @@ export const useSettingsState = () => {
     const stored = readStoredString(STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR);
     return stored === 'true' ? true : DEFAULT_SFTP_AUTO_OPEN_SIDEBAR;
   });
+  const [sftpFollowTerminalCwd, setSftpFollowTerminalCwd] = useState<boolean>(() => {
+    const stored = readStoredString(STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD);
+    return stored === 'true' ? true : DEFAULT_SFTP_FOLLOW_TERMINAL_CWD;
+  });
   const [sftpDefaultViewMode, setSftpDefaultViewMode] = useState<'list' | 'tree'>(() => {
     const stored = readStoredString(STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE);
     return (stored === 'list' || stored === 'tree') ? stored : DEFAULT_SFTP_DEFAULT_VIEW_MODE;
   });
+  const [showRecentHosts, setShowRecentHostsState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_RECENT_HOSTS);
+    return stored ?? DEFAULT_SHOW_RECENT_HOSTS;
+  });
+  const [showOnlyUngroupedHostsInRoot, setShowOnlyUngroupedHostsInRootState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT);
+    return stored ?? DEFAULT_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT;
+  });
+  const [showSftpTab, setShowSftpTabState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_SFTP_TAB);
+    return stored ?? DEFAULT_SHOW_SFTP_TAB;
+  });
+  const [showHostTreeSidebar, setShowHostTreeSidebarState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR);
+    return stored ?? DEFAULT_SHOW_HOST_TREE_SIDEBAR;
+  });
+  const [shellOnlyTabNumberShortcuts, setShellOnlyTabNumberShortcutsState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS);
+    return stored ?? DEFAULT_SHELL_ONLY_TAB_NUMBER_SHORTCUTS;
+  });
+  const [disableTerminalFontZoom, setDisableTerminalFontZoomState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM);
+    return stored ?? DEFAULT_DISABLE_TERMINAL_FONT_ZOOM;
+  });
+  const [restorePreviousSession, setRestorePreviousSessionState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_RESTORE_PREVIOUS_SESSION);
+    return resolveRestorePreviousSessionSetting(stored);
+  });
+  const [restoreTerminalCwd, setRestoreTerminalCwdState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_RESTORE_TERMINAL_CWD);
+    return resolveRestoreTerminalCwdSetting(stored);
+  });
   const [sftpTransferConcurrency, setSftpTransferConcurrencyState] = useState<number>(() => {
-    const stored = localStorageAdapter.readNumber(STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY);
-    return stored != null && stored >= 1 && stored <= 16 ? stored : 4;
+    return resolveSftpTransferConcurrency(() =>
+      localStorageAdapter.readNumber(STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY),
+    );
   });
 
   // Editor Settings
@@ -283,6 +291,18 @@ export const useSettingsState = () => {
     const stored = readStoredString(STORAGE_KEY_SESSION_LOGS_FORMAT);
     if (stored === 'txt' || stored === 'raw' || stored === 'html') return stored;
     return DEFAULT_SESSION_LOGS_FORMAT;
+  });
+  const [sessionLogsTimestampsEnabled, setSessionLogsTimestampsEnabled] = useState<boolean>(() => {
+    const stored = readStoredString(STORAGE_KEY_SESSION_LOGS_TIMESTAMPS_ENABLED);
+    return stored === 'true' ? true : DEFAULT_SESSION_LOGS_TIMESTAMPS_ENABLED;
+  });
+  const [sshDebugLogsEnabled, setSshDebugLogsEnabled] = useState<boolean>(() => {
+    const stored = readStoredString(STORAGE_KEY_SSH_DEBUG_LOGS_ENABLED);
+    return stored === 'true' ? true : DEFAULT_SSH_DEBUG_LOGS_ENABLED;
+  });
+  const [sshDeepLinkEnabled, setSshDeepLinkEnabledState] = useState<boolean>(() => {
+    const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED);
+    return stored ?? DEFAULT_SSH_DEEP_LINK_ENABLED;
   });
 
   // Global Toggle Window Settings (Quake Mode)
@@ -310,9 +330,29 @@ export const useSettingsState = () => {
     if (stored === null) return true; // Default to enabled
     return stored === 'true';
   });
+  const [windowOpacity, setWindowOpacityState] = useState<number>(() => {
+    const stored = readStoredString(STORAGE_KEY_WINDOW_OPACITY);
+    if (stored === null) return DEFAULT_WINDOW_OPACITY;
+    return clampWindowOpacity(stored);
+  });
+  const setWindowOpacity = useCallback((nextValue: SetStateAction<number>) => {
+    setWindowOpacityState((prev) => {
+      const candidate = typeof nextValue === 'function'
+        ? (nextValue as (prevState: number) => number)(prev)
+        : nextValue;
+      return clampWindowOpacity(candidate);
+    });
+  }, []);
   const incomingTerminalSettingsSignatureRef = useRef<string | null>(null);
   const localTerminalSettingsVersionRef = useRef(0);
   const broadcastedLocalTerminalSettingsVersionRef = useRef(0);
+  const customKeyBindingsVersionRef = useRef(initialCustomKeyBindingsRecord?.version || 0);
+  const customKeyBindingsOriginRef = useRef(initialCustomKeyBindingsRecord?.origin || 'legacy');
+  const customKeyBindingsLocalOriginRef = useRef(createCustomKeyBindingsSyncOrigin());
+  const customKeyBindingsMutationSourceRef = useRef<'local' | 'incoming'>('local');
+  const sshDeepLinkMutationSourceRef = useRef<'local' | 'incoming'>('local');
+  const sshDeepLinkEnabledRef = useRef(sshDeepLinkEnabled);
+  const sshDeepLinkSetRequestIdRef = useRef(0);
 
   // Fix 1: Mount guard — skip redundant IPC broadcasts & localStorage writes on initial mount.
   // Set to true by the LAST useEffect declaration; all persist effects see false on first render.
@@ -334,7 +374,14 @@ export const useSettingsState = () => {
 
   const mergeIncomingTerminalSettings = useCallback((incoming: Partial<TerminalSettings>) => {
     setTerminalSettingsState((prev) => {
-      const next = normalizeTerminalSettings({ ...prev, ...incoming });
+      const merged: Partial<TerminalSettings> = { ...prev, ...incoming };
+      if (
+        !Object.prototype.hasOwnProperty.call(incoming, 'middleClickBehavior') &&
+        Object.prototype.hasOwnProperty.call(incoming, 'middleClickPaste')
+      ) {
+        delete merged.middleClickBehavior;
+      }
+      const next = normalizeTerminalSettings(merged);
       if (areTerminalSettingsEqual(prev, next)) {
         return prev;
       }
@@ -344,14 +391,69 @@ export const useSettingsState = () => {
     });
   }, []);
 
+  const setCustomKeyBindings = useCallback((nextValue: SetStateAction<CustomKeyBindings>) => {
+    setCustomKeyBindingsState((prev) => {
+      const candidate = typeof nextValue === 'function'
+        ? (nextValue as (prevState: CustomKeyBindings) => CustomKeyBindings)(prev)
+        : nextValue;
+      if (areCustomKeyBindingsEqual(prev, candidate)) {
+        return prev;
+      }
+      customKeyBindingsVersionRef.current = nextCustomKeyBindingsSyncVersion(
+        customKeyBindingsVersionRef.current,
+      );
+      customKeyBindingsOriginRef.current = customKeyBindingsLocalOriginRef.current;
+      customKeyBindingsMutationSourceRef.current = 'local';
+      return candidate;
+    });
+  }, []);
+
+  const applyIncomingCustomKeyBindings = useCallback((incoming: {
+    bindings: CustomKeyBindings;
+    version: number;
+    origin: string;
+  }) => {
+    setCustomKeyBindingsState((prev) => {
+      if (!shouldApplyIncomingCustomKeyBindingsRecord(
+        {
+          version: customKeyBindingsVersionRef.current,
+          origin: customKeyBindingsOriginRef.current,
+        },
+        {
+          version: incoming.version,
+          origin: incoming.origin,
+        },
+      )) {
+        return prev;
+      }
+      customKeyBindingsVersionRef.current = incoming.version;
+      customKeyBindingsOriginRef.current = incoming.origin;
+      customKeyBindingsMutationSourceRef.current = 'incoming';
+      if (areCustomKeyBindingsEqual(prev, incoming.bindings)) {
+        return prev;
+      }
+      return incoming.bindings;
+    });
+  }, []);
+
+  const applyIncomingSshDeepLinkEnabled = useCallback((enabled: boolean) => {
+    sshDeepLinkSetRequestIdRef.current += 1;
+    setSshDeepLinkEnabledState((prev) => {
+      if (prev === enabled) return prev;
+      sshDeepLinkMutationSourceRef.current = 'incoming';
+      return enabled;
+    });
+  }, []);
+
   // Helper to notify other windows about settings changes via IPC
   const notifySettingsChanged = useCallback((key: string, value: unknown) => {
+    if (!enableSettingsSync) return;
     try {
       netcattyBridge.get()?.notifySettingsChanged?.({ key, value });
     } catch {
       // ignore - bridge may not be available
     }
-  }, []);
+  }, [enableSettingsSync]);
 
 
   const setSftpTransferConcurrency = useCallback((value: number) => {
@@ -402,7 +504,9 @@ export const useSettingsState = () => {
 
     const effective = nextTheme === 'system' ? getSystemPreference() : nextTheme;
     const tokens = getUiThemeById(effective, effective === 'dark' ? nextDarkId : nextLightId).tokens;
-    applyThemeTokens(nextTheme, effective, tokens, nextAccentMode, nextAccent);
+    runThemeTransition(() => {
+      applyThemeTokens(nextTheme, effective, tokens, nextAccentMode, nextAccent);
+    });
   }, [theme, lightUiThemeId, darkUiThemeId, accentMode, customAccent]);
 
   const syncCustomCssFromStorage = useCallback(() => {
@@ -426,8 +530,13 @@ export const useSettingsState = () => {
     // Terminal
     const storedTermTheme = readStoredString(STORAGE_KEY_TERM_THEME);
     if (storedTermTheme) setTerminalThemeId(storedTermTheme);
+    const storedTermThemeDark = readStoredString(STORAGE_KEY_TERM_THEME_DARK);
+    if (storedTermThemeDark) setTerminalThemeDarkId(storedTermThemeDark);
+    const storedTermThemeLight = readStoredString(STORAGE_KEY_TERM_THEME_LIGHT);
+    if (storedTermThemeLight) setTerminalThemeLightId(storedTermThemeLight);
     const storedTermFont = readStoredString(STORAGE_KEY_TERM_FONT_FAMILY);
-    if (storedTermFont) setTerminalFontFamilyId(storedTermFont);
+    const migratedTermFont = migrateIncomingTerminalFontId(storedTermFont);
+    if (migratedTermFont) setTerminalFontFamilyId(migratedTermFont);
     const storedTermSize = localStorageAdapter.readNumber(STORAGE_KEY_TERM_FONT_SIZE);
     if (storedTermSize != null) setTerminalFontSize(storedTermSize);
     const storedTermSettings = readStoredString(STORAGE_KEY_TERM_SETTINGS);
@@ -439,16 +548,24 @@ export const useSettingsState = () => {
     }
 
     // Keyboard
-    const storedKb = readStoredString(STORAGE_KEY_CUSTOM_KEY_BINDINGS);
+    const storedKb = parseCustomKeyBindingsStorageRecord(
+      localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS),
+    );
     if (storedKb) {
-      try {
-        setCustomKeyBindings(JSON.parse(storedKb));
-      } catch { /* ignore */ }
+      applyIncomingCustomKeyBindings(storedKb);
     }
 
     // Editor
     const storedWrap = readStoredString(STORAGE_KEY_EDITOR_WORD_WRAP);
     if (storedWrap === 'true' || storedWrap === 'false') setEditorWordWrapState(storedWrap === 'true');
+
+    // SSH diagnostics
+    const storedSshDebugLogsEnabled = readStoredString(STORAGE_KEY_SSH_DEBUG_LOGS_ENABLED);
+    if (storedSshDebugLogsEnabled === 'true' || storedSshDebugLogsEnabled === 'false') {
+      setSshDebugLogsEnabled(storedSshDebugLogsEnabled === 'true');
+    }
+    const storedSshDeepLinkEnabled = localStorageAdapter.readBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED);
+    applyIncomingSshDeepLinkEnabled(storedSshDeepLinkEnabled ?? DEFAULT_SSH_DEEP_LINK_ENABLED);
 
     // SFTP
     const storedDblClick = readStoredString(STORAGE_KEY_SFTP_DOUBLE_CLICK_BEHAVIOR);
@@ -461,8 +578,28 @@ export const useSettingsState = () => {
     if (storedCompress === 'true' || storedCompress === 'false') setSftpUseCompressedUpload(storedCompress === 'true');
     const storedAutoOpenSidebar = readStoredString(STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR);
     if (storedAutoOpenSidebar === 'true' || storedAutoOpenSidebar === 'false') setSftpAutoOpenSidebar(storedAutoOpenSidebar === 'true');
+    const storedFollowTerminalCwd = readStoredString(STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD);
+    if (storedFollowTerminalCwd === 'true' || storedFollowTerminalCwd === 'false') {
+      setSftpFollowTerminalCwd(storedFollowTerminalCwd === 'true');
+    }
     const storedDefaultViewMode = readStoredString(STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE);
     if (storedDefaultViewMode === 'list' || storedDefaultViewMode === 'tree') setSftpDefaultViewMode(storedDefaultViewMode);
+    const storedShowRecentHosts = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_RECENT_HOSTS);
+    setShowRecentHostsState(storedShowRecentHosts ?? DEFAULT_SHOW_RECENT_HOSTS);
+    const storedShowOnlyUngroupedHostsInRoot = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT);
+    setShowOnlyUngroupedHostsInRootState(storedShowOnlyUngroupedHostsInRoot ?? DEFAULT_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT);
+    const storedShowSftpTab = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_SFTP_TAB);
+    setShowSftpTabState(storedShowSftpTab ?? DEFAULT_SHOW_SFTP_TAB);
+    const storedShowHostTreeSidebar = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR);
+    setShowHostTreeSidebarState(storedShowHostTreeSidebar ?? DEFAULT_SHOW_HOST_TREE_SIDEBAR);
+    const storedShellOnlyTabNumberShortcuts = localStorageAdapter.readBoolean(STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS);
+    setShellOnlyTabNumberShortcutsState(storedShellOnlyTabNumberShortcuts ?? DEFAULT_SHELL_ONLY_TAB_NUMBER_SHORTCUTS);
+    const storedDisableTerminalFontZoom = localStorageAdapter.readBoolean(STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM);
+    setDisableTerminalFontZoomState(storedDisableTerminalFontZoom ?? DEFAULT_DISABLE_TERMINAL_FONT_ZOOM);
+    const storedRestorePreviousSession = localStorageAdapter.readBoolean(STORAGE_KEY_RESTORE_PREVIOUS_SESSION);
+    setRestorePreviousSessionState(resolveRestorePreviousSessionSetting(storedRestorePreviousSession));
+    const storedRestoreTerminalCwd = localStorageAdapter.readBoolean(STORAGE_KEY_RESTORE_TERMINAL_CWD);
+    setRestoreTerminalCwdState(resolveRestoreTerminalCwdSetting(storedRestoreTerminalCwd));
 
     // Workspace focus style
     const storedFocusStyle = readStoredString(STORAGE_KEY_WORKSPACE_FOCUS_STYLE);
@@ -470,11 +607,16 @@ export const useSettingsState = () => {
 
     // Custom terminal themes
     customThemeStore.loadFromStorage();
-  }, [syncAppearanceFromStorage, syncCustomCssFromStorage, setTerminalSettings]);
+  }, [applyIncomingCustomKeyBindings, applyIncomingSshDeepLinkEnabled, syncAppearanceFromStorage, syncCustomCssFromStorage, setTerminalSettings]);
 
   useLayoutEffect(() => {
     const tokens = getUiThemeById(resolvedTheme, resolvedTheme === 'dark' ? darkUiThemeId : lightUiThemeId).tokens;
-    applyThemeTokens(theme, resolvedTheme, tokens, accentMode, customAccent);
+    const apply = () => applyThemeTokens(theme, resolvedTheme, tokens, accentMode, customAccent);
+    if (persistMountedRef.current) {
+      runThemeTransition(apply);
+    } else {
+      apply();
+    }
     localStorageAdapter.writeString(STORAGE_KEY_THEME, theme);
     localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_LIGHT, lightUiThemeId);
     localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_DARK, darkUiThemeId);
@@ -520,123 +662,45 @@ export const useSettingsState = () => {
     }
   }, [uiFontFamilyId, uiFontsLoaded, notifySettingsChanged]);
 
-  // Listen for settings changes from other windows via IPC
-  useEffect(() => {
-    const bridge = netcattyBridge.get();
-    if (!bridge?.onSettingsChanged) return;
-    const unsubscribe = bridge.onSettingsChanged((payload) => {
-      const { key, value } = payload;
-      if (
-        key === STORAGE_KEY_THEME ||
-        key === STORAGE_KEY_UI_THEME_LIGHT ||
-        key === STORAGE_KEY_UI_THEME_DARK ||
-        key === STORAGE_KEY_ACCENT_MODE ||
-        key === STORAGE_KEY_COLOR
-      ) {
-        syncAppearanceFromStorage();
-        return;
-      }
-      if (key === STORAGE_KEY_UI_LANGUAGE && typeof value === 'string') {
-        const next = resolveSupportedLocale(value);
-        setUiLanguage((prev) => (prev === next ? prev : next));
-        document.documentElement.lang = next;
-      }
-      if (key === STORAGE_KEY_CUSTOM_CSS && typeof value === 'string') {
-        syncCustomCssFromStorage();
-      }
-      if (key === STORAGE_KEY_UI_FONT_FAMILY && typeof value === 'string') {
-        if (isValidUiFontId(value)) {
-          setUiFontFamilyId(value);
-        }
-      }
-      if (key === STORAGE_KEY_TERM_THEME && typeof value === 'string') {
-        setTerminalThemeId(value);
-      }
-      if (key === STORAGE_KEY_TERM_FOLLOW_APP_THEME) {
-        const next = value === true || value === 'true';
-        setFollowAppTerminalThemeState((prev) => (prev === next ? prev : next));
-      }
-      if (key === STORAGE_KEY_TERM_FONT_FAMILY && typeof value === 'string') {
-        setTerminalFontFamilyId(value);
-      }
-      if (key === STORAGE_KEY_TERM_FONT_SIZE && typeof value === 'number') {
-        setTerminalFontSize(value);
-      }
-      if (key === STORAGE_KEY_TERM_SETTINGS) {
-        if (typeof value === 'string') {
-          try {
-            const parsed = JSON.parse(value) as Partial<TerminalSettings>;
-            mergeIncomingTerminalSettings(parsed);
-          } catch {
-            // ignore parse errors
-          }
-        } else if (value && typeof value === 'object') {
-          mergeIncomingTerminalSettings(value as Partial<TerminalSettings>);
-        }
-      }
-      if (key === STORAGE_KEY_EDITOR_WORD_WRAP && typeof value === 'boolean') {
-        setEditorWordWrapState((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_SESSION_LOGS_ENABLED && typeof value === 'boolean') {
-        setSessionLogsEnabled((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_SESSION_LOGS_DIR && typeof value === 'string') {
-        setSessionLogsDir((prev) => (prev === value ? prev : value));
-      }
-      if (
-        key === STORAGE_KEY_SESSION_LOGS_FORMAT &&
-        (value === 'txt' || value === 'raw' || value === 'html')
-      ) {
-        setSessionLogsFormat((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_HOTKEY_SCHEME && (value === 'disabled' || value === 'mac' || value === 'pc')) {
-        setHotkeyScheme(value);
-      }
-      if (key === STORAGE_KEY_CUSTOM_KEY_BINDINGS) {
-        if (typeof value === 'string') {
-          try {
-            setCustomKeyBindings(JSON.parse(value) as CustomKeyBindings);
-          } catch {
-            // ignore parse errors
-          }
-        } else if (value && typeof value === 'object') {
-          setCustomKeyBindings(value as CustomKeyBindings);
-        }
-      }
-      if (key === STORAGE_KEY_HOTKEY_RECORDING && typeof value === 'boolean') {
-        setIsHotkeyRecordingState(value);
-      }
-      if (key === STORAGE_KEY_GLOBAL_HOTKEY_ENABLED && typeof value === 'boolean') {
-        setGlobalHotkeyEnabled((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_AUTO_UPDATE_ENABLED && typeof value === 'boolean') {
-        setAutoUpdateEnabled((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR && typeof value === 'boolean') {
-        setSftpAutoOpenSidebar((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE && typeof value === 'string') {
-        if (value === 'list' || value === 'tree') {
-          setSftpDefaultViewMode((prev) => (prev === value ? prev : value));
-        }
-      }
-      if (key === STORAGE_KEY_WORKSPACE_FOCUS_STYLE && (value === 'dim' || value === 'border')) {
-        setWorkspaceFocusStyleState((prev) => (prev === value ? prev : value));
-      }
-      if (key === STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY && typeof value === 'number') {
-        setSftpTransferConcurrencyState((prev) => (prev === value ? prev : value));
-      }
-    });
-    return () => {
-      try {
-        unsubscribe?.();
-      } catch {
-        // ignore
-      }
-    };
-  }, [mergeIncomingTerminalSettings, syncAppearanceFromStorage, syncCustomCssFromStorage]);
+  useSettingsIpcSync({
+    enabled: enableSettingsSync,
+    syncAppearanceFromStorage,
+    syncCustomCssFromStorage,
+    setUiLanguage,
+    setUiFontFamilyId,
+    setTerminalThemeId,
+    setTerminalThemeDarkId,
+    setTerminalThemeLightId,
+    setFollowAppTerminalThemeState,
+    setTerminalFontFamilyId,
+    setTerminalFontSize,
+    mergeIncomingTerminalSettings,
+    setEditorWordWrapState,
+    setSessionLogsEnabled,
+    setSessionLogsDir,
+    setSessionLogsFormat,
+    setSessionLogsTimestampsEnabled,
+    setSshDebugLogsEnabled,
+    setSshDeepLinkEnabledState: applyIncomingSshDeepLinkEnabled,
+    setHotkeyScheme,
+    applyIncomingCustomKeyBindings,
+    setIsHotkeyRecordingState,
+    setGlobalHotkeyEnabled,
+    setWindowOpacity,
+    setAutoUpdateEnabled,
+    setSftpAutoOpenSidebar,
+    setSftpFollowTerminalCwd,
+    setSftpDefaultViewMode,
+    setWorkspaceFocusStyleState,
+    setShowHostTreeSidebarState,
+    setDisableTerminalFontZoomState,
+    setRestorePreviousSessionState,
+    setRestoreTerminalCwdState,
+    setSftpTransferConcurrencyState,
+  });
 
   useEffect(() => {
+    if (!enableSettingsSync) return;
     const bridge = netcattyBridge.get();
     if (!bridge?.onLanguageChanged) return;
     const unsubscribe = bridge.onLanguageChanged((language) => {
@@ -651,221 +715,29 @@ export const useSettingsState = () => {
         // ignore
       }
     };
-  }, []);
+  }, [enableSettingsSync]);
 
-  // Fix 4: Keep a ref snapshot of current settings so the storage event handler
-  // can compare without capturing 25+ state variables in its closure / dep array.
-  // This avoids constant listener detach/reattach on every state change.
-  const settingsSnapshotRef = useRef({
+  useSettingsStorageSync({
+    enabled: enableSettingsSync,
     theme, lightUiThemeId, darkUiThemeId, accentMode, customAccent,
     customCSS, uiFontFamilyId, hotkeyScheme, uiLanguage,
     terminalThemeId, followAppTerminalTheme, terminalFontFamilyId, terminalFontSize,
     sftpDoubleClickBehavior, sftpAutoSync, sftpShowHiddenFiles,
-    sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpDefaultViewMode,
-    editorWordWrap, sessionLogsEnabled, sessionLogsDir, sessionLogsFormat,
-    globalHotkeyEnabled, autoUpdateEnabled,
+    sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpFollowTerminalCwd, sftpDefaultViewMode,
+    showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab, showHostTreeSidebar, shellOnlyTabNumberShortcuts, disableTerminalFontZoom, restorePreviousSession, restoreTerminalCwd,
+    editorWordWrap, sessionLogsEnabled, sessionLogsDir, sessionLogsFormat, sessionLogsTimestampsEnabled, sshDebugLogsEnabled, sshDeepLinkEnabled,
+    globalHotkeyEnabled, autoUpdateEnabled, windowOpacity,
+    setTheme, setLightUiThemeId, setDarkUiThemeId, setAccentMode, setCustomAccent,
+    setCustomCSS, setUiFontFamilyId, setHotkeyScheme, setUiLanguage,
+    setTerminalThemeId, setTerminalThemeDarkId, setTerminalThemeLightId,
+    setFollowAppTerminalThemeState, setTerminalFontFamilyId, setTerminalFontSize,
+    setSftpDoubleClickBehavior, setSftpAutoSync, setSftpShowHiddenFiles,
+    setSftpUseCompressedUpload, setSftpAutoOpenSidebar, setSftpFollowTerminalCwd, setSftpDefaultViewMode,
+    setShowRecentHostsState, setShowOnlyUngroupedHostsInRootState, setShowSftpTabState, setShowHostTreeSidebarState, setShellOnlyTabNumberShortcutsState, setDisableTerminalFontZoomState, setRestorePreviousSessionState, setRestoreTerminalCwdState,
+    setEditorWordWrapState, setSessionLogsEnabled, setSessionLogsDir, setSessionLogsFormat, setSessionLogsTimestampsEnabled, setSshDebugLogsEnabled, setSshDeepLinkEnabledState: applyIncomingSshDeepLinkEnabled,
+    setGlobalHotkeyEnabled, setWindowOpacity, setAutoUpdateEnabled, setWorkspaceFocusStyleState,
+    setSftpTransferConcurrencyState, applyIncomingCustomKeyBindings, mergeIncomingTerminalSettings,
   });
-  settingsSnapshotRef.current = {
-    theme, lightUiThemeId, darkUiThemeId, accentMode, customAccent,
-    customCSS, uiFontFamilyId, hotkeyScheme, uiLanguage,
-    terminalThemeId, followAppTerminalTheme, terminalFontFamilyId, terminalFontSize,
-    sftpDoubleClickBehavior, sftpAutoSync, sftpShowHiddenFiles,
-    sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpDefaultViewMode,
-    editorWordWrap, sessionLogsEnabled, sessionLogsDir, sessionLogsFormat,
-    globalHotkeyEnabled, autoUpdateEnabled,
-  };
-
-  // Listen for storage changes from other windows (cross-window sync)
-  useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      const s = settingsSnapshotRef.current;
-      if (e.key === STORAGE_KEY_THEME && e.newValue) {
-        if (isValidTheme(e.newValue) && e.newValue !== s.theme) {
-          setTheme(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_UI_THEME_LIGHT && e.newValue) {
-        if (isValidUiThemeId('light', e.newValue) && e.newValue !== s.lightUiThemeId) {
-          setLightUiThemeId(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_UI_THEME_DARK && e.newValue) {
-        if (isValidUiThemeId('dark', e.newValue) && e.newValue !== s.darkUiThemeId) {
-          setDarkUiThemeId(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_ACCENT_MODE && e.newValue) {
-        if ((e.newValue === 'theme' || e.newValue === 'custom') && e.newValue !== s.accentMode) {
-          setAccentMode(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_COLOR && e.newValue) {
-        if (isValidHslToken(e.newValue) && e.newValue !== s.customAccent) {
-          setCustomAccent(e.newValue.trim());
-        }
-      }
-      if (e.key === STORAGE_KEY_CUSTOM_CSS && e.newValue !== null) {
-        if (e.newValue !== s.customCSS) {
-          setCustomCSS(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_UI_FONT_FAMILY && e.newValue) {
-        if (isValidUiFontId(e.newValue) && e.newValue !== s.uiFontFamilyId) {
-          setUiFontFamilyId(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_HOTKEY_SCHEME && e.newValue) {
-        const newScheme = e.newValue as HotkeyScheme;
-        if (newScheme !== s.hotkeyScheme) {
-          setHotkeyScheme(newScheme);
-        }
-      }
-      if (e.key === STORAGE_KEY_UI_LANGUAGE && e.newValue) {
-        const next = resolveSupportedLocale(e.newValue);
-        if (next !== s.uiLanguage) {
-          setUiLanguage(next as UILanguage);
-        }
-      }
-      if (e.key === STORAGE_KEY_CUSTOM_KEY_BINDINGS && e.newValue) {
-        try {
-          const newBindings = JSON.parse(e.newValue) as CustomKeyBindings;
-          setCustomKeyBindings(newBindings);
-        } catch {
-          // ignore parse errors
-        }
-      }
-      // Sync terminal settings from other windows
-      if (e.key === STORAGE_KEY_TERM_SETTINGS && e.newValue) {
-        try {
-          const newSettings = JSON.parse(e.newValue) as TerminalSettings;
-          mergeIncomingTerminalSettings(newSettings);
-        } catch {
-          // ignore parse errors
-        }
-      }
-      // Sync terminal theme from other windows
-      if (e.key === STORAGE_KEY_TERM_THEME && e.newValue) {
-        if (e.newValue !== s.terminalThemeId) {
-          setTerminalThemeId(e.newValue);
-        }
-      }
-      // Sync follow-app-theme toggle from other windows
-      if (e.key === STORAGE_KEY_TERM_FOLLOW_APP_THEME && e.newValue) {
-        const next = e.newValue === 'true';
-        if (next !== s.followAppTerminalTheme) {
-          setFollowAppTerminalThemeState(next);
-        }
-      }
-      // Sync terminal font family from other windows
-      if (e.key === STORAGE_KEY_TERM_FONT_FAMILY && e.newValue) {
-        if (e.newValue !== s.terminalFontFamilyId) {
-          setTerminalFontFamilyId(e.newValue);
-        }
-      }
-      // Sync terminal font size from other windows
-      if (e.key === STORAGE_KEY_TERM_FONT_SIZE && e.newValue) {
-        const newSize = parseInt(e.newValue, 10);
-        if (!isNaN(newSize) && newSize !== s.terminalFontSize) {
-          setTerminalFontSize(newSize);
-        }
-      }
-      // Sync SFTP double-click behavior from other windows
-      if (e.key === STORAGE_KEY_SFTP_DOUBLE_CLICK_BEHAVIOR && e.newValue) {
-        if ((e.newValue === 'open' || e.newValue === 'transfer') && e.newValue !== s.sftpDoubleClickBehavior) {
-          setSftpDoubleClickBehavior(e.newValue);
-        }
-      }
-      // Sync SFTP auto-sync setting from other windows
-      if (e.key === STORAGE_KEY_SFTP_AUTO_SYNC && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.sftpAutoSync) {
-          setSftpAutoSync(newValue);
-        }
-      }
-      // Sync SFTP show hidden files setting from other windows
-      if (e.key === STORAGE_KEY_SFTP_SHOW_HIDDEN_FILES && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.sftpShowHiddenFiles) {
-          setSftpShowHiddenFiles(newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_EDITOR_WORD_WRAP && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.editorWordWrap) {
-          setEditorWordWrapState(newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_SESSION_LOGS_ENABLED && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.sessionLogsEnabled) {
-          setSessionLogsEnabled(newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_SESSION_LOGS_DIR && e.newValue !== null) {
-        if (e.newValue !== s.sessionLogsDir) {
-          setSessionLogsDir(e.newValue);
-        }
-      }
-      if (e.key === STORAGE_KEY_SESSION_LOGS_FORMAT && e.newValue) {
-        if (
-          (e.newValue === 'txt' || e.newValue === 'raw' || e.newValue === 'html') &&
-          e.newValue !== s.sessionLogsFormat
-        ) {
-          setSessionLogsFormat(e.newValue);
-        }
-      }
-      // Sync SFTP compressed upload setting from other windows
-      if (e.key === STORAGE_KEY_SFTP_USE_COMPRESSED_UPLOAD && e.newValue !== null) {
-        const newValue = e.newValue === 'true' || e.newValue === 'enabled';
-        if (newValue !== s.sftpUseCompressedUpload) {
-          setSftpUseCompressedUpload(newValue);
-        }
-      }
-      // Sync SFTP auto-open sidebar setting from other windows
-      if (e.key === STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.sftpAutoOpenSidebar) {
-          setSftpAutoOpenSidebar(newValue);
-        }
-      }
-      // Sync SFTP default view mode from other windows
-      if (e.key === STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE && e.newValue) {
-        if ((e.newValue === 'list' || e.newValue === 'tree') && e.newValue !== s.sftpDefaultViewMode) {
-          setSftpDefaultViewMode(e.newValue);
-        }
-      }
-      // Sync global hotkey enabled setting from other windows
-      if (e.key === STORAGE_KEY_GLOBAL_HOTKEY_ENABLED && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.globalHotkeyEnabled) {
-          setGlobalHotkeyEnabled(newValue);
-        }
-      }
-      // Sync auto-update enabled setting from other windows
-      if (e.key === STORAGE_KEY_AUTO_UPDATE_ENABLED && e.newValue !== null) {
-        const newValue = e.newValue === 'true';
-        if (newValue !== s.autoUpdateEnabled) {
-          setAutoUpdateEnabled(newValue);
-        }
-      }
-      // Sync workspace focus style from other windows
-      if (e.key === STORAGE_KEY_WORKSPACE_FOCUS_STYLE && e.newValue !== null) {
-        if (e.newValue === 'dim' || e.newValue === 'border') {
-          setWorkspaceFocusStyleState(e.newValue);
-        }
-      }
-      // Sync transfer concurrency from other windows
-      if (e.key === STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY && e.newValue !== null) {
-        const num = Number(e.newValue);
-        if (num >= 1 && num <= 16) {
-          setSftpTransferConcurrencyState(num);
-        }
-      }
-    };
-
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
-  }, [mergeIncomingTerminalSettings]); // Fix 4: stable deps only — state comparisons use settingsSnapshotRef
 
   useEffect(() => {
     localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME, terminalThemeId);
@@ -878,6 +750,18 @@ export const useSettingsState = () => {
     if (!persistMountedRef.current) return;
     notifySettingsChanged(STORAGE_KEY_TERM_FOLLOW_APP_THEME, String(followAppTerminalTheme));
   }, [followAppTerminalTheme, notifySettingsChanged]);
+
+  useEffect(() => {
+    localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME_DARK, terminalThemeDarkId);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_TERM_THEME_DARK, terminalThemeDarkId);
+  }, [terminalThemeDarkId, notifySettingsChanged]);
+
+  useEffect(() => {
+    localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME_LIGHT, terminalThemeLightId);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_TERM_THEME_LIGHT, terminalThemeLightId);
+  }, [terminalThemeLightId, notifySettingsChanged]);
 
   useEffect(() => {
     localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, terminalFontFamilyId);
@@ -913,9 +797,21 @@ export const useSettingsState = () => {
   }, [hotkeyScheme, notifySettingsChanged]);
 
   useEffect(() => {
-    localStorageAdapter.write(STORAGE_KEY_CUSTOM_KEY_BINDINGS, customKeyBindings);
+    const payload = serializeCustomKeyBindingsStorageRecord({
+      version: customKeyBindingsVersionRef.current,
+      origin: customKeyBindingsOriginRef.current,
+      bindings: customKeyBindings,
+    });
+    if (localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS) !== payload) {
+      localStorageAdapter.writeString(STORAGE_KEY_CUSTOM_KEY_BINDINGS, payload);
+    }
     if (!persistMountedRef.current) return;
-    notifySettingsChanged(STORAGE_KEY_CUSTOM_KEY_BINDINGS, customKeyBindings);
+    if (customKeyBindingsMutationSourceRef.current === 'incoming') return;
+    notifySettingsChanged(STORAGE_KEY_CUSTOM_KEY_BINDINGS, {
+      version: customKeyBindingsVersionRef.current,
+      origin: customKeyBindingsOriginRef.current,
+      bindings: customKeyBindings,
+    });
   }, [customKeyBindings, notifySettingsChanged]);
 
   const setIsHotkeyRecording = useCallback((isRecording: boolean) => {
@@ -923,16 +819,68 @@ export const useSettingsState = () => {
     notifySettingsChanged(STORAGE_KEY_HOTKEY_RECORDING, isRecording);
   }, [notifySettingsChanged]);
 
+  const setShowRecentHosts = useCallback((enabled: boolean) => {
+    setShowRecentHostsState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_RECENT_HOSTS, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHOW_RECENT_HOSTS, enabled);
+  }, [notifySettingsChanged]);
+
+  const setShowOnlyUngroupedHostsInRoot = useCallback((enabled: boolean) => {
+    setShowOnlyUngroupedHostsInRootState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT, enabled);
+  }, [notifySettingsChanged]);
+
+  const setShowSftpTab = useCallback((enabled: boolean) => {
+    setShowSftpTabState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_SFTP_TAB, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHOW_SFTP_TAB, enabled);
+  }, [notifySettingsChanged]);
+
+  const setShowHostTreeSidebar = useCallback((enabled: boolean) => {
+    setShowHostTreeSidebarState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR, enabled);
+  }, [notifySettingsChanged]);
+
+  const setShellOnlyTabNumberShortcuts = useCallback((enabled: boolean) => {
+    setShellOnlyTabNumberShortcutsState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS, enabled);
+  }, [notifySettingsChanged]);
+
+  const setDisableTerminalFontZoom = useCallback((enabled: boolean) => {
+    setDisableTerminalFontZoomState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM, enabled);
+  }, [notifySettingsChanged]);
+
+  const setRestorePreviousSession = useCallback((enabled: boolean) => {
+    setRestorePreviousSessionState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_RESTORE_PREVIOUS_SESSION, enabled);
+    if (!enabled) {
+      sessionRestoreStorage.clear();
+    }
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_RESTORE_PREVIOUS_SESSION, enabled);
+  }, [notifySettingsChanged]);
+
+  const setRestoreTerminalCwd = useCallback((enabled: boolean) => {
+    setRestoreTerminalCwdState(enabled);
+    localStorageAdapter.writeBoolean(STORAGE_KEY_RESTORE_TERMINAL_CWD, enabled);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_RESTORE_TERMINAL_CWD, enabled);
+  }, [notifySettingsChanged]);
+
   // Apply and persist custom CSS
   useEffect(() => {
-    // Always apply CSS to document (needed on mount)
-    let styleEl = document.getElementById('netcatty-custom-css') as HTMLStyleElement | null;
-    if (!styleEl) {
-      styleEl = document.createElement('style');
-      styleEl.id = 'netcatty-custom-css';
-      document.head.appendChild(styleEl);
-    }
-    styleEl.textContent = customCSS;
+    applyCustomCssToDocument(customCSS);
     localStorageAdapter.writeString(STORAGE_KEY_CUSTOM_CSS, customCSS);
     // Skip IPC on initial mount
     if (!persistMountedRef.current) return;
@@ -974,6 +922,13 @@ export const useSettingsState = () => {
     notifySettingsChanged(STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR, sftpAutoOpenSidebar);
   }, [sftpAutoOpenSidebar, notifySettingsChanged]);
 
+  // Persist SFTP follow terminal cwd setting
+  useEffect(() => {
+    localStorageAdapter.writeString(STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD, sftpFollowTerminalCwd ? 'true' : 'false');
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD, sftpFollowTerminalCwd);
+  }, [sftpFollowTerminalCwd, notifySettingsChanged]);
+
   // Persist SFTP default view mode
   useEffect(() => {
     localStorageAdapter.writeString(STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE, sftpDefaultViewMode);
@@ -1000,89 +955,90 @@ export const useSettingsState = () => {
     notifySettingsChanged(STORAGE_KEY_SESSION_LOGS_FORMAT, sessionLogsFormat);
   }, [sessionLogsFormat, notifySettingsChanged]);
 
-  // Persist and sync toggle window hotkey setting
   useEffect(() => {
-    // Register/unregister the global hotkey in main process (needed on mount)
-    const bridge = netcattyBridge.get();
-    if (bridge?.registerGlobalHotkey) {
-      if (toggleWindowHotkey && globalHotkeyEnabled) {
-        setHotkeyRegistrationError(null);
-        bridge
-          .registerGlobalHotkey(toggleWindowHotkey)
-          .then((result) => {
-            if (result?.success === false) {
-              console.warn('[GlobalHotkey] Hotkey registration failed:', result.error);
-              setHotkeyRegistrationError(result.error || 'Failed to register hotkey');
-            }
-          })
-          .catch((err) => {
-            console.warn('[GlobalHotkey] Failed to register hotkey:', err);
-            setHotkeyRegistrationError(err?.message || 'Failed to register hotkey');
-          });
-      } else {
-        setHotkeyRegistrationError(null);
-        bridge.unregisterGlobalHotkey?.().catch((err) => {
-          console.warn('[GlobalHotkey] Failed to unregister hotkey:', err);
-        });
-      }
-    }
-    localStorageAdapter.writeString(STORAGE_KEY_TOGGLE_WINDOW_HOTKEY, toggleWindowHotkey);
-    // Skip IPC on initial mount
+    localStorageAdapter.writeString(STORAGE_KEY_SESSION_LOGS_TIMESTAMPS_ENABLED, sessionLogsTimestampsEnabled ? 'true' : 'false');
     if (!persistMountedRef.current) return;
-    notifySettingsChanged(STORAGE_KEY_TOGGLE_WINDOW_HOTKEY, toggleWindowHotkey);
-  }, [toggleWindowHotkey, globalHotkeyEnabled, notifySettingsChanged]);
+    notifySettingsChanged(STORAGE_KEY_SESSION_LOGS_TIMESTAMPS_ENABLED, sessionLogsTimestampsEnabled);
+  }, [sessionLogsTimestampsEnabled, notifySettingsChanged]);
 
-  // Persist global hotkey enabled setting
   useEffect(() => {
-    localStorageAdapter.writeString(STORAGE_KEY_GLOBAL_HOTKEY_ENABLED, globalHotkeyEnabled ? 'true' : 'false');
+    localStorageAdapter.writeString(STORAGE_KEY_SSH_DEBUG_LOGS_ENABLED, sshDebugLogsEnabled ? 'true' : 'false');
     if (!persistMountedRef.current) return;
-    notifySettingsChanged(STORAGE_KEY_GLOBAL_HOTKEY_ENABLED, globalHotkeyEnabled);
-  }, [globalHotkeyEnabled, notifySettingsChanged]);
+    notifySettingsChanged(STORAGE_KEY_SSH_DEBUG_LOGS_ENABLED, sshDebugLogsEnabled);
+  }, [sshDebugLogsEnabled, notifySettingsChanged]);
 
-  // Persist and sync close to tray setting
   useEffect(() => {
-    // Update main process tray behavior (needed on mount)
-    const bridge = netcattyBridge.get();
-    if (bridge?.setCloseToTray) {
-      bridge.setCloseToTray(closeToTray).catch((err) => {
-        console.warn('[SystemTray] Failed to set close-to-tray:', err);
-      });
-    }
-    localStorageAdapter.writeString(STORAGE_KEY_CLOSE_TO_TRAY, closeToTray ? 'true' : 'false');
-    // Skip IPC on initial mount
-    if (!persistMountedRef.current) return;
-    notifySettingsChanged(STORAGE_KEY_CLOSE_TO_TRAY, closeToTray);
-  }, [closeToTray, notifySettingsChanged]);
+    sshDeepLinkEnabledRef.current = sshDeepLinkEnabled;
+  }, [sshDeepLinkEnabled]);
 
-  // Hydrate auto-update state from the main-process preference file on mount.
-  // This reconciles localStorage (renderer) with auto-update-pref.json (main)
-  // in case localStorage was cleared or is stale.
   useEffect(() => {
+    let cancelled = false;
+    const requestIdAtStart = sshDeepLinkSetRequestIdRef.current;
     const bridge = netcattyBridge.get();
-    void bridge?.getAutoUpdate?.().then((result) => {
-      if (result && typeof result.enabled === 'boolean') {
-        setAutoUpdateEnabled((prev) => {
-          if (prev === result.enabled) return prev;
-          // Sync localStorage with the main-process truth
-          localStorageAdapter.writeString(STORAGE_KEY_AUTO_UPDATE_ENABLED, result.enabled ? 'true' : 'false');
-          return result.enabled;
-        });
-      }
-    }).catch(() => { /* bridge unavailable */ });
+    if (!bridge?.getSshDeepLinkEnabled) return;
+    void bridge.getSshDeepLinkEnabled().then((enabled) => {
+      if (cancelled || typeof enabled !== 'boolean') return;
+      if (sshDeepLinkSetRequestIdRef.current !== requestIdAtStart) return;
+      sshDeepLinkMutationSourceRef.current = 'incoming';
+      setSshDeepLinkEnabledState((prev) => (prev === enabled ? prev : enabled));
+      localStorageAdapter.writeBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED, enabled);
+    }).catch(() => {
+      // The renderer can still use its cached setting when the bridge is unavailable.
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Persist auto-update enabled setting.
-  // Initial mount still writes localStorage, but skips cross-window/main-process IPC.
-  useEffect(() => {
-    localStorageAdapter.writeString(STORAGE_KEY_AUTO_UPDATE_ENABLED, autoUpdateEnabled ? 'true' : 'false');
-    if (!persistMountedRef.current) return;
-    notifySettingsChanged(STORAGE_KEY_AUTO_UPDATE_ENABLED, autoUpdateEnabled);
-    // Notify main process on user-initiated changes
+  const setSshDeepLinkEnabled = useCallback((enabled: boolean) => {
+    const previous = sshDeepLinkEnabledRef.current;
+    const requestId = sshDeepLinkSetRequestIdRef.current + 1;
+    sshDeepLinkSetRequestIdRef.current = requestId;
+    sshDeepLinkMutationSourceRef.current = 'local';
+    setSshDeepLinkEnabledState(enabled);
+
     const bridge = netcattyBridge.get();
-    bridge?.setAutoUpdate?.(autoUpdateEnabled).catch((err: unknown) => {
-      console.warn('[AutoUpdate] Failed to set auto-update:', err);
+    if (!bridge?.setSshDeepLinkEnabled) return;
+    void bridge.setSshDeepLinkEnabled(enabled).then((result) => {
+      if (sshDeepLinkSetRequestIdRef.current !== requestId) return;
+      const success = typeof result === 'object' ? result.success : result;
+      if (success !== false) return;
+      const finalEnabled = typeof result === 'object' && typeof result.enabled === 'boolean'
+        ? result.enabled
+        : previous;
+      sshDeepLinkMutationSourceRef.current = 'incoming';
+      setSshDeepLinkEnabledState(finalEnabled);
+      localStorageAdapter.writeBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED, finalEnabled);
+    }).catch(() => {
+      if (sshDeepLinkSetRequestIdRef.current !== requestId) return;
+      sshDeepLinkMutationSourceRef.current = 'incoming';
+      setSshDeepLinkEnabledState(previous);
+      localStorageAdapter.writeBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED, previous);
     });
-  }, [autoUpdateEnabled, notifySettingsChanged]);
+  }, []);
+
+  useEffect(() => {
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SSH_DEEP_LINK_ENABLED, sshDeepLinkEnabled);
+    if (sshDeepLinkMutationSourceRef.current === 'incoming') {
+      sshDeepLinkMutationSourceRef.current = 'local';
+      return;
+    }
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SSH_DEEP_LINK_ENABLED, sshDeepLinkEnabled);
+  }, [sshDeepLinkEnabled, notifySettingsChanged]);
+
+  useSystemSettingsEffects({
+    enabled: enableSystemEffects,
+    toggleWindowHotkey,
+    globalHotkeyEnabled,
+    closeToTray,
+    windowOpacity,
+    autoUpdateEnabled,
+    persistMountedRef,
+    setHotkeyRegistrationError,
+    setAutoUpdateEnabled,
+    notifySettingsChanged,
+  });
 
   // Fix 1: Mark all persist effects as mounted.
   // This MUST be declared AFTER all persist useEffects so that React runs it last
@@ -1106,37 +1062,18 @@ export const useSettingsState = () => {
 
   // Update a single key binding
   const updateKeyBinding = useCallback((bindingId: string, scheme: 'mac' | 'pc', newKey: string) => {
-    setCustomKeyBindings(prev => ({
-      ...prev,
-      [bindingId]: {
-        ...prev[bindingId],
-        [scheme]: newKey,
-      },
-    }));
-  }, []);
+    setCustomKeyBindings(prev => updateCustomKeyBindingRecord(prev, bindingId, scheme, newKey));
+  }, [setCustomKeyBindings]);
 
   // Reset a key binding to default
   const resetKeyBinding = useCallback((bindingId: string, scheme?: 'mac' | 'pc') => {
-    setCustomKeyBindings(prev => {
-      const next = { ...prev };
-      if (scheme) {
-        if (next[bindingId]) {
-          delete next[bindingId][scheme];
-          if (Object.keys(next[bindingId]).length === 0) {
-            delete next[bindingId];
-          }
-        }
-      } else {
-        delete next[bindingId];
-      }
-      return next;
-    });
-  }, []);
+    setCustomKeyBindings(prev => resetCustomKeyBinding(prev, bindingId, scheme));
+  }, [setCustomKeyBindings]);
 
   // Reset all key bindings to defaults
   const resetAllKeyBindings = useCallback(() => {
     setCustomKeyBindings({});
-  }, []);
+  }, [setCustomKeyBindings]);
 
   const updateSyncConfig = useCallback((config: SyncConfig | null) => {
     setSyncConfig(config);
@@ -1146,21 +1083,20 @@ export const useSettingsState = () => {
   // Subscribe to custom theme changes so editing in-place triggers re-render
   const customThemes = useCustomThemes();
 
-  const currentTerminalTheme = useMemo(() => {
-    // When "Follow Application Theme" is enabled, pick the terminal theme
-    // whose background matches the active UI theme preset.
-    if (followAppTerminalTheme) {
-      const activeUiThemeId = resolvedTheme === 'dark' ? darkUiThemeId : lightUiThemeId;
-      const mapped = getTerminalThemeForUiTheme(activeUiThemeId);
-      if (mapped) {
-        const found = TERMINAL_THEMES.find(t => t.id === mapped);
-        if (found) return found;
-      }
-    }
-    return TERMINAL_THEMES.find(t => t.id === terminalThemeId)
-      || customThemes.find(t => t.id === terminalThemeId)
-      || TERMINAL_THEMES[0];
-  }, [terminalThemeId, customThemes, followAppTerminalTheme, resolvedTheme, lightUiThemeId, darkUiThemeId]);
+  const currentTerminalTheme = useMemo(() => resolveCurrentTerminalTheme({
+    terminalThemeId,
+    terminalThemeDarkId,
+    terminalThemeLightId,
+    customThemes,
+    followAppTerminalTheme,
+    resolvedTheme,
+    lightUiThemeId,
+    darkUiThemeId,
+    accentMode,
+    customAccent,
+  }), [terminalThemeId, terminalThemeDarkId, terminalThemeLightId, customThemes,
+      followAppTerminalTheme, resolvedTheme, lightUiThemeId, darkUiThemeId,
+      accentMode, customAccent]);
 
   const updateTerminalSetting = useCallback(<K extends keyof TerminalSettings>(
     key: K,
@@ -1169,8 +1105,7 @@ export const useSettingsState = () => {
     setTerminalSettings(prev => ({ ...prev, [key]: value }));
   }, [setTerminalSettings]);
 
-  /** Re-apply the current UI theme tokens (used to restore after immersive mode override). */
-  const reapplyCurrentTheme = useCallback(() => {
+  const applyAppTheme = useCallback(() => {
     const tokens = getUiThemeById(resolvedTheme, resolvedTheme === 'dark' ? darkUiThemeId : lightUiThemeId).tokens;
     applyThemeTokens(theme, resolvedTheme, tokens, accentMode, customAccent);
   }, [theme, resolvedTheme, lightUiThemeId, darkUiThemeId, accentMode, customAccent]);
@@ -1197,6 +1132,10 @@ export const useSettingsState = () => {
     setTerminalThemeId,
     followAppTerminalTheme,
     setFollowAppTerminalTheme: setFollowAppTerminalThemeState,
+    terminalThemeDarkId,
+    setTerminalThemeDarkId,
+    terminalThemeLightId,
+    setTerminalThemeLightId,
     currentTerminalTheme,
     terminalFontFamilyId,
     setTerminalFontFamilyId,
@@ -1226,8 +1165,26 @@ export const useSettingsState = () => {
     setSftpUseCompressedUpload,
     sftpAutoOpenSidebar,
     setSftpAutoOpenSidebar,
+    sftpFollowTerminalCwd,
+    setSftpFollowTerminalCwd,
     sftpDefaultViewMode,
     setSftpDefaultViewMode,
+    showRecentHosts,
+    setShowRecentHosts,
+    showOnlyUngroupedHostsInRoot,
+    setShowOnlyUngroupedHostsInRoot,
+    showSftpTab,
+    setShowSftpTab,
+    showHostTreeSidebar,
+    setShowHostTreeSidebar,
+    shellOnlyTabNumberShortcuts,
+    setShellOnlyTabNumberShortcuts,
+    disableTerminalFontZoom,
+    setDisableTerminalFontZoom,
+    restorePreviousSession,
+    setRestorePreviousSession,
+    restoreTerminalCwd,
+    setRestoreTerminalCwd,
     sftpTransferConcurrency,
     setSftpTransferConcurrency,
     // Editor Settings
@@ -1244,6 +1201,12 @@ export const useSettingsState = () => {
     setSessionLogsDir,
     sessionLogsFormat,
     setSessionLogsFormat,
+    sessionLogsTimestampsEnabled,
+    setSessionLogsTimestampsEnabled,
+    sshDebugLogsEnabled,
+    setSshDebugLogsEnabled,
+    sshDeepLinkEnabled,
+    setSshDeepLinkEnabled,
     // Global Toggle Window (Quake Mode)
     toggleWindowHotkey,
     setToggleWindowHotkey,
@@ -1254,8 +1217,10 @@ export const useSettingsState = () => {
     hotkeyRegistrationError,
     globalHotkeyEnabled,
     setGlobalHotkeyEnabled,
+    windowOpacity,
+    setWindowOpacity,
     rehydrateAllFromStorage,
-    reapplyCurrentTheme,
+    applyAppTheme,
     workspaceFocusStyle,
     setWorkspaceFocusStyle,
     // Opaque version that changes when any synced setting changes, used by useAutoSync.
@@ -1265,8 +1230,9 @@ export const useSettingsState = () => {
       uiFontFamilyId, uiLanguage, customCSS,
       terminalThemeId, terminalFontFamilyId, terminalFontSize, terminalSettings,
       customKeyBindings, editorWordWrap,
-      sftpDoubleClickBehavior, sftpAutoSync, sftpShowHiddenFiles, sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpDefaultViewMode,
-      customThemes, workspaceFocusStyle,
+      sftpDoubleClickBehavior, sftpAutoSync, sftpShowHiddenFiles, sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpFollowTerminalCwd, sftpDefaultViewMode,
+      showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab, showHostTreeSidebar, shellOnlyTabNumberShortcuts, disableTerminalFontZoom,
+      customThemes, workspaceFocusStyle, sessionLogsTimestampsEnabled, sshDebugLogsEnabled, sshDeepLinkEnabled,
     ]),
   };
 };

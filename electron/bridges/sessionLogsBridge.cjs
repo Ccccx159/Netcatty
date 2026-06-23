@@ -6,6 +6,18 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { dialog } = require("electron");
+const {
+  terminalDataToHtmlContent,
+  terminalDataToPlainText,
+} = require("./terminalLogSanitizer.cjs");
+
+const FILE_NAME_UNSAFE_CHARS = new Set(["<", ">", ":", "\"", "/", "\\", "|", "?", "*"]);
+const WINDOWS_RESERVED_DEVICE_NAME = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i;
+
+function isControlCharacter(char) {
+  const code = char.codePointAt(0);
+  return code !== undefined && ((code >= 0 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f));
+}
 
 /**
  * Get current Date to a local ISO-like string (YYYY-MM-DDTHH-MM-SS)
@@ -23,20 +35,23 @@ function toLocalISOString(date = new Date()) {
   return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
 }
 
-/**
- * Strip ANSI escape codes from text
- * Used for plain text export format
- */
-function stripAnsi(str) {
-  // eslint-disable-next-line no-control-regex
-  return str
-    // OSC: ESC ] ... BEL or ESC ] ... ESC \
-    .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, '')
-    // ANSI CSI / ESC sequences
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
-    // Remove remaining control chars except \n \r \t
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+function safePathSegment(value, fallback = "unknown") {
+  const raw = String(value || "");
+  let safe = Array.from(raw, (char) => {
+    return FILE_NAME_UNSAFE_CHARS.has(char) || isControlCharacter(char) ? "_" : char;
+  }).join("").trim();
+
+  if (!safe || safe === "." || safe === "..") {
+    return fallback;
+  }
+
+  safe = safe.replace(/\.+$/g, (match) => "_".repeat(match.length));
+
+  if (WINDOWS_RESERVED_DEVICE_NAME.test(safe)) {
+    safe = `${safe}_`;
+  }
+
+  return safe;
 }
 
 /**
@@ -52,75 +67,12 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-/**
- * Convert terminal data to HTML with colors preserved
- */
-function terminalDataToHtml(terminalData, hostLabel, timestamp) {
-  // Basic ANSI to HTML conversion for common codes
-  const ansiToHtml = (text) => {
-    const colorMap = {
-      "30": "color: #000",
-      "31": "color: #c00",
-      "32": "color: #0c0",
-      "33": "color: #cc0",
-      "34": "color: #00c",
-      "35": "color: #c0c",
-      "36": "color: #0cc",
-      "37": "color: #ccc",
-      "90": "color: #666",
-      "91": "color: #f66",
-      "92": "color: #6f6",
-      "93": "color: #ff6",
-      "94": "color: #66f",
-      "95": "color: #f6f",
-      "96": "color: #6ff",
-      "97": "color: #fff",
-      "40": "background: #000",
-      "41": "background: #c00",
-      "42": "background: #0c0",
-      "43": "background: #cc0",
-      "44": "background: #00c",
-      "45": "background: #c0c",
-      "46": "background: #0cc",
-      "47": "background: #ccc",
-      "1": "font-weight: bold",
-      "3": "font-style: italic",
-      "4": "text-decoration: underline",
-    };
+function terminalPlainTextToHtml(plainText, hostLabel, timestamp) {
+  const htmlContent = escapeHtml(plainText || "");
+  return wrapTerminalHtmlContent(htmlContent, hostLabel, timestamp);
+}
 
-    // First, escape HTML in the text content (not the ANSI codes)
-    // We do this by splitting on ANSI sequences, escaping each text part, then rejoining
-    // eslint-disable-next-line no-control-regex
-    const ansiRegex = /(\x1B\[[0-9;]*m|\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]))/g;
-    const parts = text.split(ansiRegex);
-
-    let result = parts.map((part) => {
-      // Check if this part is an ANSI sequence
-      // eslint-disable-next-line no-control-regex
-      if (/^\x1B/.test(part)) {
-        // It's an ANSI sequence, convert to HTML span or remove
-        const match = part.match(/^\x1B\[([0-9;]*)m$/);
-        if (match) {
-          const codes = match[1];
-          if (codes === "0" || codes === "") {
-            return "</span>";
-          }
-          const styles = codes.split(";").map((c) => colorMap[c]).filter(Boolean);
-          if (styles.length > 0) {
-            return `<span style="${styles.join("; ")}">`;
-          }
-        }
-        // Other ANSI sequences are stripped
-        return "";
-      }
-      // It's regular text, escape HTML
-      return escapeHtml(part);
-    }).join("");
-
-    return result;
-  };
-
-  const htmlContent = ansiToHtml(terminalData);
+function wrapTerminalHtmlContent(htmlContent, hostLabel, timestamp) {
   const dateStr = new Date(timestamp).toLocaleString();
   const safeHostLabel = escapeHtml(hostLabel || "Unknown");
   const safeDateStr = escapeHtml(dateStr);
@@ -154,9 +106,17 @@ function terminalDataToHtml(terminalData, hostLabel, timestamp) {
     Host: ${safeHostLabel}<br>
     Date: ${safeDateStr}
   </div>
-  <div class="content">${htmlContent}</div>
+  <div class="content">${htmlContent || ""}</div>
 </body>
 </html>`;
+}
+
+/**
+ * Convert terminal data to HTML after applying terminal text controls while
+ * preserving SGR styles such as color, bold, italic, and underline.
+ */
+function terminalDataToHtml(terminalData, hostLabel, timestamp) {
+  return wrapTerminalHtmlContent(terminalDataToHtmlContent(terminalData), hostLabel, timestamp);
 }
 
 /**
@@ -172,7 +132,7 @@ async function exportSessionLog(event, payload) {
   // Generate default filename
   const date = new Date(startTime);
   const dateStr = toLocalISOString(date);
-  const safeHostLabel = (hostLabel || hostname || "session").replace(/[^a-zA-Z0-9-_]/g, "_");
+  const safeHostLabel = safePathSegment(hostLabel || hostname, "session");
   const ext = format === "html" ? "html" : format === "raw" ? "log" : "txt";
   const defaultPath = `${safeHostLabel}_${dateStr}.${ext}`;
 
@@ -201,8 +161,8 @@ async function exportSessionLog(event, payload) {
     // Raw format preserves ANSI codes
     content = terminalData;
   } else {
-    // Plain text - strip ANSI codes
-    content = stripAnsi(terminalData);
+    // Plain text - apply terminal text controls and remove escape sequences
+    content = terminalDataToPlainText(terminalData);
   }
 
   await fs.promises.writeFile(result.filePath, content, "utf8");
@@ -239,7 +199,7 @@ async function autoSaveSessionLog(event, payload) {
 
   try {
     // Create host subdirectory
-    const safeHostLabel = (hostLabel || hostname || hostId || "unknown").replace(/[^a-zA-Z0-9-_]/g, "_");
+    const safeHostLabel = safePathSegment(hostLabel || hostname || hostId, "unknown");
     const hostDir = path.join(directory, safeHostLabel);
 
     await fs.promises.mkdir(hostDir, { recursive: true });
@@ -258,7 +218,7 @@ async function autoSaveSessionLog(event, payload) {
     } else if (format === "raw") {
       content = terminalData;
     } else {
-      content = stripAnsi(terminalData);
+      content = terminalDataToPlainText(terminalData);
     }
 
     await fs.promises.writeFile(filePath, content, "utf8");
@@ -307,7 +267,9 @@ module.exports = {
   selectSessionLogsDir,
   autoSaveSessionLog,
   openSessionLogsDir,
-  stripAnsi,
   toLocalISOString,
   terminalDataToHtml,
+  terminalPlainTextToHtml,
+  wrapTerminalHtmlContent,
+  safePathSegment,
 };

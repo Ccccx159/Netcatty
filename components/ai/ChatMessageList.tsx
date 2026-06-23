@@ -6,8 +6,8 @@
  * No avatars. Thinking blocks are collapsible.
  */
 
-import { AlertCircle, FileText, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertCircle, FileText, RotateCcw, SquareTerminal, X, ZoomIn, ZoomOut } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import type { ChatMessage } from '../../infrastructure/ai/types';
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog';
@@ -19,6 +19,7 @@ import {
 import { Message, MessageContent, MessageResponse } from '../ai-elements/message';
 import { ToolCall } from '../ai-elements/tool-call';
 import ThinkingBlock from './ThinkingBlock';
+import ToolCallGroup from './ToolCallGroup';
 import {
   onApprovalRequest,
   onApprovalCleared,
@@ -26,6 +27,11 @@ import {
   resolveApproval,
   type ApprovalRequest,
 } from '../../infrastructure/ai/shared/approvalGate';
+import {
+  getAIPanelDiagnosticHiddenParts,
+  getAIPanelProfilerProps,
+  isAIPanelDiagnosticPartHidden,
+} from './aiPanelDiagnostics';
 
 interface ChatMessageListProps {
   messages: ChatMessage[];
@@ -33,6 +39,9 @@ interface ChatMessageListProps {
   /** Active chat session ID — used to filter standalone MCP approval blocks */
   activeSessionId?: string | null;
 }
+
+const MESSAGE_RENDER_BATCH = 50;
+const MESSAGE_RENDER_STEP = 50;
 
 const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming, activeSessionId }) => {
   // Track pending approvals from the approval gate
@@ -137,9 +146,28 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     dragStart.current = null;
   }, []);
   const { t } = useI18n();
-  const visibleMessages = messages.filter(m => m.role !== 'system');
+  const hiddenParts = getAIPanelDiagnosticHiddenParts();
+  const hideAttachments = isAIPanelDiagnosticPartHidden('attachments', hiddenParts);
+  const hideMarkdown = isAIPanelDiagnosticPartHidden('markdown', hiddenParts);
+  const hideToolCalls = isAIPanelDiagnosticPartHidden('toolcalls', hiddenParts);
+  const [renderedTailCount, setRenderedTailCount] = useState(MESSAGE_RENDER_BATCH);
+
+  useEffect(() => {
+    setRenderedTailCount(MESSAGE_RENDER_BATCH);
+  }, [activeSessionId]);
+
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => message.role !== 'system'),
+    [messages],
+  );
+
+  const hiddenMessageCount = Math.max(0, visibleMessages.length - renderedTailCount);
+  const displayedMessages = hiddenMessageCount > 0
+    ? visibleMessages.slice(-renderedTailCount)
+    : visibleMessages;
+
   const resolvedToolCallIds = new Set(
-    visibleMessages
+    displayedMessages
       .filter((m) => m.role === 'tool')
       .flatMap((m) => m.toolResults?.map((tr) => tr.toolCallId) ?? []),
   );
@@ -147,7 +175,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
   // Build maps from toolCallId → toolName / toolArgs for display
   const toolCallNames = new Map<string, string>();
   const toolCallArgs = new Map<string, Record<string, unknown>>();
-  for (const m of visibleMessages) {
+  for (const m of displayedMessages) {
     if (m.role === 'assistant' && m.toolCalls) {
       for (const tc of m.toolCalls) {
         toolCallNames.set(tc.id, tc.name);
@@ -166,26 +194,61 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
     );
   }
 
-  const lastAssistantMessage = visibleMessages.findLast(m => m.role === 'assistant');
+  const lastAssistantMessage = displayedMessages.findLast(m => m.role === 'assistant');
 
   return (
     <>
     <Conversation className="flex-1">
       <ConversationContent className="gap-1.5 px-4 py-2">
-        {visibleMessages.map((message) => {
+        {hiddenMessageCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setRenderedTailCount((count) => count + MESSAGE_RENDER_STEP)}
+            className="w-full py-2 text-center text-[12px] text-muted-foreground/50 hover:text-muted-foreground transition-colors cursor-pointer"
+          >
+            {t('ai.chat.loadEarlierMessages').replace('{n}', String(hiddenMessageCount))}
+          </button>
+        )}
+        {displayedMessages.map((message, idx) => {
           if (message.role === 'tool') {
+            // Group consecutive tool messages into a collapsible section
+            // Skip if this is NOT the first in a consecutive run
+            const prevIsTool = idx > 0 && displayedMessages[idx - 1].role === "tool";
+            if (prevIsTool || hideToolCalls) return null;
+
+            // Collect this run of consecutive tool messages
+            let end = idx + 1;
+            while (end < displayedMessages.length && displayedMessages[end].role === "tool") end++;
+            const group = displayedMessages.slice(idx, end);
+            const groupTotal = group.reduce(
+              (sum, m) => sum + (m.toolResults?.length ?? 0), 0,
+            );
+
+            // Expanded while the agent is still working (no assistant response follows)
+            const hasAssistantAfter = end < displayedMessages.length
+              && displayedMessages[end].role === "assistant";
+
             return (
-              <React.Fragment key={message.id}>
-                {message.toolResults?.map((tr) => (
-                  <ToolCall
-                    key={tr.toolCallId}
-                    name={toolCallNames.get(tr.toolCallId) || tr.toolCallId}
-                    args={toolCallArgs.get(tr.toolCallId)}
-                    result={tr.content}
-                    isError={tr.isError}
-                  />
-                ))}
-              </React.Fragment>
+              <ToolCallGroup
+                key={`tool-group-${message.id}`}
+                count={groupTotal}
+                defaultExpanded={!hasAssistantAfter}
+              >
+                {group.map((toolMsg) =>
+                  toolMsg.toolResults?.map((tr) => (
+                    <React.Profiler key={tr.toolCallId} {...getAIPanelProfilerProps("AIChatPanel.ToolCall.Result")}>
+                    <div>
+                      <ToolCall
+                        name={toolCallNames.get(tr.toolCallId) || tr.toolCallId}
+                        args={toolCallArgs.get(tr.toolCallId)}
+                        result={tr.content}
+                        isError={tr.isError}
+                      />
+                    </div>
+                    </React.Profiler>
+                  )),
+                )}
+              </ToolCallGroup>
             );
           }
 
@@ -195,7 +258,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
 
           return (
             <Message key={message.id} from={message.role}>
-              <MessageContent>
+              <MessageContent from={message.role}>
                 {/* Thinking block */}
                 {!isUser && message.thinking && (
                   <ThinkingBlock
@@ -206,10 +269,18 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
                 )}
 
                 {/* User attachments (images, files) — fallback to legacy `images` field */}
-                {isUser && (message.attachments ?? message.images)?.length && (
+                {isUser && !hideAttachments && (message.attachments ?? message.images)?.length && (
                   <div className="flex gap-1.5 flex-wrap mb-1">
                     {(message.attachments ?? message.images)!.map((att, i) => (
-                      att.mediaType.startsWith('image/') ? (
+                      att.terminalSelection ? (
+                        <div
+                          key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
+                          className="inline-flex items-center gap-1.5 h-7 px-2 rounded-md bg-muted/20 border border-border/20 text-[11px] text-foreground/70"
+                        >
+                          <SquareTerminal size={12} className="text-muted-foreground/60 shrink-0" />
+                          <span className="truncate max-w-[150px]">{att.filename || 'terminal selection'}</span>
+                        </div>
+                      ) : att.mediaType.startsWith('image/') ? (
                         <img
                           key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
                           src={`data:${att.mediaType};base64,${att.base64Data}`}
@@ -232,40 +303,55 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
 
                 {message.content && (
                   isUser
-                    ? <div className="whitespace-pre-wrap break-words text-[13px]">{message.content}</div>
-                    : <MessageResponse isAnimating={isThisStreaming}>
-                        {message.content}
-                      </MessageResponse>
+                    ? <div className="whitespace-pre-wrap break-words text-[13px] leading-[1.45]">{message.content}</div>
+                    : hideMarkdown
+                      ? <div className="whitespace-pre-wrap break-words text-[13px] leading-[1.45]">{message.content}</div>
+                      : (
+                          <React.Profiler {...getAIPanelProfilerProps('AIChatPanel.Markdown')}>
+                            <MessageResponse isAnimating={isThisStreaming}>
+                              {message.content}
+                            </MessageResponse>
+                          </React.Profiler>
+                        )
                 )}
 
                 {/* Pending tool calls from the *last* assistant message are rendered
                     after all tool-result messages (see below) for chronological order.
                     Unresolved tool calls from earlier or cancelled messages are shown
                     inline — as interrupted, or with approval controls if still pending. */}
-                {(message !== lastAssistantMessage || message.executionStatus === 'cancelled') && message.toolCalls?.filter((tc) =>
-                  !resolvedToolCallIds.has(tc.id),
-                ).map((tc) => {
-                  const isPending = pendingApprovals.has(tc.id);
-                  const resolved = resolvedApprovals.get(tc.id);
-                  const approvalStatus = isPending
-                    ? 'pending' as const
-                    : resolved === true
-                      ? 'approved' as const
-                      : resolved === false
-                        ? 'denied' as const
-                        : undefined;
+{(() => {
+                  if (hideToolCalls) return null;
+                  if (message === lastAssistantMessage && message.executionStatus !== "cancelled") return null;
+                  const unresolvedTcs = message.toolCalls?.filter((tc) => !resolvedToolCallIds.has(tc.id)) ?? [];
+                  if (unresolvedTcs.length === 0) return null;
                   return (
-                    <ToolCall
-                      key={tc.id}
-                      name={tc.name}
-                      args={tc.arguments}
-                      isInterrupted={!isPending}
-                      approvalStatus={approvalStatus}
-                      onApprove={() => handleApprove(tc.id)}
-                      onReject={() => handleReject(tc.id)}
-                    />
+                    <ToolCallGroup count={unresolvedTcs.length} defaultExpanded={false}>
+                      {unresolvedTcs.map((tc) => {
+                        const isPending = pendingApprovals.has(tc.id);
+                        const resolved = resolvedApprovals.get(tc.id);
+                        const approvalStatus = isPending
+                          ? "pending" as const
+                          : resolved === true
+                            ? "approved" as const
+                            : resolved === false
+                              ? "denied" as const
+                              : undefined;
+                        return (
+                          <div key={tc.id} className="px-2 py-1.5">
+                            <ToolCall
+                              name={tc.name}
+                              args={tc.arguments}
+                              isInterrupted={!isPending}
+                              approvalStatus={approvalStatus}
+                              onApprove={() => handleApprove(tc.id)}
+                              onReject={() => handleReject(tc.id)}
+                            />
+                          </div>
+                        );
+                      })}
+                    </ToolCallGroup>
                   );
-                })}
+                })()}
 
                 {/* Status text with shimmer */}
                 {message.statusText && (
@@ -295,47 +381,61 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({ messages, isStreaming
 
         {/* Pending tool calls from the last assistant message — rendered here
             (after all tool-result messages) so they appear at the bottom. */}
-        {lastAssistantMessage?.toolCalls?.filter((tc) =>
-          !resolvedToolCallIds.has(tc.id) && lastAssistantMessage.executionStatus !== 'cancelled',
-        ).map((tc) => {
-          const isPending = pendingApprovals.has(tc.id);
-          const resolved = resolvedApprovals.get(tc.id);
-          const approvalStatus = isPending
-            ? 'pending' as const
-            : resolved === true
-              ? 'approved' as const
-              : resolved === false
-                ? 'denied' as const
-                : undefined;
+{(() => {
+          if (hideToolCalls) return null;
+          const pendingTcs = lastAssistantMessage?.toolCalls?.filter((tc) =>
+            !resolvedToolCallIds.has(tc.id) && lastAssistantMessage.executionStatus !== "cancelled",
+          ) ?? [];
+          if (pendingTcs.length === 0) return null;
+          const isActive = lastAssistantMessage.executionStatus !== "error";
+          const isToolRunning = !!(isStreaming && lastAssistantMessage.executionStatus === "running");
           return (
-            <ToolCall
-              key={tc.id}
-              name={tc.name}
-              args={tc.arguments}
-              isLoading={isStreaming && lastAssistantMessage.executionStatus === 'running' && !isPending}
-              approvalStatus={approvalStatus}
-              onApprove={() => handleApprove(tc.id)}
-              onReject={() => handleReject(tc.id)}
-            />
+            <ToolCallGroup count={pendingTcs.length} defaultExpanded={isActive}>
+              {pendingTcs.map((tc) => {
+                const isPending = pendingApprovals.has(tc.id);
+                const resolved = resolvedApprovals.get(tc.id);
+                const approvalStatus = isPending
+                  ? "pending" as const
+                  : resolved === true
+                    ? "approved" as const
+                    : resolved === false
+                      ? "denied" as const
+                      : undefined;
+                return (
+                  <div key={tc.id} className="px-2 py-1.5">
+                    <ToolCall
+                      name={tc.name}
+                      args={tc.arguments}
+                      isLoading={isToolRunning && !isPending}
+                      approvalStatus={approvalStatus}
+                      onApprove={() => handleApprove(tc.id)}
+                      onReject={() => handleReject(tc.id)}
+                    />
+                  </div>
+                );
+              })}
+            </ToolCallGroup>
           );
-        })}
+        })()}
 
-        {/* Standalone MCP/ACP approval requests (not tied to SDK tool calls) */}
-        {Array.from(pendingApprovals.entries())
-          .filter((entry) => entry[0].startsWith('mcp_approval_') && (!activeSessionId || entry[1].chatSessionId === activeSessionId))
-          .map((entry) => {
-            const [id, req] = entry;
+        {/* Standalone MCP/SDK approval requests (not tied to SDK tool calls) */}
+        {!hideToolCalls && Array.from(pendingApprovals.entries())
+          .filter(([id, req]) => id.startsWith('mcp_approval_') && (!activeSessionId || req.chatSessionId === activeSessionId))
+          .map(([id, req]) => {
             return (
-              <ToolCall
-                key={id}
-                name={req.toolName}
-                args={req.args}
-                isLoading={false}
-                isInterrupted={false}
-                approvalStatus={'pending'}
-                onApprove={() => handleApprove(id)}
-                onReject={() => handleReject(id)}
-              />
+              <React.Profiler key={id} {...getAIPanelProfilerProps('AIChatPanel.ToolCall.Approval')}>
+                <div>
+                  <ToolCall
+                    name={req.toolName}
+                    args={req.args}
+                    isLoading={false}
+                    isInterrupted={false}
+                    approvalStatus={'pending'}
+                    onApprove={() => handleApprove(id)}
+                    onReject={() => handleReject(id)}
+                  />
+                </div>
+              </React.Profiler>
             );
           })}
         {/* Streaming indicator — only when no content and no thinking yet */}

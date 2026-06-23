@@ -9,32 +9,56 @@ const https = require("node:https");
 const http = require("node:http");
 const path = require("node:path");
 const { URL } = require("node:url");
+const { randomUUID } = require("node:crypto");
 const { spawn, execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const { existsSync } = fs;
 
 const mcpServerBridge = require("./mcpServerBridge.cjs");
 const { getCliLauncherPath, TOOL_CLI_DISCOVERY_ENV_VAR } = require("../cli/discoveryPath.cjs");
+const {
+  scanUserSkills,
+  buildUserSkillsContext,
+  toPublicUserSkillsStatus,
+} = require("./ai/userSkills.cjs");
+const { registerProviderHandlers } = require("./aiBridge/providerHandlers.cjs"), { registerCattyExecHandlers } = require("./aiBridge/cattyExecHandlers.cjs"), { createAgentCliHelpers } = require("./aiBridge/agentCliHelpers.cjs");
+const { registerAgentDiscoveryHandlers } = require("./aiBridge/agentDiscoveryHandlers.cjs"), { registerAgentProcessHandlers } = require("./aiBridge/agentProcessHandlers.cjs"), { registerSdkStreamHandlers } = require("./aiBridge/sdk/sdkStreamHandlers.cjs");
+const { probeClaudeAuth, probeCopilotAuth, probeCodexAuth, probeCodebuddyAuth } = require("./aiBridge/agentAuthProbes.cjs");
 
 // ── Extracted modules ──
 const {
   stripAnsi,
   normalizeCliPathForPlatform,
-  shouldUseShellForCommand,
+  prepareCommandForSpawn,
+  normalizeClaudeCodeExecutableEnvForSdk,
+  resolveClaudeCodeExecutableForSdk,
+  resolveCodexExecutableForSdk,
+  addCodexExecutableEnvForSdk,
+  resolveCodebuddyExecutableForSdk,
+  resolveSdkBinPath,
+  resolveSdkBinPathAsync,
   resolveCliFromPath,
-  resolveClaudeAcpBinaryPath,
+  resolveCliFromPathAsync,
+  isPlausibleCliVersionOutput,
   getShellEnv,
-  serializeStreamChunk,
+  getFreshIdlePrompt,
+  invalidateShellEnvCache,
   toUnpackedAsarPath,
 } = require("./ai/shellUtils.cjs");
 
+const { detectClaudeAuthPresence, expandHomePath } = require("./ai/claudeAuth.cjs");
+
+const CLAUDE_AUTH_HELP_MESSAGE =
+  "Claude Code has no usable authentication. Open Settings -> AI -> Claude Code and set a Config directory (point it at a folder where you've run `claude` login) or add an ANTHROPIC_API_KEY under Environment variables. Alternatively, run `claude` in a terminal to log in.";
+
 const {
   codexLoginSessions,
-  resolveCodexAcpBinaryPath,
   appendCodexLoginOutput,
   toCodexLoginSessionResponse,
   getActiveCodexLoginSession,
   normalizeCodexIntegrationState,
+  readCodexCustomProviderConfig,
+  getCodexCustomConfigPreflightError,
   extractCodexError,
   isCodexAuthError,
   getCodexAuthFingerprint,
@@ -63,7 +87,7 @@ function normalizeToolIntegrationMode(mode) {
 }
 
 function setToolIntegrationMode(mode) {
-  // Tool access mode is selected per ACP request. The TCP bridge host is shared
+  // Tool access mode is selected per SDK agent request. The TCP bridge host is shared
   // by both MCP and Skills + CLI, so changing the setting must not tear down
   // unrelated in-flight sessions, approvals, or background jobs.
   return normalizeToolIntegrationMode(mode);
@@ -95,7 +119,8 @@ function getSkillsCliInvocation() {
   };
 }
 
-function buildExternalAgentContextualPrompt({ mode, prompt, chatSessionId, defaultTargetSession }) {
+function buildExternalAgentContextualPrompt({ mode, prompt, chatSessionId, defaultTargetSession, userSkillsContext }) {
+  const userSkillsPreamble = userSkillsContext ? `${userSkillsContext}\n\n` : "";
   if (mode === "skills") {
     const { commandPrefix: cliCommandPrefix, launcherPath, usesLauncher } = getSkillsCliInvocation();
     const skillHint = existsSync(NETCATTY_TOOL_SKILL_PATH)
@@ -133,12 +158,14 @@ function buildExternalAgentContextualPrompt({ mode, prompt, chatSessionId, defau
       : `Start with \`${cliCommandPrefix} env --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` to discover available sessions and their IDs. `;
 
     return (
+      `${userSkillsPreamble}` +
       `[Context: You are inside Netcatty, a multi-session terminal manager. ` +
       `${skillHint}` +
       `${cliHint}` +
       `${scopeHint}` +
       `${defaultTargetHint}` +
       `Use Skills + CLI instead of the "netcatty-remote-hosts" MCP server for Netcatty session access. ` +
+      `Use the local shell only to invoke Netcatty CLI commands or inspect local attachments explicitly supplied by the user. Do not use local shell or filesystem tools for unrelated local-machine work. ` +
       `First classify the task: remote command execution tasks go through \`exec\`, while remote file or directory tasks go through \`sftp\`. If the user explicitly says to avoid shell or \`exec\`, do not use \`exec\`. Treat \`exec\` as the short-command path only: use it only for commands expected to finish within about 60 seconds. For builds, scans, watch mode, tail-following, ping, or anything likely to exceed that budget or stream output for an extended period, do not use plain \`exec\`; use the long-running job commands instead. ` +
       `${discoveryHint}` +
       `After choosing a target session ID, call \`${cliCommandPrefix} session --session <id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` before executing anything. Do not infer protocol, shell type, device type, or connection readiness from the \`env\` result alone when you are about to run a command. ` +
@@ -161,8 +188,10 @@ function buildExternalAgentContextualPrompt({ mode, prompt, chatSessionId, defau
   }
 
   return (
+    `${userSkillsPreamble}` +
     `[Context: You are inside Netcatty, a multi-session terminal manager. ` +
     `Use the "netcatty-remote-hosts" MCP tools to operate only on the terminal sessions exposed by Netcatty. ` +
+    `For local files explicitly attached by the user, use the list_attachments and read_attachment tools. Do not use local shell or local filesystem tools for unrelated local-machine work. ` +
     `Those sessions may be remote hosts, a local terminal, or Mosh-backed shells. ` +
     `Call get_environment first to discover available sessions and their IDs. ` +
     `Use terminal_execute only for commands likely to finish within about 60 seconds. ` +
@@ -179,20 +208,10 @@ let sftpClients = null;
 let electronModule = null;
 let mainWebContentsId = null;
 let cliDiscoveryFilePath = null;
+let registeredContext = null;
 
 // Active streaming requests (for cancellation)
 const activeStreams = new Map();
-
-// External agent processes
-const agentProcesses = new Map();
-const MAX_CONCURRENT_AGENTS = 5;
-
-// ACP providers (module-level so cleanup() can access them)
-const acpProviders = new Map();
-const acpActiveStreams = new Map();
-const acpRequestSessions = new Map();
-const acpPendingCancelRequests = new Set();
-const acpChatRuns = new Map();
 
 // ── Provider registry (synced from renderer, keys stay encrypted) ──
 const ENC_PREFIX = "enc:v1:";
@@ -269,53 +288,6 @@ function injectApiKeyIntoRequest(url, headers, providerId) {
   }
 
   return { url: patchedUrl, headers: patchedHeaders };
-}
-
-function cleanupAcpProvider(chatSessionId) {
-  // Clean up temporary COPILOT_HOME directory regardless of whether a
-  // provider entry exists — prepareCopilotHome may have succeeded before
-  // provider creation failed.
-  try {
-    const tempDirBridge = require("./tempDirBridge.cjs");
-    const tempCopilotHome = path.join(tempDirBridge.getTempDir(), `copilot-home-${chatSessionId}`);
-    if (existsSync(tempCopilotHome)) {
-      fs.rmSync(tempCopilotHome, { recursive: true, force: true });
-    }
-  } catch {
-    // Best-effort cleanup
-  }
-
-  const entry = acpProviders.get(chatSessionId);
-  if (!entry) return;
-  cleanupAcpProviderInstance(entry.provider, chatSessionId);
-  acpProviders.delete(chatSessionId);
-}
-
-function cleanupAcpProviderInstance(provider, chatSessionId = "transient") {
-  if (!provider) return;
-  const rootPid = provider?.model?.agentProcess?.pid;
-  const childPids = getChildProcessTreePids(rootPid);
-  try {
-    if (typeof provider.forceCleanup === "function") {
-      provider.forceCleanup();
-    } else if (typeof provider.cleanup === "function") {
-      provider.cleanup();
-    }
-  } catch (err) {
-    console.warn("[ACP] Provider cleanup failed for session", chatSessionId, err?.message || err);
-  }
-  killTrackedProcessTree(rootPid, childPids);
-}
-
-function isActiveAcpRun(chatSessionId, requestId) {
-  const activeRun = acpChatRuns.get(chatSessionId);
-  return Boolean(activeRun && activeRun.requestId === requestId);
-}
-
-function shouldRetryFreshSession(err) {
-  const message = String(err?.message || err || "").toLowerCase();
-  return (message.includes("method not found") && message.includes("session/load"))
-    || (message.includes("resource not found") && message.includes("session") && message.includes("not found"));
 }
 
 function getChildProcessTreePids(rootPid) {
@@ -462,42 +434,6 @@ function _validateSenderImpl(event, allowSettings) {
   }
 }
 
-function summarizeMcpServersForDebug(mcpServers) {
-  if (!Array.isArray(mcpServers)) return [];
-  return mcpServers.map((server) => ({
-    name: server?.name || "",
-    type: server?.type || "",
-    command: server?.command || "",
-    args: Array.isArray(server?.args) ? server.args : [],
-    hasEnv: Array.isArray(server?.env) ? server.env.length > 0 : false,
-    url: server?.url || "",
-  }));
-}
-
-function logAcpDebug(agentLabel, message, details) {
-  const prefix = `[ACP DEBUG][${agentLabel}]`;
-  if (details === undefined) {
-    console.log(prefix, message);
-    return;
-  }
-  try {
-    console.log(prefix, message, JSON.stringify(details));
-  } catch {
-    console.log(prefix, message, details);
-  }
-}
-
-function normalizeAgentCommandName(command) {
-  if (typeof command !== "string" || !command) return "";
-  return path.basename(command).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
-}
-
-function matchesAgentCommand(command, expectedName) {
-  if (typeof command !== "string" || typeof expectedName !== "string") return false;
-  if (command.toLowerCase() === expectedName.toLowerCase()) return true;
-  return normalizeAgentCommandName(command) === normalizeAgentCommandName(expectedName);
-}
-
 function envPairsToObject(entries) {
   if (!Array.isArray(entries)) return {};
   const result = {};
@@ -508,29 +444,20 @@ function envPairsToObject(entries) {
   return result;
 }
 
-function mapMcpServerToCopilotConfig(server) {
-  if (!server || typeof server !== "object" || !server.name) return null;
-
-  if (server.type === "stdio" || server.type === "local") {
-    return {
-      type: "local",
-      command: server.command || "",
-      args: Array.isArray(server.args) ? server.args : [],
-      env: envPairsToObject(server.env),
-      tools: ["*"],
-    };
+function normalizeAgentEnv(env) {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return {};
+  const result = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!key || value == null) continue;
+    result[key] = String(value);
   }
-
-  if (server.type === "http" || server.type === "sse") {
-    return {
-      type: server.type,
-      url: server.url || "",
-      headers: envPairsToObject(server.headers),
-      tools: ["*"],
-    };
+  // CLAUDE_CONFIG_DIR is consumed as a filesystem path by the spawned agent,
+  // which won't shell-expand "~". Expand it here so "~/.claude" works and the
+  // stored value stays portable (each device expands to its own home).
+  if (result.CLAUDE_CONFIG_DIR) {
+    result.CLAUDE_CONFIG_DIR = expandHomePath(result.CLAUDE_CONFIG_DIR);
   }
-
-  return null;
+  return result;
 }
 
 function safeReadJson(filePath) {
@@ -540,47 +467,6 @@ function safeReadJson(filePath) {
   } catch {
     return null;
   }
-}
-
-function prepareCopilotHome(shellEnv, mcpServers, chatSessionId) {
-  const tempDirBridge = require("./tempDirBridge.cjs");
-  const homeDir = shellEnv.HOME || process.env.HOME || process.env.USERPROFILE || "";
-  const realCopilotHome = shellEnv.COPILOT_HOME || path.join(homeDir, ".copilot");
-  const tempCopilotHome = path.join(tempDirBridge.getTempDir(), `copilot-home-${chatSessionId}`);
-
-  try {
-    fs.rmSync(tempCopilotHome, { recursive: true, force: true });
-  } catch {
-    // Ignore cleanup failures; mkdir/copy below will surface real issues if any.
-  }
-
-  fs.mkdirSync(tempCopilotHome, { recursive: true });
-
-  if (realCopilotHome && existsSync(realCopilotHome)) {
-    fs.cpSync(realCopilotHome, tempCopilotHome, { recursive: true });
-  }
-
-  const configPath = path.join(tempCopilotHome, "mcp-config.json");
-  const baseConfig = safeReadJson(configPath) || { mcpServers: {} };
-  const mergedServers = { ...(baseConfig.mcpServers || {}) };
-
-  for (const server of Array.isArray(mcpServers) ? mcpServers : []) {
-    const mapped = mapMcpServerToCopilotConfig(server);
-    if (!mapped) continue;
-    mergedServers[server.name] = mapped;
-  }
-
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ ...baseConfig, mcpServers: mergedServers }, null, 2),
-    { mode: 0o600 },
-  );
-
-  return {
-    copilotHome: tempCopilotHome,
-    configPath,
-    serverNames: Object.keys(mergedServers),
-  };
 }
 
 /**
@@ -733,2101 +619,136 @@ function streamRequest(url, options, event, requestId, skipTLS) {
   });
 }
 
-function registerHandlers(ipcMain) {
-  // ── Provider config sync (renderer → main, keys stay encrypted) ──
-  ipcMain.handle("netcatty:ai:sync-providers", async (event, { providers }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false };
-    if (Array.isArray(providers)) {
-      providerConfigs = providers;
-      rebuildProviderFetchHosts();
-    }
-    return { ok: true };
-  });
 
-  // ── Web search config sync (renderer → main, for fetch allowlist + key decryption) ──
-  ipcMain.handle("netcatty:ai:sync-web-search", async (event, { apiHost, apiKey }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false };
-    webSearchApiHost = typeof apiHost === "string" ? apiHost : null;
-    webSearchApiKeyEncrypted = typeof apiKey === "string" ? apiKey : null;
-    rebuildProviderFetchHosts();
-    return { ok: true };
-  });
-
-  /**
-   * Inject the decrypted web search API key into request headers.
-   * Replaces __WEB_SEARCH_KEY__ placeholder, similar to __IPC_SECURED__ for providers.
-   */
-  function injectWebSearchKeyIntoHeaders(headers) {
-    if (!webSearchApiKeyEncrypted || !headers) return headers;
-    const realKey = decryptApiKeyValue(webSearchApiKeyEncrypted);
-    if (!realKey) return headers;
-    const patched = {};
-    for (const [k, v] of Object.entries(headers)) {
-      patched[k] = typeof v === "string" ? v.replace(WEB_SEARCH_KEY_PLACEHOLDER, realKey) : v;
-    }
-    return patched;
-  }
-
-  // Temporarily add a host to the fetch allowlist (used by settings model listing).
-  // Entries are auto-removed after 30 seconds unless they belong to a synced provider.
-  const TEMP_ALLOWLIST_TTL = 30_000;
-  // Track temporarily added entries so cleanup can distinguish them from synced ones
-  const tempAllowedHosts = new Set();
-  const tempAllowedPorts = new Set();
-  // Track temporarily added HTTP hosts (for rebuild restoration)
-  const tempHttpHosts = new Set();
-  // Track active expiry timers per host to avoid duplicate/premature expiry
-  const hostExpiryTimers = new Map();
-
-  /** Check if a host is owned by a currently synced provider config */
-  function isHostInProviderConfigs(host) {
-    for (const config of providerConfigs) {
-      if (!config.baseURL) continue;
-      try { if (new URL(config.baseURL).hostname === host) return true; } catch {}
-    }
-    return false;
-  }
-  /** Check if a host is owned by a provider config that uses http:// */
-  function isHttpHostInProviderConfigs(host) {
-    for (const config of providerConfigs) {
-      if (!config.baseURL) continue;
-      try {
-        const p = new URL(config.baseURL);
-        if (p.hostname === host && p.protocol === "http:") return true;
-      } catch {}
-    }
-    return false;
-  }
-  /** Check if a localhost port is owned by a currently synced provider config */
-  function isPortInProviderConfigs(port) {
-    for (const config of providerConfigs) {
-      if (!config.baseURL) continue;
-      try {
-        const p = new URL(config.baseURL);
-        if ((p.hostname === "localhost" || p.hostname === "127.0.0.1") &&
-            Number(p.port || (p.protocol === "https:" ? 443 : 80)) === port) return true;
-      } catch {}
-    }
-    return false;
-  }
-
-  ipcMain.handle("netcatty:ai:allowlist:add-host", async (event, { baseURL }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    if (typeof baseURL !== "string") return { ok: false, error: "baseURL must be a string" };
-    try {
-      const parsed = new URL(baseURL);
-      const host = parsed.hostname;
-      if (host === "localhost" || host === "127.0.0.1") {
-        const port = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
-        if (!ALLOWED_LOCALHOST_PORTS.has(port)) {
-          ALLOWED_LOCALHOST_PORTS.add(port);
-          tempAllowedPorts.add(port);
-          setTimeout(() => {
-            // Only remove if still temporary (not built-in and not synced by a provider)
-            if (!BUILTIN_LOCALHOST_PORTS.includes(port) && !isPortInProviderConfigs(port)) {
-              ALLOWED_LOCALHOST_PORTS.delete(port);
-            }
-            tempAllowedPorts.delete(port);
-          }, TEMP_ALLOWLIST_TTL);
-        }
-      } else {
-        const isNewHost = !providerFetchHosts.has(host);
-        if (isNewHost) {
-          providerFetchHosts.add(host);
-        }
-        // Always track in tempAllowedHosts so rebuild can restore to providerFetchHosts
-        // even if the original persistent source (e.g. HTTPS provider) is removed mid-TTL
-        tempAllowedHosts.add(host);
-        if (parsed.protocol === "http:") {
-          providerHttpHosts.add(host);
-          if (!isHttpHostInProviderConfigs(host)) tempHttpHosts.add(host);
-        }
-        // Always (re-)schedule expiry timer to clean up temp entries
-        const existing = hostExpiryTimers.get(host);
-        if (existing) clearTimeout(existing);
-        const timer = setTimeout(() => {
-          hostExpiryTimers.delete(host);
-          // Check if host is still needed by a provider config or web search
-          const isWebSearchHost = webSearchApiHost && (() => {
-            try { return new URL(webSearchApiHost).hostname === host; } catch { return false; }
-          })();
-          if (!isHostInProviderConfigs(host) && !isWebSearchHost) {
-            providerFetchHosts.delete(host);
-            providerHttpHosts.delete(host);
-          } else if (!isHttpHostInProviderConfigs(host)) {
-            providerHttpHosts.delete(host);
-          }
-          tempAllowedHosts.delete(host);
-          tempHttpHosts.delete(host);
-        }, TEMP_ALLOWLIST_TTL);
-        hostExpiryTimers.set(host, timer);
-      }
-      return { ok: true };
-    } catch {
-      return { ok: false, error: "Invalid URL" };
-    }
-  });
-
-  // URL allowlist: only permit requests to known AI provider domains + HTTPS
-  const BUILTIN_FETCH_HOSTS = new Set([
-    "api.openai.com",
-    "api.anthropic.com",
-    "generativelanguage.googleapis.com",
-    "openrouter.ai",
-    // Web search providers
-    "api.tavily.com",
-    "api.exa.ai",
-    "api.bochaai.com",
-    "open.bigmodel.cn",
-  ]);
-  // Dynamically populated from configured provider baseURLs
-  const providerFetchHosts = new Set();
-  // Subset of providerFetchHosts where the provider baseURL explicitly uses http://
-  const providerHttpHosts = new Set();
-
-  /**
-   * Rebuild the dynamic host allowlist from the current providerConfigs.
-   * Called whenever providers are synced from the renderer.
-   */
-  function rebuildProviderFetchHosts() {
-    providerFetchHosts.clear();
-    providerHttpHosts.clear();
-    // Reset localhost ports to built-in defaults, then add provider-configured ones
-    ALLOWED_LOCALHOST_PORTS.clear();
-    for (const port of BUILTIN_LOCALHOST_PORTS) ALLOWED_LOCALHOST_PORTS.add(port);
-    // Re-add any still-active temporary entries so a sync doesn't wipe them
-    for (const host of tempAllowedHosts) providerFetchHosts.add(host);
-    for (const host of tempHttpHosts) providerHttpHosts.add(host);
-    for (const port of tempAllowedPorts) ALLOWED_LOCALHOST_PORTS.add(port);
-    for (const config of providerConfigs) {
-      if (!config.baseURL) continue;
-      try {
-        const parsed = new URL(config.baseURL);
-        const host = parsed.hostname;
-        // Skip localhost — handled separately via port allowlist
-        if (host === "localhost" || host === "127.0.0.1") {
-          const port = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
-          ALLOWED_LOCALHOST_PORTS.add(port);
-        } else {
-          providerFetchHosts.add(host);
-          if (parsed.protocol === "http:") providerHttpHosts.add(host);
-        }
-      } catch {
-        // Invalid URL in config — skip
-      }
-    }
-    // Add web search apiHost if configured (e.g. SearXNG self-hosted instance)
-    if (webSearchApiHost) {
-      try {
-        const parsed = new URL(webSearchApiHost);
-        const host = parsed.hostname;
-        if (host === "localhost" || host === "127.0.0.1") {
-          const port = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
-          ALLOWED_LOCALHOST_PORTS.add(port);
-        } else {
-          providerFetchHosts.add(host);
-        }
-      } catch {}
-    }
-  }
-
-  // Allowed localhost ports to prevent SSRF (Issue #9)
-  const BUILTIN_LOCALHOST_PORTS = [
-    11434,  // Ollama default
-    1234,   // LM Studio default
-    3000,   // Common local dev
-    3001,   // Common local dev
-    5000,   // Common local dev
-    5001,   // Common local dev
-    8000,   // Common local dev
-    8080,   // Common local dev
-    8888,   // Common local dev
-  ];
-  const ALLOWED_LOCALHOST_PORTS = new Set(BUILTIN_LOCALHOST_PORTS);
-  // RFC1918 / link-local / loopback / IPv6 private ranges — used by SSRF guard
-  function isPrivateIp(ip) {
-    if (!ip) return false;
-    // Strip IPv6 brackets that URL.hostname may include
-    const cleaned = ip.replace(/^\[|\]$/g, "");
-    if (cleaned === "::1" || cleaned === "0.0.0.0" || cleaned === "::") return true;
-    // IPv6 private ranges: fc00::/7 (unique local), fe80::/10 (link-local), ::ffff:127.x (mapped loopback)
-    const lower = cleaned.toLowerCase();
-    if (lower.startsWith("fc") || lower.startsWith("fd")) return true;   // fc00::/7
-    if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) return true; // fe80::/10
-    if (lower.startsWith("::ffff:")) {
-      // IPv4-mapped IPv6 — extract IPv4 portion and check
-      const v4 = lower.slice(7);
-      return isPrivateIp(v4);
-    }
-    // IPv4
-    const parts = cleaned.split(".");
-    if (parts.length === 4 && parts.every(p => /^\d+$/.test(p))) {
-      const [a, b] = parts.map(Number);
-      if (a === 10) return true;                           // 10.0.0.0/8
-      if (a === 172 && b >= 16 && b <= 31) return true;   // 172.16.0.0/12
-      if (a === 192 && b === 168) return true;             // 192.168.0.0/16
-      if (a === 127) return true;                          // 127.0.0.0/8
-      if (a === 169 && b === 254) return true;             // 169.254.0.0/16 link-local
-      if (a === 100 && b >= 64 && b <= 127) return true;   // 100.64.0.0/10 CGNAT (Tailscale etc.)
-      if (a === 0) return true;                            // 0.0.0.0/8
-    }
-    return false;
-  }
-
-  function isPrivateHost(hostname) {
-    if (hostname === "localhost") return true;
-    // metadata endpoints (AWS, GCP, Azure)
-    if (hostname === "metadata.google.internal") return true;
-    return isPrivateIp(hostname);
-  }
-
-  function isAllowedFetchUrl(urlString, skipHostCheck) {
-    try {
-      const parsed = new URL(urlString);
-      // Always block private/internal hosts when skipHostCheck is set (SSRF protection)
-      if (skipHostCheck) {
-        if (isPrivateHost(parsed.hostname)) return false;
-        // Require HTTPS for skipHostCheck requests
-        if (parsed.protocol !== "https:") return false;
-        return true;
-      }
-      // Allow localhost/127.0.0.1 only on known ports (e.g. Ollama) — normal fetch path only
-      if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
-        const port = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
-        return ALLOWED_LOCALHOST_PORTS.has(port);
-      }
-      // Only allow http: and https: schemes for remote hosts
-      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
-      // For HTTP, only allow providers explicitly configured with http:// or the web search apiHost
-      if (parsed.protocol === "http:") {
-        const isProviderHost = providerHttpHosts.has(parsed.hostname);
-        let isWebSearchHost = false;
-        if (webSearchApiHost) {
-          try { isWebSearchHost = new URL(webSearchApiHost).hostname === parsed.hostname; } catch { }
-        }
-        if (!isProviderHost && !isWebSearchHost) return false;
-      }
-      // Check built-in + provider-configured host allowlist
-      if (BUILTIN_FETCH_HOSTS.has(parsed.hostname)) return true;
-      if (providerFetchHosts.has(parsed.hostname)) return true;
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  // Start a streaming chat request (proxied through main process)
-  ipcMain.handle("netcatty:ai:chat:stream", async (event, { requestId, url, headers, body, providerId }) => {
-    // Validate IPC sender (Issue #17)
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    try {
-      // Inject real API key if providerId is given (replaces placeholder in headers/URL)
-      const patched = injectApiKeyIntoRequest(url, headers, providerId);
-      const resolvedUrl = patched.url;
-      const resolvedHeaders = patched.headers;
-
-      // Validate URL: only allow HTTP(S) schemes
-      try {
-        const parsed = new URL(resolvedUrl);
-        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-          return { ok: false, error: "Only HTTP(S) URLs are allowed" };
-        }
-      } catch {
-        return { ok: false, error: "Invalid URL" };
-      }
-
-      // Check URL against allowed hosts (same as netcatty:ai:fetch)
-      if (!isAllowedFetchUrl(resolvedUrl)) {
-        return { ok: false, error: "URL host is not in the allowed list" };
-      }
-
-      const skipTLS = shouldSkipTLSVerify(providerId);
-      const { statusCode, statusText } = await streamRequest(resolvedUrl, { method: "POST", headers: resolvedHeaders, body }, event, requestId, skipTLS);
-      return { ok: true, statusCode, statusText };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // Cancel an active stream
-  ipcMain.handle("netcatty:ai:chat:cancel", async (event, { requestId }) => {
-    if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const controller = activeStreams.get(requestId);
-    if (controller) {
-      controller.abort();
-      activeStreams.delete(requestId);
-      return true;
-    }
-    return false;
-  });
-
-  // Non-streaming request (for model listing, validation, etc.)
-  ipcMain.handle("netcatty:ai:fetch", async (event, { url, method, headers, body, providerId, skipHostCheck, followRedirects, skipTLSVerify }) => {
-    // Validate IPC sender — settings window needs this for model listing
-    if (!validateSenderOrSettings(event)) {
-      return { ok: false, status: 0, data: "", error: "Unauthorized IPC sender" };
-    }
-
-    // Inject real API key if providerId is given (replaces placeholder in headers/URL)
-    const patched = injectApiKeyIntoRequest(url, headers, providerId);
-    const resolvedUrl = patched.url;
-    // Also inject web search API key if placeholder is present
-    const resolvedHeaders = injectWebSearchKeyIntoHeaders(patched.headers);
-
-    // Validate URL: block non-HTTP(S) schemes and internal network access
-    try {
-      const parsed = new URL(resolvedUrl);
-      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-        return { ok: false, status: 0, data: "", error: "Only HTTP(S) URLs are allowed" };
-      }
-      // Block file:// and other dangerous schemes (already covered above)
-    } catch {
-      return { ok: false, status: 0, data: "", error: "Invalid URL" };
-    }
-
-    // Check URL against allowed hosts; skipHostCheck allows public HTTPS but still blocks private/internal
-    if (!isAllowedFetchUrl(resolvedUrl, !!skipHostCheck)) {
-      return { ok: false, status: 0, data: "", error: "URL host is not in the allowed list" };
-    }
-
-    const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10MB safety limit
-    const MAX_REDIRECTS = followRedirects ? 5 : 0;
-
-    function doFetch(fetchUrl, redirectsLeft) {
-      return new Promise((resolve) => {
-        const parsedUrl = new URL(fetchUrl);
-        const isHttps = parsedUrl.protocol === "https:";
-        const lib = isHttps ? https : http;
-
-        const fetchOpts = { method: method || "GET", headers: resolvedHeaders || {}, timeout: 30000 };
-        if ((skipTLSVerify || shouldSkipTLSVerify(providerId)) && isHttps) fetchOpts.rejectUnauthorized = false;
-        const req = lib.request(parsedUrl, fetchOpts,
-          (res) => {
-            // Handle redirects
-            if (redirectsLeft > 0 && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-              const location = new URL(res.headers.location, fetchUrl).href;
-              res.resume(); // drain the response
-              // Revalidate the redirect target hostname (blocks localhost/metadata etc.)
-              if (!isAllowedFetchUrl(location, !!skipHostCheck)) {
-                resolve({ ok: false, status: 0, data: "", error: "Redirect target is not allowed" });
-                return;
-              }
-              resolve(doFetch(location, redirectsLeft - 1));
-              return;
-            }
-            let data = "";
-            let totalSize = 0;
-            res.on("data", (chunk) => {
-              totalSize += chunk.length;
-              if (totalSize > MAX_RESPONSE_SIZE) {
-                req.destroy();
-                resolve({ ok: false, status: 0, data: "", error: "Response body exceeded maximum size (10MB)" });
-                return;
-              }
-              data += chunk.toString();
-            });
-            res.on("end", () => {
-              resolve({
-                ok: res.statusCode >= 200 && res.statusCode < 300,
-                status: res.statusCode,
-                data,
-              });
-            });
-          }
-        );
-
-        req.on("error", (err) => {
-          resolve({ ok: false, status: 0, data: "", error: err.message });
-        });
-        req.on("timeout", () => {
-          req.destroy();
-          resolve({ ok: false, status: 0, data: "", error: "Request timeout" });
-        });
-
-        if (body) req.write(body);
-        req.end();
-      });
-    }
-
-    return doFetch(resolvedUrl, MAX_REDIRECTS);
-  });
-
-  // Execute a command on a terminal session (for Catty Agent)
-  ipcMain.handle("netcatty:ai:exec", async (event, { sessionId, command, chatSessionId }) => {
-    // Validate IPC sender (Issue #17)
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    // Block execution in observer mode (Issue #11)
-    if (mcpServerBridge.getPermissionMode() === "observer") {
-      return { ok: false, error: "Execution blocked: permission mode is 'observer'" };
-    }
-    const session = sessions?.get(sessionId);
-    if (!session) {
-      return { ok: false, error: "Session not found" };
-    }
-
-    // Honor the per-session execution lock so this IPC path does not race with
-    // long-running background jobs started via terminal_start.
-    const busyErr = mcpServerBridge.getSessionBusyError?.(sessionId);
-    if (busyErr) return busyErr;
-    const reservation = mcpServerBridge.reserveSessionExecution?.(sessionId, "exec");
-    if (reservation && !reservation.ok) return reservation;
-    const sessionToken = reservation?.token;
-    const releaseLock = () => {
-      if (sessionToken) {
-        try { mcpServerBridge.releaseSessionExecution?.(sessionId, sessionToken); } catch {}
-      }
-    };
-
-    // Look up device type from metadata (set by renderer from Host.deviceType).
-    // Mosh sessions use a shell-backed PTY, so network device mode only applies to SSH/serial.
-    // Prefer session.protocol (runtime truth) over meta.protocol (renderer hint)
-    // because Mosh tabs report as protocol:"ssh" in metadata but "mosh" in session.
-    const meta = mcpServerBridge.getSessionMeta(sessionId, chatSessionId) || {};
-    const sessionProtocol = session.protocol || session.type || meta.protocol || "";
-    const isSshOrSerial = sessionProtocol === "ssh" || sessionProtocol === "serial";
-    const isNetworkDevice = (meta.deviceType === "network" && isSshOrSerial) || sessionProtocol === "serial";
-
-    // Shell blocklist is meaningless on network device CLIs (e.g. "shutdown"
-    // disables an interface on Cisco). Skip for network devices and serial sessions.
-    if (!isNetworkDevice) {
-      const safety = mcpServerBridge.checkCommandSafety(command);
-      if (safety.blocked) {
-        releaseLock();
-        return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
-      }
-    }
-
-    // Helper: ensure the session lock is released once the promise settles
-    // (or immediately on a synchronous error/early return).
-    const withLockRelease = (factory) => {
-      try {
-        const result = factory();
-        return Promise.resolve(result).finally(releaseLock);
-      } catch (err) {
-        releaseLock();
-        return { ok: false, error: err?.message || String(err) };
-      }
-    };
-
-    try {
-      if ((session.protocol === "local" || session.type === "local") && session.shellKind === "unknown") {
-        releaseLock();
-        return {
-          ok: false,
-          error: "AI execution is not supported for this local shell executable. Configure the local terminal to use bash/zsh/sh, fish, PowerShell/pwsh, or cmd.exe.",
-        };
-      }
-
-      const ptyStream = session.stream || session.pty || session.proc;
-
-      // Network devices (switches/routers) connected via SSH: use raw execution.
-      // Their vendor CLIs don't run a POSIX shell, so shell-wrapped commands fail.
-      if (isNetworkDevice && ptyStream && typeof ptyStream.write === "function") {
-        const { execViaRawPty } = require("./ai/ptyExec.cjs");
-        const timeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaRawPty(ptyStream, command, {
-          timeoutMs,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          chatSessionId,
-          encoding: "utf8", // SSH PTY streams use UTF-8, not latin1
-        }));
-      }
-
-      // Prefer PTY stream (visible in terminal)
-      if (ptyStream && typeof ptyStream.write === "function") {
-        const timeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaPty(ptyStream, command, {
-          stripMarkers: true,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          timeoutMs,
-          shellKind: session.shellKind,
-          chatSessionId,
-          expectedPrompt: session.lastIdlePrompt || "",
-          typedInput: true,
-          echoCommand: (rawCommand) => {
-            const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
-            safeSend(contents, "netcatty:data", {
-              sessionId,
-              data: `${rawCommand}\r\n`,
-              syntheticEcho: true,
-            });
-          },
-          // Catty Agent has no terminal_start fallback for long-running
-          // commands, so do NOT enforce a hard wall-clock timeout here.
-          // The inactivity timeout still applies, so genuinely hung
-          // processes are still terminated.
-        }));
-      }
-
-      // Network devices require an interactive PTY for raw command execution.
-      if (isNetworkDevice) {
-        releaseLock();
-        return { ok: false, error: "Network device session has no writable PTY stream for command execution" };
-      }
-
-      // Fallback: SSH exec channel (invisible to terminal)
-      const sshClient = session.sshClient || session.conn;
-      if (sshClient && typeof sshClient.exec === "function") {
-        const { execViaChannel } = require("./ai/ptyExec.cjs");
-        const channelTimeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaChannel(sshClient, command, {
-          timeoutMs: channelTimeoutMs,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          chatSessionId,
-        }));
-      }
-
-      // Serial port: raw command execution (no shell wrapping)
-      if (session.protocol === "serial" && session.serialPort && typeof session.serialPort.write === "function") {
-        const { execViaRawPty } = require("./ai/ptyExec.cjs");
-        const serialTimeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
-        return withLockRelease(() => execViaRawPty(session.serialPort, command, {
-          timeoutMs: serialTimeoutMs,
-          trackForCancellation: mcpServerBridge.activePtyExecs,
-          chatSessionId,
-          encoding: session.serialEncoding || "utf8",
-        }));
-      }
-
-      releaseLock();
-      return { ok: false, error: "No terminal stream or SSH client available for this session" };
-    } catch (err) {
-      releaseLock();
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // Cancel in-flight Catty Agent command executions for a chat session
-  ipcMain.handle("netcatty:ai:catty:cancel", async (event, { chatSessionId }) => {
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    mcpServerBridge.cancelPtyExecsForSession(chatSessionId);
-    void mcpServerBridge.cancelSftpOpsForSession?.(chatSessionId);
-    return { ok: true };
-  });
-
-  async function runCommand(command, args, options) {
-    return await new Promise((resolve, reject) => {
-      const child = spawn(command, args || [], {
-        stdio: ["ignore", "pipe", "pipe"],
-        cwd: options?.cwd || undefined,
-        env: options?.env || process.env,
-        shell: shouldUseShellForCommand(command),
-        windowsHide: true,
-      });
-
-      let stdout = "";
-      let stderr = "";
-      const MAX_BUFFER = 10 * 1024 * 1024; // 10MB
-
-      child.stdout.on("data", (chunk) => {
-        if (stdout.length < MAX_BUFFER) {
-          stdout += chunk.toString("utf8");
-        }
-      });
-
-      child.stderr.on("data", (chunk) => {
-        if (stderr.length < MAX_BUFFER) {
-          stderr += chunk.toString("utf8");
-        }
-      });
-
-      child.once("error", (error) => {
-        reject(error);
-      });
-
-      child.once("close", (exitCode) => {
-        resolve({
-          stdout: stripAnsi(stdout),
-          stderr: stripAnsi(stderr),
-          exitCode,
-        });
-      });
-    });
-  }
-
-  async function runCodexCli(args, options) {
-    const shellEnv = await getShellEnv();
-    const codexCliPath = resolveCliFromPath("codex", shellEnv) || "codex";
-    return await runCommand(codexCliPath, args, {
-      cwd: options?.cwd?.trim() || undefined,
-      env: shellEnv,
-    });
-  }
-
-  async function runCodexCliChecked(args, options) {
-    const result = await runCodexCli(args, options);
-    if (result.exitCode === 0) {
-      return result;
-    }
-
-    const errorText =
-      result.stderr.trim() ||
-      result.stdout.trim() ||
-      `Codex command failed with exit code ${result.exitCode ?? "unknown"}`;
-    throw new Error(errorText);
-  }
-
-  async function validateCodexChatGptAuth(options) {
-    const maxAgeMs = options?.maxAgeMs ?? 30000;
-    const now = Date.now();
-    const cached = getCodexValidationCache();
-    if (cached && now - cached.checkedAt < maxAgeMs) {
-      return cached;
-    }
-
-    const { createACPProvider } = require("@mcpc-tech/acp-ai-provider");
-    const shellEnv = await getShellEnv();
-    const resolvedCommand = resolveCodexAcpBinaryPath(shellEnv, electronModule);
-    if (!resolvedCommand) {
-      const result = { ok: false, checkedAt: now, error: "codex-acp binary not found", code: "ENOENT" };
-      setCodexValidationCache(result);
-      return result;
-    }
-    const provider = createACPProvider({
-      command: resolvedCommand,
-      env: shellEnv,
-      session: {
-        cwd: process.cwd(),
-        mcpServers: [],
-      },
-      authMethodId: "chatgpt",
-    });
-
-    try {
-      await provider.initSession();
-      const result = { ok: true, checkedAt: now, error: null };
-      setCodexValidationCache(result);
-      return result;
-    } catch (error) {
-      const normalized = extractCodexError(error);
-      const result = {
-        ok: false,
-        checkedAt: now,
-        error: normalized.message,
-        code: normalized.code,
-      };
-      setCodexValidationCache(result);
-      return result;
-    } finally {
-      try {
-        if (typeof provider.forceCleanup === "function") {
-          provider.forceCleanup();
-        } else if (typeof provider.cleanup === "function") {
-          provider.cleanup();
-        }
-      } catch {
-        // Ignore validation cleanup failures.
-      }
-    }
-  }
-
-  function objectToPairs(value) {
-    if (!value || typeof value !== "object") return [];
-    return Object.entries(value)
-      .filter(([name, val]) => typeof name === "string" && typeof val === "string")
-      .map(([name, val]) => ({ name, value: val }));
-  }
-
-  function resolveCodexStdioEnv(transport, shellEnv) {
-    const merged = {};
-
-    if (transport?.env && typeof transport.env === "object") {
-      for (const [name, value] of Object.entries(transport.env)) {
-        if (typeof name === "string" && typeof value === "string") {
-          merged[name] = value;
-        }
-      }
-    }
-
-    if (Array.isArray(transport?.env_vars)) {
-      for (const envName of transport.env_vars) {
-        const value = shellEnv[envName] || process.env[envName];
-        if (typeof value === "string" && value.length > 0 && !merged[envName]) {
-          merged[envName] = value;
-        }
-      }
-    }
-
-    return merged;
-  }
-
-  function resolveCodexHttpHeaders(transport, shellEnv) {
-    const merged = {};
-
-    if (transport?.http_headers && typeof transport.http_headers === "object") {
-      for (const [name, value] of Object.entries(transport.http_headers)) {
-        if (typeof name === "string" && typeof value === "string") {
-          merged[name] = value;
-        }
-      }
-    }
-
-    if (transport?.env_http_headers && typeof transport.env_http_headers === "object") {
-      for (const [headerName, envName] of Object.entries(transport.env_http_headers)) {
-        if (typeof headerName !== "string" || typeof envName !== "string") continue;
-        const value = shellEnv[envName] || process.env[envName];
-        if (typeof value === "string" && value.length > 0) {
-          merged[headerName] = value;
-        }
-      }
-    }
-
-    const bearerEnvVar = typeof transport?.bearer_token_env_var === "string"
-      ? transport.bearer_token_env_var.trim()
-      : "";
-    if (bearerEnvVar && !merged.Authorization) {
-      const token = shellEnv[bearerEnvVar] || process.env[bearerEnvVar];
-      if (typeof token === "string" && token.trim()) {
-        merged.Authorization = `Bearer ${token.trim()}`;
-      }
-    }
-
-    return merged;
-  }
-
-  async function resolveCodexMcpSnapshot(cwd) {
-    const empty = { mcpServers: [], fingerprint: getCodexMcpFingerprint([]) };
-
-    try {
-      const result = await runCodexCliChecked(["mcp", "list", "--json"], {
-        cwd: cwd || undefined,
-      });
-      const parsed = JSON.parse(result.stdout);
-      if (!Array.isArray(parsed)) {
-        return empty;
-      }
-
-      const shellEnv = await getShellEnv();
-      const mcpServers = [];
-
-      for (const entry of parsed) {
-        if (!entry?.enabled || !entry?.transport || typeof entry?.name !== "string") {
-          continue;
-        }
-
-        const transportType = String(entry.transport.type || "").trim().toLowerCase();
-
-        if (transportType === "stdio") {
-          const command = String(entry.transport.command || "").trim();
-          if (!command) continue;
-          mcpServers.push({
-            name: entry.name,
-            type: "stdio",
-            command,
-            args: Array.isArray(entry.transport.args)
-              ? entry.transport.args.filter((arg) => typeof arg === "string")
-              : [],
-            env: objectToPairs(resolveCodexStdioEnv(entry.transport, shellEnv)),
-          });
-          continue;
-        }
-
-        if (transportType === "streamable_http" || transportType === "http" || transportType === "sse") {
-          const url = String(entry.transport.url || "").trim();
-          if (!url) continue;
-          mcpServers.push({
-            name: entry.name,
-            type: "http",
-            url,
-            headers: objectToPairs(resolveCodexHttpHeaders(entry.transport, shellEnv)),
-          });
-        }
-      }
-
-      return {
-        mcpServers,
-        fingerprint: getCodexMcpFingerprint(mcpServers),
-      };
-    } catch (err) {
-      console.error("[Codex] Failed to resolve MCP servers:", err?.message || err);
-      return empty;
-    }
-  }
-
-  // Discover external agents from PATH, plus bundled ACP binaries if present.
-  ipcMain.handle("netcatty:ai:agents:discover", async (event) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const agents = [];
-    const knownAgents = [
-      {
-        command: "claude",
-        name: "Claude Code",
-        icon: "claude",
-        description: "Anthropic's agentic coding assistant",
-        acpCommand: "claude-agent-acp",
-        acpArgs: [],
-        args: ["-p", "--output-format", "text", "{prompt}"],
-        resolveAcp: resolveClaudeAcpBinaryPath,
-      },
-      {
-        command: "codex",
-        name: "Codex CLI",
-        icon: "openai",
-        description: "OpenAI's coding agent",
-        acpCommand: "codex-acp",
-        acpArgs: [],
-        args: ["exec", "--full-auto", "--json", "{prompt}"],
-        resolveAcp: resolveCodexAcpBinaryPath,
-      },
-      {
-        command: "copilot",
-        name: "GitHub Copilot CLI",
-        icon: "copilot",
-        description: "GitHub's coding agent CLI",
-        acpCommand: "copilot",
-        acpArgs: ["--acp", "--stdio"],
-        args: ["-p", "{prompt}"],
-      },
-    ];
-
-    const shellEnv = await getShellEnv();
-    const seenPaths = new Set();
-
-    for (const agent of knownAgents) {
-      let resolvedPath = resolveCliFromPath(agent.command, shellEnv);
-
-      // If the base command is not on PATH, check whether the bundled ACP
-      // binary is available — the agent can still work via ACP without the
-      // standalone CLI installed.
-      // resolveClaudeAcpBinaryPath returns { command, prependArgs },
-      // resolveCodexAcpBinaryPath returns a plain string.
-      let versionCommand = null;
-      let versionPrependArgs = [];
-      if (!resolvedPath && agent.resolveAcp) {
-        const result = agent.resolveAcp(shellEnv, electronModule);
-        if (typeof result === "string") {
-          if (result && result !== agent.acpCommand && existsSync(result)) {
-            resolvedPath = result;
-          }
-        } else if (result?.command) {
-          // On Windows the command may be `node` with the script in prependArgs.
-          // Use the script path for display/dedup so the UI shows the actual
-          // agent rather than the Node binary.
-          const scriptPath = result.prependArgs?.[0];
-          const displayPath = scriptPath || result.command;
-          if (displayPath !== agent.acpCommand && existsSync(displayPath)) {
-            resolvedPath = displayPath;
-            if (scriptPath) {
-              versionCommand = result.command;
-              versionPrependArgs = result.prependArgs;
-            }
-          }
-        }
-      }
-
-      if (!resolvedPath || seenPaths.has(resolvedPath)) {
-        continue;
-      }
-
-      let version = "";
-      try {
-        // When the agent is invoked via Node (Windows), probe version with
-        // the full command (e.g. `node /path/to/dist/index.js --version`).
-        const probeCmd = versionCommand || resolvedPath;
-        const probeArgs = [...versionPrependArgs, "--version"];
-        const result = await runCommand(probeCmd, probeArgs, { env: shellEnv });
-        version = (result.stdout || result.stderr || "").trim().split("\n")[0];
-      } catch {
-        // --version failed: not a valid CLI executable (e.g. .app bundle)
-        continue;
-      }
-
-      if (!version) continue;
-
-      const { resolveAcp: _unused, ...agentInfo } = agent;
-      agents.push({
-        ...agentInfo,
-        acpCommand: agent.command === "copilot" ? resolvedPath : agentInfo.acpCommand,
-        path: resolvedPath,
-        version,
-        available: true,
-      });
-      seenPaths.add(resolvedPath);
-    }
-
-    return agents;
-  });
-
-  // Resolve a CLI binary path (auto-detect or validate custom path)
-  ipcMain.handle("netcatty:ai:resolve-cli", async (event, { command, customPath }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const shellEnv = await getShellEnv();
-    let resolvedPath = null;
-
-    if (customPath) {
-      // Normalize Windows shim paths like `codex` -> `codex.cmd` when present.
-      // Fall back to PATH search if the stored path no longer exists
-      // (e.g. CLI reinstalled to a different location).
-      resolvedPath = normalizeCliPathForPlatform(customPath) || resolveCliFromPath(command, shellEnv);
-    } else {
-      resolvedPath = resolveCliFromPath(command, shellEnv);
-    }
-
-    if (!resolvedPath) {
-      return { path: null, version: null, available: false };
-    }
-
-    let version = "";
-    try {
-      const result = await runCommand(resolvedPath, ["--version"], { env: shellEnv });
-      version = (result.stdout || result.stderr || "").trim().split("\n")[0];
-    } catch {
-      // --version failed: not a valid CLI executable
-      return { path: resolvedPath, version: null, available: false };
-    }
-
-    if (!version) {
-      return { path: resolvedPath, version: null, available: false };
-    }
-
-    return { path: resolvedPath, version, available: true };
-  });
-
-  ipcMain.handle("netcatty:ai:codex:get-integration", async (event) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    try {
-      const result = await runCodexCli(["login", "status"]);
-      const rawOutput = [result.stdout, result.stderr]
-        .filter((chunk) => chunk.trim().length > 0)
-        .join("\n")
-        .trim();
-      let state = normalizeCodexIntegrationState(rawOutput);
-      let effectiveRawOutput = rawOutput;
-
-      if (state === "connected_chatgpt") {
-        const validation = await validateCodexChatGptAuth({ maxAgeMs: 10000 });
-        if (!validation.ok) {
-          if (isCodexAuthError(validation)) {
-            try {
-              await runCodexCli(["logout"]);
-            } catch {
-              // Ignore logout failures; we still want to surface the invalid state.
-            }
-            invalidateCodexValidationCache();
-            state = "not_logged_in";
-          } else {
-            state = "unknown";
-          }
-
-          effectiveRawOutput = [
-            rawOutput,
-            "",
-            "ChatGPT auth validation failed:",
-            validation.error || "Unknown validation error",
-          ].join("\n").trim();
-        }
-      }
-
-      return {
-        state,
-        isConnected: state === "connected_chatgpt" || state === "connected_api_key",
-        rawOutput: effectiveRawOutput,
-        exitCode: result.exitCode,
-      };
-    } catch (err) {
-      return {
-        state: "unknown",
-        isConnected: false,
-        rawOutput: err?.message || String(err),
-        exitCode: null,
-      };
-    }
-  });
-
-  ipcMain.handle("netcatty:ai:codex:start-login", async (event) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const existingSession = getActiveCodexLoginSession();
-    if (existingSession) {
-      return { ok: true, session: toCodexLoginSessionResponse(existingSession) };
-    }
-
-    try {
-      const shellEnv = await getShellEnv();
-      const codexCliPath = resolveCliFromPath("codex", shellEnv) || "codex";
-      const sessionId = `codex_login_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const child = spawn(codexCliPath, ["login"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: shellEnv,
-        shell: shouldUseShellForCommand(codexCliPath),
-        windowsHide: true,
-      });
-
-      const session = {
-        id: sessionId,
-        process: child,
-        state: "running",
-        output: "",
-        url: null,
-        error: null,
-        exitCode: null,
-      };
-
-      const handleChunk = (chunk) => {
-        appendCodexLoginOutput(session, chunk.toString("utf8"));
-      };
-
-      child.stdout.on("data", handleChunk);
-      child.stderr.on("data", handleChunk);
-
-      child.once("error", (error) => {
-        session.state = "error";
-        session.error = `[codex] Failed to start login flow: ${error.message}`;
-        session.process = null;
-      });
-
-      child.once("close", (exitCode) => {
-        session.exitCode = exitCode;
-        session.process = null;
-
-        if (session.state === "cancelled") {
-          return;
-        }
-
-        if (exitCode === 0) {
-          session.state = "success";
-          session.error = null;
-        } else {
-          session.state = "error";
-          session.error = session.error || `Codex login exited with code ${exitCode ?? "unknown"}`;
-        }
-      });
-
-      codexLoginSessions.set(sessionId, session);
-      invalidateCodexValidationCache();
-      return { ok: true, session: toCodexLoginSessionResponse(session) };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  ipcMain.handle("netcatty:ai:codex:get-login-session", async (event, { sessionId }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const session = codexLoginSessions.get(sessionId);
-    if (!session) {
-      return { ok: false, error: "Codex login session not found" };
-    }
-    return { ok: true, session: toCodexLoginSessionResponse(session) };
-  });
-
-  ipcMain.handle("netcatty:ai:codex:cancel-login", async (event, { sessionId }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const session = codexLoginSessions.get(sessionId);
-    if (!session) {
-      return { ok: true, found: false };
-    }
-
-    session.state = "cancelled";
-    session.error = null;
-    if (session.process && !session.process.killed) {
-      session.process.kill("SIGTERM");
-    }
-
-    invalidateCodexValidationCache();
-    return { ok: true, found: true, session: toCodexLoginSessionResponse(session) };
-  });
-
-  ipcMain.handle("netcatty:ai:codex:logout", async (event) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    try {
-      const logoutResult = await runCodexCli(["logout"]);
-      invalidateCodexValidationCache();
-      const statusResult = await runCodexCli(["login", "status"]);
-      const rawOutput = [statusResult.stdout, statusResult.stderr]
-        .filter((chunk) => chunk.trim().length > 0)
-        .join("\n")
-        .trim();
-      const state = normalizeCodexIntegrationState(rawOutput);
-
-      return {
-        ok: true,
-        state,
-        isConnected: state === "connected_chatgpt" || state === "connected_api_key",
-        rawOutput,
-        logoutOutput: [logoutResult.stdout, logoutResult.stderr]
-          .filter((chunk) => chunk.trim().length > 0)
-          .join("\n")
-          .trim(),
-      };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // Known agent command names (must match knownAgents in discover handler)
-  const ALLOWED_AGENT_COMMANDS = new Set([
-    "claude", "claude-agent-acp",
-    "codex", "codex-acp",
-    "copilot",
-  ]);
-
-  // Spawn an external agent process
-  ipcMain.handle("netcatty:ai:agent:spawn", async (event, { agentId, command, args, env, closeStdin }) => {
-    // Validate IPC sender (Issue #17)
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    // Validate command against known agent binaries (Issue #1)
-    if (typeof command !== "string" || !command.trim()) {
-      return { ok: false, error: "Invalid command" };
-    }
-    // Reject absolute/relative paths — only bare command names allowed
-    if (command.includes("/") || command.includes("\\")) {
-      return { ok: false, error: "Absolute or relative paths are not allowed. Use a known agent command name." };
-    }
-    if (!ALLOWED_AGENT_COMMANDS.has(command)) {
-      return { ok: false, error: `Unknown agent command: ${command}. Allowed: ${[...ALLOWED_AGENT_COMMANDS].join(", ")}` };
-    }
-    if (agentProcesses.has(agentId)) {
-      return { ok: false, error: "Agent already running" };
-    }
-    if (agentProcesses.size >= MAX_CONCURRENT_AGENTS) {
-      return { ok: false, error: `Concurrent agent limit reached (max ${MAX_CONCURRENT_AGENTS})` };
-    }
-
-    try {
-      const shellEnv = await getShellEnv();
-      const stdinMode = closeStdin ? "ignore" : "pipe";
-
-      // Blocklist of dangerous environment variable names that could be used for code injection
-      const DANGEROUS_ENV_KEYS = new Set([
-        "LD_PRELOAD", "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
-        "NODE_OPTIONS", "ELECTRON_RUN_AS_NODE",
-        "PYTHONPATH", "RUBYLIB", "PERL5LIB",
-        "BASH_ENV", "ENV", "CDPATH", "PROMPT_COMMAND",
-      ]);
-
-      // Also block BASH_FUNC_* prefix keys (Issue #16)
-      const isDangerousEnvKey = (k) =>
-        DANGEROUS_ENV_KEYS.has(k) || k.startsWith("BASH_FUNC_");
-
-      // Filter dangerous keys from user-provided env before merging
-      const filteredUserEnv = {};
-      if (env && typeof env === "object") {
-        for (const [k, v] of Object.entries(env)) {
-          if (!isDangerousEnvKey(k)) {
-            filteredUserEnv[k] = v;
-          }
-        }
-      }
-
-      // Only pass safe environment variables to agent processes
-      const SAFE_ENV_KEYS = new Set([
-        "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
-        "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
-        // NODE_PATH omitted: can redirect module resolution (code injection vector)
-        // CODEX_API_KEY omitted: injected separately at spawn site for Codex only
-      ]);
-      const safeEnv = {};
-      for (const [k, v] of Object.entries(shellEnv)) {
-        if (SAFE_ENV_KEYS.has(k) || k.startsWith("LC_") || k.startsWith("XDG_")) {
-          safeEnv[k] = v;
-        }
-      }
-
-      const proc = spawn(command, args || [], {
-        stdio: [stdinMode, "pipe", "pipe"],
-        env: { ...filteredUserEnv, ...safeEnv },
-      });
-
-      proc.stdout.on("data", (data) => {
-        safeSend(event.sender, "netcatty:ai:agent:stdout", {
-          agentId,
-          data: data.toString(),
-        });
-      });
-
-      proc.stderr.on("data", (data) => {
-        safeSend(event.sender, "netcatty:ai:agent:stderr", {
-          agentId,
-          data: data.toString(),
-        });
-      });
-
-      proc.on("exit", (code) => {
-        agentProcesses.delete(agentId);
-        safeSend(event.sender, "netcatty:ai:agent:exit", { agentId, code });
-      });
-
-      proc.on("error", (err) => {
-        agentProcesses.delete(agentId);
-        safeSend(event.sender, "netcatty:ai:agent:error", {
-          agentId,
-          error: err.message,
-        });
-      });
-
-      agentProcesses.set(agentId, proc);
-
-      return { ok: true, pid: proc.pid };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // Send data to agent's stdin
-  ipcMain.handle("netcatty:ai:agent:write", async (event, { agentId, data }) => {
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    const proc = agentProcesses.get(agentId);
-    if (!proc) return { ok: false, error: "Agent not found" };
-    try {
-      if (!proc.stdin || proc.stdin.destroyed) {
-        return { ok: false, error: "stdin not available" };
-      }
-      proc.stdin.write(data);
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // Close agent's stdin (signal EOF)
-  ipcMain.handle("netcatty:ai:agent:close-stdin", async (event, { agentId }) => {
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    const proc = agentProcesses.get(agentId);
-    if (!proc) return { ok: false, error: "Agent not found" };
-    try {
-      if (proc.stdin && !proc.stdin.destroyed) {
-        proc.stdin.end();
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
-
-  // ── MCP Server session metadata ──
-
-  ipcMain.handle("netcatty:ai:mcp:update-sessions", async (event, { sessions: sessionList, chatSessionId }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    mcpServerBridge.updateSessionMetadata(sessionList || [], chatSessionId);
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:mcp:set-command-blocklist", async (event, { blocklist }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    // Validate: must be an array of strings, each a valid regex pattern
-    if (!Array.isArray(blocklist)) {
-      return { ok: false, error: "blocklist must be an array" };
-    }
-    const validPatterns = [];
-    for (const pattern of blocklist) {
-      if (typeof pattern !== "string") continue;
-      try {
-        new RegExp(pattern, "i"); // Validate regex
-        validPatterns.push(pattern);
-      } catch {
-        // Skip invalid regex patterns silently
-      }
-    }
-    mcpServerBridge.setCommandBlocklist(validPatterns);
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:mcp:set-command-timeout", async (event, { timeout }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const value = Number(timeout);
-    if (!Number.isFinite(value) || value < 1 || value > 3600) {
-      return { ok: false, error: "timeout must be a number between 1 and 3600" };
-    }
-    mcpServerBridge.setCommandTimeout(value);
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:mcp:set-max-iterations", async (event, { maxIterations }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const value = Number(maxIterations);
-    if (!Number.isFinite(value) || value < 1 || value > 100) {
-      return { ok: false, error: "maxIterations must be a number between 1 and 100" };
-    }
-    mcpServerBridge.setMaxIterations(value);
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:mcp:set-permission-mode", async (event, { mode }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const validModes = ["observer", "confirm", "autonomous"];
-    if (!validModes.includes(mode)) {
-      return { ok: false, error: `mode must be one of: ${validModes.join(", ")}` };
-    }
-    mcpServerBridge.setPermissionMode(mode);
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:mcp:set-tool-integration-mode", async (event, { mode }) => {
-    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const validModes = ["mcp", "skills"];
-    if (!validModes.includes(mode)) {
-      return { ok: false, error: `mode must be one of: ${validModes.join(", ")}` };
-    }
-    setToolIntegrationMode(mode);
-    return { ok: true };
-  });
-
-  // ── MCP Approval response (renderer → main) ──
-  ipcMain.handle("netcatty:ai:mcp:approval-response", async (event, { approvalId, approved }) => {
-    if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    mcpServerBridge.resolveApprovalFromRenderer(approvalId, approved);
-    return { ok: true };
-  });
-
-  // ── ACP (Agent Client Protocol) streaming ──
-
-  ipcMain.handle("netcatty:ai:acp:list-models", async (event, { acpCommand, acpArgs, cwd, providerId, chatSessionId }) => {
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-
-    let provider = null;
-    let copilotConfigInfo = null;
-    try {
-      const { createACPProvider } = require("@mcpc-tech/acp-ai-provider");
-      const shellEnv = await getShellEnv();
-      const sessionCwd = cwd || process.cwd();
-      const isCodexAgent = matchesAgentCommand(acpCommand, "codex-acp");
-      const isClaudeAgent = matchesAgentCommand(acpCommand, "claude-agent-acp");
-      const isCopilotAgent = matchesAgentCommand(acpCommand, "copilot");
-      const agentLabel = isCodexAgent ? "codex" : isClaudeAgent ? "claude" : isCopilotAgent ? "copilot" : acpCommand;
-
-      const resolvedProvider = providerId ? resolveProviderApiKey(providerId) : null;
-      const apiKey = resolvedProvider?.apiKey || undefined;
-
-      const agentEnv = withCliDiscoveryEnv({ ...shellEnv });
-      if (isCodexAgent && apiKey) {
-        agentEnv.CODEX_API_KEY = apiKey;
-      }
-      if (isCodexAgent && resolvedProvider?.provider?.baseURL) {
-        agentEnv.OPENAI_BASE_URL = resolvedProvider.provider.baseURL;
-      }
-      if (isClaudeAgent && apiKey) {
-        agentEnv.ANTHROPIC_API_KEY = apiKey;
-      }
-      if (isClaudeAgent && resolvedProvider?.provider?.baseURL) {
-        agentEnv.ANTHROPIC_BASE_URL = resolvedProvider.provider.baseURL;
-      }
-
-      if (isCopilotAgent) {
-        copilotConfigInfo = prepareCopilotHome(shellEnv, [], chatSessionId || `models_${Date.now()}`);
-        agentEnv.COPILOT_HOME = copilotConfigInfo.copilotHome;
-      }
-
-      const claudeAcp = isClaudeAgent ? resolveClaudeAcpBinaryPath(shellEnv, electronModule) : null;
-      const resolvedCommand = isCodexAgent
-        ? resolveCodexAcpBinaryPath(shellEnv, electronModule)
-        : claudeAcp
-          ? claudeAcp.command
-          : acpCommand;
-      if (!resolvedCommand) {
-        return { ok: false, models: [], error: `${agentLabel} binary not found` };
-      }
-      const resolvedArgs = claudeAcp
-        ? [...claudeAcp.prependArgs, ...(acpArgs || [])]
-        : acpArgs || [];
-
-      provider = createACPProvider({
-        command: resolvedCommand,
-        args: resolvedArgs,
-        env: agentEnv,
-        session: {
-          cwd: sessionCwd,
-          mcpServers: [],
-        },
-        ...(isCodexAgent
-          ? { authMethodId: apiKey ? "codex-api-key" : "chatgpt" }
-          : isCopilotAgent
-            ? { authMethodId: "copilot-login" }
-            : {}),
-      });
-
-      const sessionInfo = await provider.initSession();
-      const availableModels = Array.isArray(sessionInfo?.models?.availableModels)
-        ? sessionInfo.models.availableModels
-        : [];
-
-      if (isCopilotAgent) {
-        logAcpDebug(agentLabel, "Fetched session models", {
-          chatSessionId: chatSessionId || null,
-          currentModelId: sessionInfo?.models?.currentModelId || null,
-          availableModelIds: availableModels.map((modelInfo) => modelInfo?.modelId).filter(Boolean),
-          copilotHome: copilotConfigInfo?.copilotHome || null,
-          copilotMcpConfigPath: copilotConfigInfo?.configPath || null,
-        });
-      }
-
-      return {
-        ok: true,
-        currentModelId: sessionInfo?.models?.currentModelId || null,
-        models: availableModels.map((modelInfo) => ({
-          id: modelInfo?.modelId,
-          name: modelInfo?.name || modelInfo?.displayName || modelInfo?.modelId,
-          description: modelInfo?.description || undefined,
-        })).filter((modelInfo) => Boolean(modelInfo.id)),
-      };
-    } catch (err) {
-      console.error("[ACP] Failed to list models:", err?.message || err);
-      return { ok: false, error: err?.message || String(err) };
-    } finally {
-      try {
-        cleanupAcpProviderInstance(provider, chatSessionId || "transient-model-list");
-      } catch {
-        // Ignore cleanup failures for transient model-discovery providers.
-      }
-      // Clean up transient COPILOT_HOME created for model listing
-      if (copilotConfigInfo?.copilotHome) {
-        try {
-          fs.rmSync(copilotConfigInfo.copilotHome, { recursive: true, force: true });
-        } catch { /* best-effort */ }
-      }
-    }
-  });
-
-  ipcMain.handle("netcatty:ai:acp:stream", async (event, { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession }) => {
-    // Validate IPC sender (Issue #17)
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    let abortController = null;
-    try {
-      const existingRun = acpChatRuns.get(chatSessionId);
-      if (existingRun && existingRun.requestId !== requestId) {
-        existingRun.cancelRequested = true;
-        const existingController = acpActiveStreams.get(existingRun.requestId);
-        if (existingController) {
-          existingController.abort();
-          acpActiveStreams.delete(existingRun.requestId);
-        }
-        acpRequestSessions.delete(existingRun.requestId);
-        cleanupAcpProvider(chatSessionId);
-      }
-
-      mcpServerBridge.setChatSessionCancelled?.(chatSessionId, false);
-      abortController = new AbortController();
-      acpActiveStreams.set(requestId, abortController);
-      acpRequestSessions.set(requestId, chatSessionId);
-      acpChatRuns.set(chatSessionId, { requestId, cancelRequested: false });
-
-      const consumePendingStartupCancel = () => {
-        if (!acpPendingCancelRequests.has(requestId)) return false;
-        acpPendingCancelRequests.delete(requestId);
-        abortController?.abort();
-        return true;
-      };
-
-      const shouldAbortStartup = () =>
-        Boolean(abortController?.signal?.aborted || consumePendingStartupCancel());
-
-      const { createACPProvider } = require("@mcpc-tech/acp-ai-provider");
-      const { streamText, stepCountIs } = require("ai");
-
-      const shellEnv = await getShellEnv();
-      if (shouldAbortStartup()) return { ok: true };
-      const sessionCwd = cwd || process.cwd();
-      const isCodexAgent = matchesAgentCommand(acpCommand, "codex-acp");
-      const isClaudeAgent = matchesAgentCommand(acpCommand, "claude-agent-acp");
-      const isCopilotAgent = matchesAgentCommand(acpCommand, "copilot");
-      const agentLabel = isCodexAgent ? "codex" : isClaudeAgent ? "claude" : isCopilotAgent ? "copilot" : acpCommand;
-      const effectiveToolIntegrationMode = normalizeToolIntegrationMode(toolIntegrationMode);
-      debugMcpLog("ACP request start", {
-        requestId,
-        chatSessionId,
-        acpCommand,
-        acpArgs,
-        model,
-        providerId,
-        sessionCwd,
-        isCodexAgent,
-        isClaudeAgent,
-        toolIntegrationMode: effectiveToolIntegrationMode,
-      });
-
-      // Resolve API key from providerId (decrypted in main process only)
-      const resolvedProvider = providerId ? resolveProviderApiKey(providerId) : null;
-      const apiKey = resolvedProvider?.apiKey || undefined;
-
-      if (isCodexAgent && !apiKey) {
-        const validation = await validateCodexChatGptAuth({ maxAgeMs: 10000 });
-        if (shouldAbortStartup()) return { ok: true };
-        if (!validation.ok) {
-          if (isCodexAuthError(validation)) {
-            try {
-              await runCodexCli(["logout"]);
-            } catch {
-              // Ignore logout failures during recovery.
-            }
-            invalidateCodexValidationCache();
-          }
-
-          safeSend(event.sender, "netcatty:ai:acp:error", {
-            requestId,
-            error: `Codex ChatGPT login is stale or invalid. Reconnect Codex in Settings -> AI.\n\nDetails: ${validation.error || "Unknown authentication error"}`,
-          });
-          return { ok: false, error: validation.error || "Codex authentication validation failed" };
-        }
-      }
-
-      const authFingerprint = isCodexAgent
-        ? getCodexAuthFingerprint(apiKey)
-        : isClaudeAgent
-          ? getCodexAuthFingerprint(apiKey + (resolvedProvider?.provider?.baseURL || ""))
-          : null;
-      const mcpSnapshot = isCodexAgent
-        ? await resolveCodexMcpSnapshot(sessionCwd)
-        : { mcpServers: [], fingerprint: getCodexMcpFingerprint([]) };
-      if (shouldAbortStartup()) return { ok: true };
-
-      setToolIntegrationMode(effectiveToolIntegrationMode);
-      if (effectiveToolIntegrationMode === "skills") {
-        try {
-          await ensureSkillsCliHost();
-        } catch (err) {
-          const message = err?.message || String(err);
-          safeSend(event.sender, "netcatty:ai:acp:error", {
-            requestId,
-            error: `Failed to initialize Netcatty Skills + CLI bridge.\n\nDetails: ${message}`,
-          });
-          return { ok: false, error: message };
-        }
-      }
-
-      // Inject Netcatty MCP server for scoped terminal-session access only when
-      // the user selected MCP mode. Skills mode uses the Netcatty CLI instead.
-      if (effectiveToolIntegrationMode === "mcp") {
-        try {
-          const mcpPort = await mcpServerBridge.getOrCreateHost();
-          const scopedIds = mcpServerBridge.getScopedSessionIds(chatSessionId);
-          const netcattyMcpConfig = mcpServerBridge.buildMcpServerConfig(mcpPort, scopedIds, chatSessionId);
-          mcpSnapshot.mcpServers.push(netcattyMcpConfig);
-          debugMcpLog("Injected Netcatty MCP server", {
-            requestId,
-            chatSessionId,
-            mcpPort,
-            scopedIds,
-            mcpServerNames: mcpSnapshot.mcpServers.map(server => server.name),
-          });
-          if (isCopilotAgent) {
-            logAcpDebug(agentLabel, "Injected Netcatty MCP server into session", {
-              chatSessionId,
-              scopedIds,
-              injectedServer: summarizeMcpServersForDebug([netcattyMcpConfig])[0],
-            });
-          }
-        } catch (err) {
-          console.error("[ACP] Failed to inject Netcatty MCP server:", err?.message || err);
-        }
-      }
-      if (shouldAbortStartup()) return { ok: true };
-
-      // Recalculate fingerprint after injection
-      mcpSnapshot.fingerprint = getCodexMcpFingerprint(mcpSnapshot.mcpServers);
-
-      const currentPermissionMode = mcpServerBridge.getPermissionMode();
-      let providerEntry = acpProviders.get(chatSessionId);
-      const shouldReuseProvider = Boolean(
-        providerEntry &&
-        providerEntry.acpCommand === acpCommand &&
-        providerEntry.cwd === sessionCwd &&
-        providerEntry.authFingerprint === authFingerprint &&
-        providerEntry.mcpFingerprint === mcpSnapshot.fingerprint &&
-        providerEntry.permissionMode === currentPermissionMode,
-      );
-
-      if (!shouldReuseProvider) {
-        const resumeSessionId = providerEntry?.provider?.getSessionId?.() || existingSessionId || undefined;
-        cleanupAcpProvider(chatSessionId);
-
-        const agentEnv = withCliDiscoveryEnv({ ...shellEnv });
-        if (isCodexAgent && apiKey) {
-          agentEnv.CODEX_API_KEY = apiKey;
-        }
-        if (isCodexAgent && resolvedProvider?.provider?.baseURL) {
-          agentEnv.OPENAI_BASE_URL = resolvedProvider.provider.baseURL;
-        }
-        if (isClaudeAgent && apiKey) {
-          agentEnv.ANTHROPIC_API_KEY = apiKey;
-        }
-        if (isClaudeAgent && resolvedProvider?.provider?.baseURL) {
-          agentEnv.ANTHROPIC_BASE_URL = resolvedProvider.provider.baseURL;
-        }
-        let copilotConfigInfo = null;
-        if (isCopilotAgent) {
-          copilotConfigInfo = prepareCopilotHome(shellEnv, mcpSnapshot.mcpServers, chatSessionId);
-          agentEnv.COPILOT_HOME = copilotConfigInfo.copilotHome;
-        }
-
-        const claudeAcp = isClaudeAgent ? resolveClaudeAcpBinaryPath(shellEnv, electronModule) : null;
-        const resolvedCommand = isCodexAgent
-          ? resolveCodexAcpBinaryPath(shellEnv, electronModule)
-          : claudeAcp
-            ? claudeAcp.command
-            : acpCommand;
-        if (!resolvedCommand) {
-          throw new Error(`${agentLabel} binary not found`);
-        }
-        const resolvedArgs = claudeAcp
-          ? [...claudeAcp.prependArgs, ...(acpArgs || [])]
-          : acpArgs || [];
-        const sessionMcpServers = isCopilotAgent ? [] : mcpSnapshot.mcpServers;
-
-        const provider = createACPProvider({
-          command: resolvedCommand,
-          args: resolvedArgs,
-          env: agentEnv,
-          session: {
-            cwd: sessionCwd,
-            mcpServers: sessionMcpServers,
-          },
-          ...(resumeSessionId ? { existingSessionId: resumeSessionId } : {}),
-          ...(isCodexAgent
-            ? { authMethodId: apiKey ? "codex-api-key" : "chatgpt" }
-            : isCopilotAgent
-              ? { authMethodId: "copilot-login" }
-            : {}),
-          persistSession: true,
-        });
-        debugMcpLog("Created ACP provider", {
-          requestId,
-          chatSessionId,
-          resolvedCommand,
-          resolvedArgs,
-          mcpServerNames: mcpSnapshot.mcpServers.map(server => server.name),
-          authMethodId: isCodexAgent ? (apiKey ? "codex-api-key" : "chatgpt") : null,
-        });
-
-        if (isCopilotAgent) {
-          logAcpDebug(agentLabel, "Creating ACP provider", {
-            requestId,
-            chatSessionId,
-            cwd: sessionCwd,
-            resolvedCommand,
-            resolvedArgs,
-            sessionMcpServers: summarizeMcpServersForDebug(sessionMcpServers),
-            copilotHome: copilotConfigInfo?.copilotHome || null,
-            copilotMcpConfigPath: copilotConfigInfo?.configPath || null,
-            copilotMcpServerNames: copilotConfigInfo?.serverNames || [],
-          });
-        }
-
-        providerEntry = {
-          provider,
-          acpCommand,
-          cwd: sessionCwd,
-          authFingerprint,
-          mcpFingerprint: mcpSnapshot.fingerprint,
-          permissionMode: currentPermissionMode,
-          historyReplayFallback: false,
-        };
-        acpProviders.set(chatSessionId, providerEntry);
-      }
-      let modelInstance = providerEntry.provider.languageModel(model || undefined);
-      try {
-        await providerEntry.provider.initSession(providerEntry.provider.tools);
-        debugMcpLog("provider.initSession ok", {
-          requestId,
-          chatSessionId,
-          providerSessionId: providerEntry.provider.getSessionId?.() || null,
-        });
-        if (isCopilotAgent) {
-          logAcpDebug(agentLabel, "ACP session initialized", {
-            requestId,
-            chatSessionId,
-            providerSessionId: providerEntry.provider.getSessionId?.() || null,
-            toolNames: Object.keys(providerEntry.provider.tools || {}),
-          });
-        }
-        if (shouldAbortStartup()) return { ok: true };
-      } catch (err) {
-        debugMcpLog("provider.initSession error", {
-          requestId,
-          chatSessionId,
-          message: err?.message || String(err),
-        });
-        const attemptedResumeSessionId = providerEntry.provider?.getSessionId?.() || existingSessionId;
-        if (!attemptedResumeSessionId || !shouldRetryFreshSession(err)) {
-          throw err;
-        }
-
-        cleanupAcpProvider(chatSessionId);
-
-        const fallbackClaudeAcp = isClaudeAgent ? resolveClaudeAcpBinaryPath(shellEnv, electronModule) : null;
-        const fallbackCommand = isCodexAgent
-          ? resolveCodexAcpBinaryPath(shellEnv, electronModule)
-          : fallbackClaudeAcp
-            ? fallbackClaudeAcp.command
-            : acpCommand;
-        if (!fallbackCommand) {
-          throw new Error(`${agentLabel} binary not found`);
-        }
-        const fallbackProvider = createACPProvider({
-          command: fallbackCommand,
-          args: fallbackClaudeAcp
-            ? [...fallbackClaudeAcp.prependArgs, ...(acpArgs || [])]
-            : acpArgs || [],
-          env: (() => {
-            const fallbackEnv = withCliDiscoveryEnv(
-              isCodexAgent && apiKey ? { ...shellEnv, CODEX_API_KEY: apiKey } : { ...shellEnv },
-            );
-            if (isCodexAgent && resolvedProvider?.provider?.baseURL) {
-              fallbackEnv.OPENAI_BASE_URL = resolvedProvider.provider.baseURL;
-            }
-            if (isClaudeAgent && apiKey) {
-              fallbackEnv.ANTHROPIC_API_KEY = apiKey;
-            }
-            if (isClaudeAgent && resolvedProvider?.provider?.baseURL) {
-              fallbackEnv.ANTHROPIC_BASE_URL = resolvedProvider.provider.baseURL;
-            }
-            if (isCopilotAgent) {
-              const fallbackCopilotConfig = prepareCopilotHome(shellEnv, mcpSnapshot.mcpServers, chatSessionId);
-              fallbackEnv.COPILOT_HOME = fallbackCopilotConfig.copilotHome;
-            }
-            return fallbackEnv;
-          })(),
-          session: {
-            cwd: sessionCwd,
-            mcpServers: isCopilotAgent ? [] : mcpSnapshot.mcpServers,
-          },
-          ...(isCodexAgent
-            ? { authMethodId: apiKey ? "codex-api-key" : "chatgpt" }
-            : isCopilotAgent
-              ? { authMethodId: "copilot-login" }
-            : {}),
-          persistSession: true,
-        });
-
-        providerEntry = {
-          provider: fallbackProvider,
-          acpCommand,
-          cwd: sessionCwd,
-          authFingerprint,
-          mcpFingerprint: mcpSnapshot.fingerprint,
-          permissionMode: currentPermissionMode,
-          historyReplayFallback: Array.isArray(historyMessages) && historyMessages.length > 0,
-        };
-        acpProviders.set(chatSessionId, providerEntry);
-        modelInstance = providerEntry.provider.languageModel(model || undefined);
-        await providerEntry.provider.initSession(providerEntry.provider.tools);
-        debugMcpLog("fallback provider.initSession ok", {
-          requestId,
-          chatSessionId,
-          providerSessionId: providerEntry.provider.getSessionId?.() || null,
-        });
-        if (isCopilotAgent) {
-          logAcpDebug(agentLabel, "ACP session initialized after fallback", {
-            requestId,
-            chatSessionId,
-            providerSessionId: providerEntry.provider.getSessionId?.() || null,
-            toolNames: Object.keys(providerEntry.provider.tools || {}),
-          });
-        }
-        if (shouldAbortStartup()) return { ok: true };
-      }
-      const activeProviderSessionId = providerEntry.provider.getSessionId?.() || null;
-      if (activeProviderSessionId) {
-        safeSend(event.sender, "netcatty:ai:acp:event", {
-          requestId,
-          event: { type: "session-id", sessionId: activeProviderSessionId },
-        });
-      }
-
-      // Prepend context hint so the agent uses the configured Netcatty access mode.
-      const contextualPrompt = buildExternalAgentContextualPrompt({
-        mode: effectiveToolIntegrationMode,
-        prompt,
-        chatSessionId,
-        defaultTargetSession,
-      });
-
-      // Build message content: text + optional attachments
-      // ACP provider only supports image/* and audio/* inline via `type: "file"`.
-      // For other file types (PDF, text, etc.), tell the agent the original file
-      // path so it can read it directly — ACP agents have local file access.
-      function buildMessageContent(text, attachments) {
-        if (!Array.isArray(attachments) || attachments.length === 0) {
-          return text;
-        }
-
-        const content = [];
-        const fileHints = [];
-
-        for (const att of attachments) {
-          if (!att.base64Data || !att.mediaType) continue;
-
-          if (att.mediaType.startsWith("image/")) {
-            // Images: pass inline as ACP-compatible file parts
-            content.push({
-              type: "file",
-              mediaType: att.mediaType,
-              data: att.base64Data,
-              ...(att.filename ? { filename: att.filename } : {}),
-            });
-          } else if (att.filePath) {
-            // Non-image files with a known local path: tell the agent to read it
-            fileHints.push(`[Attached file "${att.filename || "file"}" is on the LOCAL machine (not a remote server), path: ${att.filePath} — read it locally]`);
-          } else {
-            // Pasted/virtual files without a path: save to managed temp dir so the agent can read them
-            try {
-              const fs = require("node:fs");
-              const tempDirBridge = require("./tempDirBridge.cjs");
-              const safeName = att.filename || `file-${Date.now()}`;
-              const tempPath = tempDirBridge.getTempFilePath(safeName);
-              fs.writeFileSync(tempPath, Buffer.from(att.base64Data, "base64"));
-              fileHints.push(`[Attached file "${att.filename || safeName}" is on the LOCAL machine (not a remote server), path: ${tempPath} — read it locally]`);
-            } catch (err) {
-              console.error("[ACP] Failed to save pasted attachment to temp:", err?.message || err);
-            }
-          }
-        }
-
-        const fullText = fileHints.length > 0
-          ? fileHints.join("\n") + "\n\n" + text
-          : text;
-
-        content.unshift({ type: "text", text: fullText });
-        return content;
-      }
-
-      const latestPromptMessage = {
-        role: "user",
-        content: buildMessageContent(contextualPrompt, images),
-      };
-
-      const result = streamText({
-        model: modelInstance,
-        messages: providerEntry.historyReplayFallback
-          ? [
-              ...(Array.isArray(historyMessages)
-                ? historyMessages.map((msg) => ({ role: msg.role, content: msg.content }))
-                : []),
-              latestPromptMessage,
-            ]
-          : [latestPromptMessage],
-        tools: providerEntry.provider.tools,
-        stopWhen: stepCountIs(mcpServerBridge.getMaxIterations ? mcpServerBridge.getMaxIterations() : 20),
-        abortSignal: abortController.signal,
-      });
-      const reader = result.fullStream.getReader();
-      let hasContent = false;
-      // Stall detection: if no chunk for 3s, send a status event
-      let stallTimer = null;
-      const STALL_TIMEOUT_MS = 3000;
-      function resetStallTimer() {
-        if (stallTimer) clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => {
-          if (!abortController.signal.aborted) {
-            if (!isActiveAcpRun(chatSessionId, requestId)) return;
-            safeSend(event.sender, "netcatty:ai:acp:event", {
-              requestId,
-              event: { type: "status", message: "Waiting for response from agent..." },
-            });
-          }
-        }, STALL_TIMEOUT_MS);
-      }
-      resetStallTimer();
-      try {
-        while (true) {
-          const { done, value: chunk } = await reader.read();
-          if (done || abortController.signal.aborted) break;
-          if (!isActiveAcpRun(chatSessionId, requestId)) break;
-          resetStallTimer();
-          try {
-            const serialized = serializeStreamChunk(chunk);
-            if (!serialized || !serialized.type) continue;
-
-            if (serialized.type === "text-delta" || serialized.type === "reasoning-delta" || serialized.type === "tool-call" || serialized.type === "tool-result") {
-              hasContent = true;
-            }
-            if (isCopilotAgent && (serialized.type === "tool-call" || serialized.type === "tool-result" || serialized.type === "error" || serialized.type === "status")) {
-              logAcpDebug(agentLabel, `Stream event: ${serialized.type}`, serialized);
-            }
-            debugMcpLog("ACP stream event", {
-              requestId,
-              chatSessionId,
-              type: serialized.type,
-              toolName: serialized.toolName || null,
-            });
-            safeSend(event.sender, "netcatty:ai:acp:event", {
-              requestId,
-              event: serialized,
-            });
-          } catch (serErr) {
-            console.error("[ACP stream] Failed to serialize chunk:", chunk?.type, serErr?.message);
-          }
-        }
-      } finally {
-        if (stallTimer) clearTimeout(stallTimer);
-        reader.releaseLock();
-      }
-
-      // If stream completed with zero content, likely an auth or connection issue
-      if (!hasContent && !abortController.signal.aborted) {
-        debugMcpLog("ACP empty response", {
-          requestId,
-          chatSessionId,
-          isCodexAgent,
-          providerSessionId: providerEntry.provider.getSessionId?.() || null,
-        });
-        if (isCopilotAgent) {
-          logAcpDebug(agentLabel, "Stream completed with no content", {
-            requestId,
-            chatSessionId,
-            providerSessionId: providerEntry.provider.getSessionId?.() || null,
-          });
-        }
-        if (!isActiveAcpRun(chatSessionId, requestId)) {
-          return { ok: true };
-        }
-        safeSend(event.sender, "netcatty:ai:acp:error", {
-          requestId,
-          error: isCodexAgent
-            ? "Codex returned an empty response. Connect Codex in Settings -> AI, or configure an enabled OpenAI provider API key."
-            : "Agent returned an empty response.",
-        });
-      } else {
-        debugMcpLog("ACP stream done", { requestId, chatSessionId, hasContent });
-        if (!isActiveAcpRun(chatSessionId, requestId)) {
-          return { ok: true };
-        }
-        safeSend(event.sender, "netcatty:ai:acp:done", { requestId });
-      }
-    } catch (err) {
-      console.error("[ACP] Handler caught error:", err?.message || err, err?.stack?.split("\n").slice(0, 3).join("\n"));
-      const normalized = extractCodexError(err);
-      const errMsg = normalized.message;
-      const isAuthErr = isCodexAuthError(normalized);
-
-      if (isAuthErr) {
-        console.error("[ACP] Auth error — user needs to re-login:", errMsg);
-        cleanupAcpProvider(chatSessionId);
-      }
-
-      safeSend(event.sender, "netcatty:ai:acp:error", {
-        requestId,
-        error: isAuthErr
-          ? `Authentication failed. Connect Codex in Settings -> AI, or configure an enabled OpenAI provider API key.\n\nDetails: ${errMsg}`
-          : errMsg,
-      });
-    } finally {
-      acpActiveStreams.delete(requestId);
-      acpRequestSessions.delete(requestId);
-      acpPendingCancelRequests.delete(requestId);
-      const activeRun = acpChatRuns.get(chatSessionId);
-      if (activeRun?.requestId === requestId) {
-        acpChatRuns.delete(chatSessionId);
-      }
-    }
-
-    return { ok: true };
-  });
-
-  ipcMain.handle("netcatty:ai:acp:cancel", async (event, { requestId, chatSessionId }) => {
-    if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    const effectiveChatSessionId = chatSessionId || acpRequestSessions.get(requestId);
-    const activeRun = effectiveChatSessionId ? acpChatRuns.get(effectiveChatSessionId) : null;
-    const effectiveRequestId = requestId || activeRun?.requestId || "";
-    // Cancel synchronous PTY executions scoped to this chat session (send Ctrl+C).
-    // Do NOT cancel terminal_start background jobs here — they were intentionally
-    // launched as long-running and should keep running when the user only wants
-    // to stop the model's polling/output. Background jobs are still cleaned up
-    // when the chat session itself is deleted (see cleanupScopedMetadata).
-    mcpServerBridge.setChatSessionCancelled?.(effectiveChatSessionId, true);
-    mcpServerBridge.cancelPtyExecsForSession(effectiveChatSessionId);
-    mcpServerBridge.clearPendingApprovals(effectiveChatSessionId);
-    if (activeRun && activeRun.requestId === effectiveRequestId) {
-      activeRun.cancelRequested = true;
-    }
-    const controller = acpActiveStreams.get(effectiveRequestId);
-    let cancelled = false;
-    if (controller) {
-      controller.abort();
-      acpActiveStreams.delete(effectiveRequestId);
-      cancelled = true;
-    } else if (effectiveRequestId) {
-      acpPendingCancelRequests.add(effectiveRequestId);
-      cancelled = true;
-    }
-    // Preserve the ACP provider session on stop so the next user message can
-    // continue within the same persisted conversation context. Full provider
-    // cleanup is handled by netcatty:ai:acp:cleanup when the chat is deleted.
-    if (effectiveChatSessionId) cancelled = true;
-    if (effectiveRequestId) acpRequestSessions.delete(effectiveRequestId);
-    void mcpServerBridge.cancelSftpOpsForSession?.(effectiveChatSessionId);
-    return cancelled ? { ok: true } : { ok: false, error: "Stream not found" };
-  });
-
-  // Cleanup a specific ACP session (when chat session is deleted)
-  ipcMain.handle("netcatty:ai:acp:cleanup", async (event, { chatSessionId }) => {
-    if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    mcpServerBridge.setChatSessionCancelled?.(chatSessionId, true);
-    mcpServerBridge.cancelPtyExecsForSession(chatSessionId);
-    cleanupAcpProvider(chatSessionId);
-    await mcpServerBridge.cleanupScopedMetadata(chatSessionId);
-    return { ok: true };
-  });
-
-
-  // Kill an agent process — waits for exit or force-kills after timeout
-  ipcMain.handle("netcatty:ai:agent:kill", async (event, { agentId }) => {
-    if (!validateSender(event)) {
-      return { ok: false, error: "Unauthorized IPC sender" };
-    }
-    const proc = agentProcesses.get(agentId);
-    if (!proc) return { ok: false, error: "Agent not found" };
-    try {
-      proc.kill("SIGTERM");
-      // Wait for the process to exit, or force-kill after 5 seconds
-      await new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          if (agentProcesses.has(agentId)) {
-            try { proc.kill("SIGKILL"); } catch {}
-          }
-          resolve();
-        }, 5000);
-        proc.once("exit", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      });
-      agentProcesses.delete(agentId);
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-  });
+function createHandlerContext(ipcMain) {
+  return {
+    ipcMain,
+    require,
+    https,
+    http,
+    path,
+    URL,
+    randomUUID,
+    spawn,
+    execFileSync,
+    fs,
+    existsSync,
+    mcpServerBridge,
+    getCliLauncherPath,
+    TOOL_CLI_DISCOVERY_ENV_VAR,
+    scanUserSkills,
+    buildUserSkillsContext,
+    toPublicUserSkillsStatus,
+    stripAnsi,
+    normalizeCliPathForPlatform,
+    prepareCommandForSpawn,
+    normalizeClaudeCodeExecutableEnvForSdk,
+    resolveClaudeCodeExecutableForSdk,
+    resolveCodexExecutableForSdk,
+    addCodexExecutableEnvForSdk,
+    resolveCodebuddyExecutableForSdk,
+    resolveSdkBinPath,
+    resolveSdkBinPathAsync,
+    resolveCliFromPath,
+    resolveCliFromPathAsync,
+    probeClaudeAuth,
+    probeCopilotAuth,
+    probeCodexAuth,
+    probeCodebuddyAuth,
+    isPlausibleCliVersionOutput,
+    getShellEnv,
+    getFreshIdlePrompt,
+    invalidateShellEnvCache,
+    toUnpackedAsarPath,
+    detectClaudeAuthPresence,
+    expandHomePath,
+    CLAUDE_AUTH_HELP_MESSAGE,
+    codexLoginSessions,
+    appendCodexLoginOutput,
+    toCodexLoginSessionResponse,
+    getActiveCodexLoginSession,
+    normalizeCodexIntegrationState,
+    readCodexCustomProviderConfig,
+    getCodexCustomConfigPreflightError,
+    extractCodexError,
+    isCodexAuthError,
+    getCodexAuthFingerprint,
+    getCodexMcpFingerprint,
+    invalidateCodexValidationCache,
+    getCodexValidationCache,
+    setCodexValidationCache,
+    DEBUG_MCP,
+    NETCATTY_TOOL_SKILL_PATH,
+    NETCATTY_TOOL_LAUNCHER_PATH,
+    NETCATTY_TOOL_CLI_PATH,
+    debugMcpLog,
+    normalizeToolIntegrationMode,
+    setToolIntegrationMode,
+    ensureSkillsCliHost,
+    getSkillsCliInvocation,
+    buildExternalAgentContextualPrompt,
+    execViaPty,
+    get sessions() { return sessions; },
+    set sessions(value) { sessions = value; },
+    get sftpClients() { return sftpClients; },
+    set sftpClients(value) { sftpClients = value; },
+    get electronModule() { return electronModule; },
+    set electronModule(value) { electronModule = value; },
+    get mainWebContentsId() { return mainWebContentsId; },
+    set mainWebContentsId(value) { mainWebContentsId = value; },
+    get cliDiscoveryFilePath() { return cliDiscoveryFilePath; },
+    set cliDiscoveryFilePath(value) { cliDiscoveryFilePath = value; },
+    activeStreams,
+    get providerConfigs() { return providerConfigs; },
+    set providerConfigs(value) { providerConfigs = value; },
+    get webSearchApiHost() { return webSearchApiHost; },
+    set webSearchApiHost(value) { webSearchApiHost = value; },
+    get webSearchApiKeyEncrypted() { return webSearchApiKeyEncrypted; },
+    set webSearchApiKeyEncrypted(value) { webSearchApiKeyEncrypted = value; },
+    decryptApiKeyValue,
+    resolveProviderApiKey,
+    shouldSkipTLSVerify,
+    API_KEY_PLACEHOLDER,
+    WEB_SEARCH_KEY_PLACEHOLDER,
+    injectApiKeyIntoRequest,
+    getChildProcessTreePids,
+    killTrackedProcessTree,
+    safeSend,
+    withCliDiscoveryEnv,
+    validateSender,
+    validateSenderOrSettings,
+    envPairsToObject,
+    normalizeAgentEnv,
+    safeReadJson,
+    streamRequest,
+  };
 }
 
-// Cleanup all agent processes on shutdown
-function cleanup() {
-  for (const [id, proc] of agentProcesses) {
-    try {
-      proc.kill("SIGTERM");
-    } catch {}
-  }
-  agentProcesses.clear();
+function registerHandlers(ipcMain) {
+  const context = createHandlerContext(ipcMain);
+  Object.assign(context, createAgentCliHelpers(context));
+  registeredContext = context;
 
+  registerProviderHandlers(context);
+  registerCattyExecHandlers(context);
+  registerAgentDiscoveryHandlers(context);
+  registerAgentProcessHandlers(context);
+  registerSdkStreamHandlers(context);
+}
+
+// Abort active streams and child processes on shutdown
+function cleanup() {
   for (const [id, controller] of activeStreams) {
     try { controller.abort(); } catch {}
   }
   activeStreams.clear();
 
-  // Abort active ACP streams
-  for (const [id, controller] of acpActiveStreams) {
-    try { controller.abort(); } catch {}
-  }
-  acpActiveStreams.clear();
-
-
-  // Cleanup ACP providers (kills codex-acp child processes)
-  for (const [id] of acpProviders) {
-    cleanupAcpProvider(id);
+  // Abort active SDK agent streams (set by registerSdkStreamHandlers on ctx).
+  if (registeredContext && registeredContext.sdkActiveStreams) {
+    for (const [, controller] of registeredContext.sdkActiveStreams) {
+      try { controller.abort(); } catch {}
+    }
+    registeredContext.sdkActiveStreams.clear();
   }
 
   for (const [id, session] of codexLoginSessions) {

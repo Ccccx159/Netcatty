@@ -189,6 +189,11 @@ export function getFileExtension(fileName: string): string {
   return fileName.slice(lastDot + 1).toLowerCase();
 }
 
+/** True when the filename has a real extension (e.g. `foo.txt`), not a dot-only name like `.git`. */
+export function hasFileExtension(fileName: string): boolean {
+  return fileName.lastIndexOf('.') > 0;
+}
+
 /**
  * Check if a file is a text file based on its extension and name
  */
@@ -433,9 +438,28 @@ export function getSupportedLanguages(): { id: string; name: string }[] {
  */
 export interface DropEntry {
   file: File | null;  // null for directory entries
+  localPath?: string;
+  size?: number;
   relativePath: string;  // Path relative to the root of the drop (e.g., "folder/subfolder/file.txt")
   isDirectory: boolean;
 }
+
+const createDropEntriesFromFiles = (files: FileList | File[]): DropEntry[] => {
+  const results: DropEntry[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const path = getPathForFile(file);
+    if (path) {
+      (file as File & { path?: string }).path = path;
+    }
+    results.push({
+      file,
+      relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+      isDirectory: false,
+    });
+  }
+  return results;
+};
 
 /**
  * Convert a FileSystemEntry to a File
@@ -598,6 +622,9 @@ export async function extractDropEntries(
 
     // Process entries iteratively (non-recursive) to avoid stack overflow
     const results = await processEntriesIteratively(entries);
+    if (results.length === 0) {
+      return createDropEntriesFromFiles(dataTransfer.files);
+    }
 
     // Restore the 'path' property for all files
     // Try to get the path directly from webUtils.getPathForFile for each file
@@ -635,16 +662,6 @@ export async function extractDropEntries(
   } else {
     // Fallback: use regular FileList (no folder support)
     // Files from FileList in Electron already have the 'path' property
-    const results: DropEntry[] = [];
-    const files = dataTransfer.files;
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      results.push({
-        file,
-        relativePath: file.name,
-        isDirectory: false,
-      });
-    }
-    return results;
+    return createDropEntriesFromFiles(dataTransfer.files);
   }
 }

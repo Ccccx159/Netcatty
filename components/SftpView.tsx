@@ -14,19 +14,21 @@
  * - components/sftp/SftpHostPicker.tsx - Host selection dialog
  */
 
-import React, { memo, useCallback, useLayoutEffect, useMemo, useRef } from "react";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useIsSftpActive } from "../application/state/activeTabStore";
 import { useSftpState } from "../application/state/useSftpState";
 import { useSftpBackend } from "../application/state/useSftpBackend";
+import { getParentPath, isConcreteTransferTargetPath } from "../application/state/sftp/utils";
 import { HotkeyScheme, KeyBinding } from "../domain/models";
 import { logger } from "../lib/logger";
 import { useRenderTracker } from "../lib/useRenderTracker";
 import { cn } from "../lib/utils";
-import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
-import { Host, Identity, SSHKey } from "../types";
+import { Host, Identity, KnownHost, ProxyProfile, SSHKey, TransferTask } from "../types";
 import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig";
+import { materializeHostProxyProfile } from "../domain/proxyProfiles";
 import { useSftpFileAssociations } from "../application/state/useSftpFileAssociations";
+import { registerEditorSftpWriterScoped } from "../application/state/editorSftpBridge";
 import { toast } from "./ui/toast";
 
 // Import extracted components
@@ -52,8 +54,11 @@ interface SftpViewProps {
   hosts: Host[];
   keys: SSHKey[];
   identities: Identity[];
+  knownHosts?: KnownHost[];
   groupConfigs?: import('../domain/models').GroupConfig[];
+  proxyProfiles?: ProxyProfile[];
   updateHosts: (hosts: Host[]) => void;
+  onAddKnownHost?: (knownHost: KnownHost) => void;
   sftpDefaultViewMode: "list" | "tree";
   sftpDoubleClickBehavior: "open" | "transfer";
   sftpAutoSync: boolean;
@@ -63,14 +68,18 @@ interface SftpViewProps {
   keyBindings: KeyBinding[];
   editorWordWrap: boolean;
   setEditorWordWrap: (enabled: boolean) => void;
+  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
 }
 
 const SftpViewInner: React.FC<SftpViewProps> = ({
   hosts,
   keys,
   identities,
+  knownHosts = [],
   groupConfigs = [],
+  proxyProfiles = [],
   updateHosts,
+  onAddKnownHost,
   sftpDefaultViewMode,
   sftpDoubleClickBehavior,
   sftpAutoSync,
@@ -80,13 +89,12 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
   keyBindings,
   editorWordWrap,
   setEditorWordWrap,
+  terminalSettings,
 }) => {
   const { t } = useI18n();
   const isActive = useIsSftpActive();
   const rootRef = useRef<HTMLDivElement>(null);
   const dialogActionScopeIdRef = useRef("sftp-main-view");
-
-  useInstantThemeSwitch(rootRef);
 
   // File watch event handlers (stable refs to avoid re-creating the useSftpState options)
   const fileWatchHandlers = useMemo(() => ({
@@ -105,17 +113,21 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     ...fileWatchHandlers,
     useCompressedUpload: sftpUseCompressedUpload,
     defaultShowHiddenFiles: sftpShowHiddenFiles,
-  }), [fileWatchHandlers, sftpUseCompressedUpload, sftpShowHiddenFiles]);
+    terminalSettings,
+    knownHosts,
+    onAddKnownHost,
+  }), [fileWatchHandlers, sftpUseCompressedUpload, sftpShowHiddenFiles, terminalSettings, knownHosts, onAddKnownHost]);
 
   // Pre-resolve group defaults so SFTP connections inherit group config
-  const effectiveHosts = useMemo(() =>
-    hosts.map(h => {
-      if (!h.group) return h;
-      const defaults = resolveGroupDefaults(h.group, groupConfigs);
-      return applyGroupDefaults(h, defaults);
-    }),
-    [hosts, groupConfigs],
-  );
+  const effectiveHosts = useMemo(() => {
+    const validProxyProfileIds = new Set(proxyProfiles.map((profile) => profile.id));
+    return hosts.map(h => {
+      const withGroupDefaults = h.group
+        ? applyGroupDefaults(h, resolveGroupDefaults(h.group, groupConfigs, { validProxyProfileIds }), { validProxyProfileIds })
+        : applyGroupDefaults(h, {}, { validProxyProfileIds });
+      return materializeHostProxyProfile(withGroupDefaults, proxyProfiles);
+    });
+  }, [hosts, groupConfigs, proxyProfiles]);
 
   const sftp = useSftpState(effectiveHosts, keys, identities, sftpOptions);
 
@@ -128,12 +140,31 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     mkdirLocal,
     deleteLocalFile,
     listLocalDir,
+    listDrives,
+    openPath,
   } = useSftpBackend();
 
   // Store sftp in a ref so callbacks can access the latest instance
   // without needing to re-create when sftp changes
   const sftpRef = useRef(sftp);
   sftpRef.current = sftp;
+
+  // Register this useSftpState's writeTextFileByConnection with the bridge so
+  // the editor tab's save path can reach the active SFTP session. The bridge
+  // supports multiple simultaneous writers (SftpSidePanel inside terminals
+  // also registers its own instance) and dispatches by trying each until one
+  // owns the target connectionId.
+  //
+  // Intentionally no deps: `sftp` identity churns on every SFTP state change
+  // (transfers, pane updates, tab switches), which would make this effect
+  // unregister+reregister constantly. Route through sftpRef so the closure
+  // always reads the latest writeTextFileByConnection; that method is stable
+  // across sftp re-renders (it's a methodsRef-backed dispatcher).
+  useEffect(() => {
+    return registerEditorSftpWriterScoped((connectionId, expectedHostId, filePath, content, encoding) =>
+      sftpRef.current.writeTextFileByConnection(connectionId, expectedHostId, filePath, content, encoding),
+    );
+  }, []);
 
   // Store behavior setting in ref for stable callbacks
   const behaviorRef = useRef(sftpDoubleClickBehavior);
@@ -219,6 +250,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     fileOpenerTarget,
     setFileOpenerTarget,
     handleSaveTextFile,
+    onPromoteToTab,
     handleFileOpenerSelect,
     handleSelectSystemApp,
   } = useSftpViewPaneCallbacks({
@@ -236,11 +268,81 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     startStreamTransfer,
     getSftpIdForConnection: sftp.getSftpIdForConnection,
     listLocalFiles: listLocalDir,
+    listDrives,
   });
 
   const visibleTransfers = useMemo(
     () => [...sftp.transfers].filter((t) => !t.parentTaskId).reverse().slice(0, 5),
     [sftp.transfers],
+  );
+
+  const getTransferTargetDirectory = useCallback(
+    (task: TransferTask) => (task.isDirectory ? task.targetPath : getParentPath(task.targetPath)),
+    [],
+  );
+
+  const findRemoteTransferTargetTab = useCallback((task: TransferTask) => {
+    const state = sftpRef.current;
+    for (const side of ["left", "right"] as const) {
+      const tabs = side === "left" ? state.leftTabs.tabs : state.rightTabs.tabs;
+      const pane = tabs.find((tab) => tab.connection?.id === task.targetConnectionId);
+      if (pane?.connection && !pane.connection.isLocal) {
+        return { side, tabId: pane.id };
+      }
+    }
+    return null;
+  }, []);
+
+  const canRevealTransferTarget = useCallback(
+    (task: TransferTask) => {
+      if (task.status !== "completed") return false;
+      if (!isConcreteTransferTargetPath(task)) return false;
+      if (task.targetConnectionId === "local") {
+        return true;
+      }
+      return !!findRemoteTransferTargetTab(task);
+    },
+    [findRemoteTransferTargetTab],
+  );
+
+  const handleRevealTransferTarget = useCallback(
+    async (task: TransferTask) => {
+      if (!isConcreteTransferTargetPath(task)) return;
+      const targetDirectory = getTransferTargetDirectory(task);
+      if (task.targetConnectionId === "local") {
+        try {
+          const result = await openPath(targetDirectory);
+          if (result.success) return;
+        } catch {
+          // Show the localized error below.
+        }
+        toast.error(t("sftp.transfers.openTargetFolderError"), "SFTP");
+        return;
+      }
+
+      const targetTab = findRemoteTransferTargetTab(task);
+      if (!targetTab) return;
+      await sftpRef.current.navigateTo(targetTab.side, targetDirectory, { force: true, tabId: targetTab.tabId });
+    },
+    [findRemoteTransferTargetTab, getTransferTargetDirectory, openPath, t],
+  );
+
+  const canCopyTransferTargetPath = useCallback(
+    (task: TransferTask) => task.status === "completed" && isConcreteTransferTargetPath(task),
+    [],
+  );
+
+  const handleCopyTransferTargetPath = useCallback(
+    async (task: TransferTask) => {
+      if (!isConcreteTransferTargetPath(task)) return;
+      try {
+        await navigator.clipboard.writeText(task.targetPath);
+        toast.success(t("sftp.transfers.copyTargetPathSuccess"), "SFTP");
+      } catch {
+        toast.error(t("sftp.transfers.copyTargetPathError"), "SFTP");
+      }
+    },
+    [t],
   );
 
   const containerStyle: React.CSSProperties = isActive
@@ -278,9 +380,11 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     handleReorderTabsRight,
     handleMoveTabFromLeftToRight,
     handleMoveTabFromRightToLeft,
+    handleDuplicateTabLeft,
+    handleDuplicateTabRight,
     handleHostSelectLeft,
     handleHostSelectRight,
-  } = useSftpViewTabs({ sftp, sftpRef });
+  } = useSftpViewTabs({ sftp, sftpRef, hosts: effectiveHosts });
 
   const handleAddTabLeftWithFocus = useCallback(() => {
     const tabId = handleAddTabLeft();
@@ -302,9 +406,30 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
     handlePaneFocus("right", tabId);
   }, [handlePaneFocus, handleSelectTabRight]);
 
+  const handleDuplicateTabLeftWithFocus = useCallback(
+    async (...args: Parameters<typeof handleDuplicateTabLeft>) => {
+      const tabId = await handleDuplicateTabLeft(...args);
+      if (tabId) {
+        handlePaneFocus("left", tabId);
+      }
+    },
+    [handleDuplicateTabLeft, handlePaneFocus],
+  );
+
+  const handleDuplicateTabRightWithFocus = useCallback(
+    async (...args: Parameters<typeof handleDuplicateTabRight>) => {
+      const tabId = await handleDuplicateTabRight(...args);
+      if (tabId) {
+        handlePaneFocus("right", tabId);
+      }
+    },
+    [handleDuplicateTabRight, handlePaneFocus],
+  );
+
   return (
     <SftpContextProvider
-      hosts={hosts}
+      hosts={effectiveHosts}
+      writableHosts={hosts}
       updateHosts={updateHosts}
       draggedFiles={draggedFiles}
       dragCallbacks={dragCallbacks}
@@ -347,6 +472,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
                 onAddTab={handleAddTabLeftWithFocus}
                 onReorderTabs={handleReorderTabsLeft}
                 onMoveTabToOtherSide={handleMoveTabFromRightToLeft}
+                onDuplicateTab={handleDuplicateTabLeftWithFocus}
               />
             )}
             <div className="relative flex-1 min-h-0">
@@ -407,6 +533,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
                 onAddTab={handleAddTabRightWithFocus}
                 onReorderTabs={handleReorderTabsRight}
                 onMoveTabToOtherSide={handleMoveTabFromLeftToRight}
+                onDuplicateTab={handleDuplicateTabRightWithFocus}
               />
             )}
             <div className="relative flex-1 min-h-0">
@@ -443,9 +570,13 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
         </div>
 
         <SftpOverlays
-          hosts={hosts}
+          hosts={effectiveHosts}
           sftp={sftp}
           visibleTransfers={visibleTransfers}
+          canRevealTransferTarget={canRevealTransferTarget}
+          onRevealTransferTarget={handleRevealTransferTarget}
+          canCopyTransferTargetPath={canCopyTransferTargetPath}
+          onCopyTransferTargetPath={handleCopyTransferTargetPath}
           showHostPickerLeft={showHostPickerLeft}
           showHostPickerRight={showHostPickerRight}
           hostSearchLeft={hostSearchLeft}
@@ -475,6 +606,7 @@ const SftpViewInner: React.FC<SftpViewProps> = ({
           setFileOpenerTarget={setFileOpenerTarget}
           handleFileOpenerSelect={handleFileOpenerSelect}
           handleSelectSystemApp={handleSelectSystemApp}
+          onPromoteToTab={onPromoteToTab}
           t={t}
         />
       </div>
@@ -486,8 +618,11 @@ const sftpViewAreEqual = (prev: SftpViewProps, next: SftpViewProps): boolean =>
   prev.hosts === next.hosts &&
   prev.keys === next.keys &&
   prev.identities === next.identities &&
+  prev.knownHosts === next.knownHosts &&
   prev.groupConfigs === next.groupConfigs &&
+  prev.proxyProfiles === next.proxyProfiles &&
   prev.sftpDefaultViewMode === next.sftpDefaultViewMode &&
+  prev.onAddKnownHost === next.onAddKnownHost &&
   prev.sftpDoubleClickBehavior === next.sftpDoubleClickBehavior &&
   prev.sftpAutoSync === next.sftpAutoSync &&
   prev.sftpShowHiddenFiles === next.sftpShowHiddenFiles &&
@@ -495,7 +630,12 @@ const sftpViewAreEqual = (prev: SftpViewProps, next: SftpViewProps): boolean =>
   prev.hotkeyScheme === next.hotkeyScheme &&
   prev.keyBindings === next.keyBindings &&
   prev.editorWordWrap === next.editorWordWrap &&
-  prev.setEditorWordWrap === next.setEditorWordWrap;
+  prev.setEditorWordWrap === next.setEditorWordWrap &&
+  // Only the keepalive fields of terminalSettings affect SFTP connection
+  // resolution today; compare them directly rather than the whole object
+  // so unrelated terminal-setting changes don't tear the panel down.
+  prev.terminalSettings?.keepaliveInterval === next.terminalSettings?.keepaliveInterval &&
+  prev.terminalSettings?.keepaliveCountMax === next.terminalSettings?.keepaliveCountMax;
 
 export const SftpView = memo(SftpViewInner, sftpViewAreEqual);
 SftpView.displayName = "SftpView";

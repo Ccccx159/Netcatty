@@ -8,6 +8,14 @@
  * - Memory pressure handling
  */
 
+export const XTERM_UNLIMITED_SCROLLBACK_CAP = 50000;
+
+export function resolveXTermScrollback(scrollback: number): number {
+  // xterm.js treats 0 as "no scrollback". Keep the app's 0 sentinel useful
+  // without asking xterm to resize/reflow nearly one million buffer rows.
+  return scrollback === 0 ? XTERM_UNLIMITED_SCROLLBACK_CAP : scrollback;
+}
+
 export const XTERM_PERFORMANCE_CONFIG = {
   // Memory and Scrollback Settings
   scrollback: {
@@ -132,14 +140,6 @@ export type ResolvedXTermPerformance = {
 
 const isLowMemoryDevice = (deviceMemoryGb?: number) =>
   typeof deviceMemoryGb === "number" && deviceMemoryGb > 0 && deviceMemoryGb <= 4;
-
-/**
- * Get platform-specific xterm configuration
- * @returns Configuration object optimized for the current platform
- */
-export function getXTermConfig(platform: XTermPlatform = "darwin") {
-  return resolveXTermPerformanceConfig({ platform }).options;
-}
 
 export type RendererPreference = "auto" | "webgl" | "dom";
 

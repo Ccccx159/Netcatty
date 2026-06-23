@@ -8,6 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+
 dist
 dist-ssr
 *.local
@@ -40,10 +41,19 @@ coverage
 
 # Codex
 /.codex/
-/CLAUDE.md
+
+# Qoder
+.qoder
+
+# Workbuddy
+.workbuddy
+
+# Codebuddy
+.codebuddy
 
 # AI / Superpowers generated docs (local only)
 /docs/superpowers/
+/.superpowers/
 
 # Dev-only electron-updater test config (not for production)
 /dev-app-update.yml
@@ -55,8 +65,31 @@ coverage
 # Serena MCP project config (local only)
 /.serena/
 
+# Git worktrees (local isolated workspaces)
+/.worktrees/
+
 # Windows VS Build environment scripts (local dev only)
 Directory.Build.props
 Directory.Build.targets
 build_with_vs.bat
 build_with_vs2022.bat
+
+# Bundled mosh-client binaries fetched at pack time by
+# scripts/fetch-mosh-binaries.cjs. resources/mosh/README.md is
+# committed; the actual binaries, the Cygwin DLL bundle (Windows),
+# and the bundled ncurses terminfo database are all pulled from the
+# dedicated mosh binary repository, never committed.
+/resources/mosh/*/mosh-client
+/resources/mosh/*/mosh-client.exe
+/resources/mosh/*/mosh-client-*-dlls/
+/resources/mosh/*/*.dll
+/resources/mosh/*/terminfo/
+
+# Bundled EternalTerminal `et` client binaries fetched at pack time by
+# scripts/fetch-et-binaries.cjs. resources/et/README.md is committed; the
+# actual binaries (and any DLL bundle for dynamically-linked Windows builds)
+# are pulled from the dedicated et binary repository, never committed.
+/resources/et/*/et
+/resources/et/*/et.exe
+/resources/et/*/et-*-dlls/
+/resources/et/*/*.dll

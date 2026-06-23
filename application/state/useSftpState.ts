@@ -170,10 +170,22 @@ export const useSftpState = (
   useSftpSessionCleanup(sftpSessionsRef);
   useSftpFileWatch(options);
 
-  const { connect, disconnect, listLocalFiles, listRemoteFiles } = useSftpConnections({
+  const {
+    connect,
+    disconnect,
+    listLocalFiles,
+    listRemoteFiles,
+    hostKeyVerification,
+    rejectHostKeyVerification,
+    acceptHostKeyVerification,
+    acceptAndSaveHostKeyVerification,
+  } = useSftpConnections({
     hosts,
     keys,
     identities,
+    knownHosts: options?.knownHosts,
+    onAddKnownHost: options?.onAddKnownHost,
+    terminalSettings: options?.terminalSettings,
     leftTabsRef,
     rightTabsRef,
     leftTabs,
@@ -271,7 +283,7 @@ export const useSftpState = (
 
   const {
     transfers,
-    conflicts,
+    conflicts: transferConflicts,
     activeTransfersCount,
     startTransfer,
     downloadToLocal,
@@ -282,7 +294,7 @@ export const useSftpState = (
     retryTransfer,
     clearCompletedTransfers,
     dismissTransfer,
-    resolveConflict,
+    resolveConflict: resolveTransferConflict,
   } = useSftpTransfers({
     getActivePane,
     getPaneByConnectionId,
@@ -301,14 +313,21 @@ export const useSftpState = (
     readTextFile,
     readBinaryFile,
     writeTextFile,
+    writeTextFileByConnection,
     downloadToTempAndOpen,
+    openWithSystemDefault,
     uploadExternalFiles,
+    uploadExternalFileList,
+    uploadExternalFolderPath,
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
     activeFileWatchCountRef,
+    uploadConflicts,
+    resolveUploadConflict,
   } = useSftpExternalOperations({
     getActivePane,
+    getPaneByConnectionId,
     refresh,
     sftpSessionsRef,
     connectionCacheKeyMapRef,
@@ -319,6 +338,21 @@ export const useSftpState = (
     isTransferCancelled,
     dismissExternalUpload: dismissTransfer,
   });
+
+  const conflicts = useMemo(
+    () => [...transferConflicts, ...uploadConflicts],
+    [transferConflicts, uploadConflicts],
+  );
+  const resolveAnyConflict = useCallback(
+    (...args: Parameters<typeof resolveTransferConflict>) => {
+      const [conflictId] = args;
+      if (uploadConflicts.some((conflict) => conflict.transferId === conflictId)) {
+        return resolveUploadConflict(...args);
+      }
+      return resolveTransferConflict(...args);
+    },
+    [resolveTransferConflict, resolveUploadConflict, uploadConflicts],
+  );
 
   // Store methods in a ref to create stable wrapper functions
   // This prevents callback reference changes from causing re-renders in consumers
@@ -359,8 +393,12 @@ export const useSftpState = (
     readTextFile,
     readBinaryFile,
     writeTextFile,
+    writeTextFileByConnection,
     downloadToTempAndOpen,
+    openWithSystemDefault,
     uploadExternalFiles,
+    uploadExternalFileList,
+    uploadExternalFolderPath,
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
@@ -372,9 +410,12 @@ export const useSftpState = (
     retryTransfer,
     clearCompletedTransfers,
     dismissTransfer,
-    resolveConflict,
+    resolveConflict: resolveAnyConflict,
     getSftpIdForConnection,
     reportSessionError: handleSessionError,
+    rejectHostKeyVerification,
+    acceptHostKeyVerification,
+    acceptAndSaveHostKeyVerification,
   });
   methodsRef.current = {
     getFilteredFiles,
@@ -413,8 +454,12 @@ export const useSftpState = (
     readTextFile,
     readBinaryFile,
     writeTextFile,
+    writeTextFileByConnection,
     downloadToTempAndOpen,
+    openWithSystemDefault,
     uploadExternalFiles,
+    uploadExternalFileList,
+    uploadExternalFolderPath,
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
@@ -426,9 +471,12 @@ export const useSftpState = (
     retryTransfer,
     clearCompletedTransfers,
     dismissTransfer,
-    resolveConflict,
+    resolveConflict: resolveAnyConflict,
     getSftpIdForConnection,
     reportSessionError: handleSessionError,
+    rejectHostKeyVerification,
+    acceptHostKeyVerification,
+    acceptAndSaveHostKeyVerification,
   };
 
   // Create stable method wrappers that call through methodsRef
@@ -476,8 +524,16 @@ export const useSftpState = (
     readTextFile: (...args: Parameters<typeof readTextFile>) => methodsRef.current.readTextFile(...args),
     readBinaryFile: (...args: Parameters<typeof readBinaryFile>) => methodsRef.current.readBinaryFile(...args),
     writeTextFile: (...args: Parameters<typeof writeTextFile>) => methodsRef.current.writeTextFile(...args),
+    writeTextFileByConnection: (...args: Parameters<typeof writeTextFileByConnection>) =>
+      methodsRef.current.writeTextFileByConnection(...args),
     downloadToTempAndOpen: (...args: Parameters<typeof downloadToTempAndOpen>) => methodsRef.current.downloadToTempAndOpen(...args),
+    openWithSystemDefault: (...args: Parameters<typeof openWithSystemDefault>) =>
+      methodsRef.current.openWithSystemDefault(...args),
     uploadExternalFiles: (...args: Parameters<typeof uploadExternalFiles>) => methodsRef.current.uploadExternalFiles(...args),
+    uploadExternalFileList: (...args: Parameters<typeof uploadExternalFileList>) =>
+      methodsRef.current.uploadExternalFileList(...args),
+    uploadExternalFolderPath: (...args: Parameters<typeof uploadExternalFolderPath>) =>
+      methodsRef.current.uploadExternalFolderPath(...args),
     uploadExternalEntries: (...args: Parameters<typeof uploadExternalEntries>) =>
       methodsRef.current.uploadExternalEntries(...args),
     cancelExternalUpload: () => methodsRef.current.cancelExternalUpload(),
@@ -490,9 +546,12 @@ export const useSftpState = (
     retryTransfer: (...args: Parameters<typeof retryTransfer>) => methodsRef.current.retryTransfer(...args),
     clearCompletedTransfers: () => methodsRef.current.clearCompletedTransfers(),
     dismissTransfer: (...args: Parameters<typeof dismissTransfer>) => methodsRef.current.dismissTransfer(...args),
-    resolveConflict: (...args: Parameters<typeof resolveConflict>) => methodsRef.current.resolveConflict(...args),
+    resolveConflict: (...args: Parameters<typeof resolveAnyConflict>) => methodsRef.current.resolveConflict(...args),
     getSftpIdForConnection: (...args: Parameters<typeof getSftpIdForConnection>) => methodsRef.current.getSftpIdForConnection(...args),
     reportSessionError: (...args: Parameters<typeof handleSessionError>) => methodsRef.current.reportSessionError(...args),
+    rejectHostKeyVerification: () => methodsRef.current.rejectHostKeyVerification(),
+    acceptHostKeyVerification: () => methodsRef.current.acceptHostKeyVerification(),
+    acceptAndSaveHostKeyVerification: () => methodsRef.current.acceptAndSaveHostKeyVerification(),
     activeFileWatchCountRef,
   }), [activeFileWatchCountRef]); // activeFileWatchCountRef is a stable ref
 
@@ -507,6 +566,7 @@ export const useSftpState = (
     transfers,
     activeTransfersCount,
     conflicts,
+    hostKeyVerification,
 
     // Stable methods - never change reference
     ...stableMethods,
@@ -527,6 +587,7 @@ export const useSftpState = (
     transfers,
     activeTransfersCount,
     conflicts,
+    hostKeyVerification,
     stableMethods,
   ]);
 };

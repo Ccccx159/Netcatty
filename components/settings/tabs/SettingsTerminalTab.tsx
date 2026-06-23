@@ -1,13 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState, useMemo } from "react";
-import { AlertCircle, ChevronRight, Import, Minus, Palette, Pencil, Plus, RotateCcw, Trash2 } from "lucide-react";
+import { AlertCircle, Import, Minus, Palette, Pencil, Plus, Trash2 } from "lucide-react";
 import type {
   CursorShape,
-  LinkModifier,
-  RightClickBehavior,
   TerminalEmulationType,
   TerminalSettings,
 } from "../../../domain/models";
-import { DEFAULT_KEYWORD_HIGHLIGHT_RULES, type KeywordHighlightRule } from "../../../domain/models";
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { MAX_FONT_SIZE, MIN_FONT_SIZE, type TerminalFont } from "../../../infrastructure/config/fonts";
 import { TERMINAL_THEMES } from "../../../infrastructure/config/terminalThemes";
@@ -15,256 +12,45 @@ import { customThemeStore, useCustomThemes } from "../../../application/state/cu
 import { parseItermcolors } from "../../../infrastructure/parsers/itermcolorsParser";
 import { cn } from "../../../lib/utils";
 import { useDiscoveredShells } from "../../../lib/useDiscoveredShells";
+import { parseShellArgs, formatShellArgs } from "../../../domain/shellArgs";
 import { Button } from "../../ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "../../ui/dialog";
 import { Input } from "../../ui/input";
-import { Label } from "../../ui/label";
+import { Select as ShadcnSelect, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../ui/select";
 import { SectionHeader, Select, SettingsTabContent, SettingRow, Toggle } from "../settings-ui";
 import { ThemeSelectModal } from "../ThemeSelectModal";
 import { TerminalFontSelect } from "../TerminalFontSelect";
+import { TerminalCjkFontSelect } from "../TerminalCjkFontSelect";
 import { CustomThemeModal } from "../../terminal/CustomThemeModal";
 import type { TerminalTheme } from "../../../domain/models";
+import { resolveFollowedTerminalThemeId, TERMINAL_THEME_AUTO } from "../../../domain/terminalAppearance";
 
-// Keyword highlight rules editor for global settings
-const DEFAULT_NEW_RULE_COLOR = '#F87171';
+import { KeywordHighlightRulesEditor, ThemePreviewButton } from "./SettingsTerminalTabControls";
+import { TerminalBehaviorSettings } from "./TerminalBehaviorSettings";
 
-const AddCustomRuleDialog: React.FC<{
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  editRule?: KeywordHighlightRule | null;
-  onAdd: (rule: KeywordHighlightRule) => void;
-}> = ({ open, onOpenChange, editRule, onAdd }) => {
-  const { t } = useI18n();
-  const [label, setLabel] = useState('');
-  const [pattern, setPattern] = useState('');
-  const [color, setColor] = useState(DEFAULT_NEW_RULE_COLOR);
-  const [patternError, setPatternError] = useState<string | null>(null);
+const FONT_WEIGHT_OPTIONS = [
+  { value: "100", labelKey: "settings.terminal.font.weight.thin" },
+  { value: "200", labelKey: "settings.terminal.font.weight.extraLight" },
+  { value: "300", labelKey: "settings.terminal.font.weight.light" },
+  { value: "400", labelKey: "settings.terminal.font.weight.normal" },
+  { value: "500", labelKey: "settings.terminal.font.weight.medium" },
+  { value: "600", labelKey: "settings.terminal.font.weight.semiBold" },
+  { value: "700", labelKey: "settings.terminal.font.weight.bold" },
+  { value: "800", labelKey: "settings.terminal.font.weight.extraBold" },
+  { value: "900", labelKey: "settings.terminal.font.weight.black" },
+];
 
-  const reset = () => { setLabel(''); setPattern(''); setColor(DEFAULT_NEW_RULE_COLOR); setPatternError(null); };
-
-  // Populate form when editing
-  useEffect(() => {
-    if (open && editRule) {
-      setLabel(editRule.label);
-      setPattern(editRule.patterns[0] || '');
-      setColor(editRule.color);
-      setPatternError(null);
-    } else if (!open) {
-      reset();
-    }
-  }, [open, editRule]);
-
-  const handleSubmit = () => {
-    if (!label.trim() || !pattern.trim()) return;
-    try { new RegExp(pattern, 'gi'); } catch {
-      setPatternError(t('settings.terminal.keywordHighlight.invalidPattern'));
-      return;
-    }
-    // When editing, replace only the first pattern and keep any additional ones
-    const patterns = editRule
-      ? [pattern, ...editRule.patterns.slice(1)]
-      : [pattern];
-    onAdd({ id: editRule?.id ?? crypto.randomUUID(), label: label.trim(), patterns, color, enabled: editRule?.enabled ?? true });
-    reset();
-    onOpenChange(false);
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => { if (!v) reset(); onOpenChange(v); }}>
-      <DialogContent className="sm:max-w-[400px]">
-        <DialogHeader>
-          <DialogTitle>{editRule ? t('settings.terminal.keywordHighlight.editCustom') : t('settings.terminal.keywordHighlight.addCustom')}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-3 py-2">
-          <div className="space-y-1.5">
-            <Label className="text-xs">{t('settings.terminal.keywordHighlight.labelField')}</Label>
-            <div className="flex gap-2">
-              <Input
-                placeholder={t('settings.terminal.keywordHighlight.labelPlaceholder')}
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
-                className="flex-1"
-              />
-              <label className="relative flex-shrink-0">
-                <input type="color" value={color} onChange={(e) => setColor(e.target.value)} className="sr-only" />
-                <span className="block w-9 h-9 rounded-md cursor-pointer border border-border/50 hover:border-border" style={{ backgroundColor: color }} />
-              </label>
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">{t('settings.terminal.keywordHighlight.patternField')}</Label>
-            <Input
-              placeholder={t('settings.terminal.keywordHighlight.patternPlaceholder')}
-              value={pattern}
-              onChange={(e) => { setPattern(e.target.value); if (patternError) setPatternError(null); }}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleSubmit(); }}
-              className={cn("font-mono", patternError && "border-destructive")}
-            />
-            {patternError && <div className="text-xs text-destructive">{patternError}</div>}
-          </div>
-          {label.trim() && pattern.trim() && !patternError && (
-            <div className="flex items-center gap-2 p-2 rounded-md bg-muted/50">
-              <span className="text-xs text-muted-foreground">{t('settings.terminal.keywordHighlight.preview')}:</span>
-              <span className="text-sm font-medium" style={{ color }}>{label}</span>
-            </div>
-          )}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => { reset(); onOpenChange(false); }}>{t('common.cancel')}</Button>
-          <Button onClick={handleSubmit} disabled={!label.trim() || !pattern.trim()}>{editRule ? t('common.save') : t('common.add')}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-};
-
-const KeywordHighlightRulesEditor: React.FC<{
-  rules: KeywordHighlightRule[];
-  onChange: (rules: KeywordHighlightRule[]) => void;
-}> = ({ rules, onChange }) => {
-  const { t } = useI18n();
-  const [addDialogOpen, setAddDialogOpen] = useState(false);
-  const [editingRule, setEditingRule] = useState<KeywordHighlightRule | null>(null);
-
-  const isBuiltIn = (id: string) => DEFAULT_KEYWORD_HIGHLIGHT_RULES.some((r) => r.id === id);
-
-  return (
-    <div className="space-y-2.5">
-      {rules.map((rule) => {
-        const custom = !isBuiltIn(rule.id);
-        return (
-          <div key={rule.id} className="flex items-center gap-2 group">
-            <div className="flex-1 min-w-0 flex items-center gap-1.5">
-              <span className={cn("text-sm truncate", !rule.enabled && "text-muted-foreground line-through")} style={rule.enabled ? { color: rule.color } : undefined}>
-                {rule.label}
-              </span>
-              {custom && (
-                <>
-                  <Pencil
-                    size={10}
-                    className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground cursor-pointer"
-                    onClick={() => { setEditingRule(rule); setAddDialogOpen(true); }}
-                  />
-                  <Trash2
-                    size={10}
-                    className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground cursor-pointer"
-                    onClick={() => onChange(rules.filter((r) => r.id !== rule.id))}
-                  />
-                </>
-              )}
-            </div>
-            <label className="relative flex-shrink-0">
-              <input
-                type="color"
-                value={rule.color}
-                onChange={(e) => onChange(rules.map((r) => r.id === rule.id ? { ...r, color: e.target.value } : r))}
-                className="sr-only"
-              />
-              <span
-                className="block w-8 h-5 rounded cursor-pointer border border-border/50 hover:border-border transition-colors"
-                style={{ backgroundColor: rule.color }}
-              />
-            </label>
-          </div>
-        );
-      })}
-
-      <div className="flex pt-2 mt-2 border-t border-border/50">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="flex-1 text-muted-foreground hover:text-foreground"
-          onClick={() => setAddDialogOpen(true)}
-        >
-          <Plus size={14} className="mr-1.5" />
-          {t('settings.terminal.keywordHighlight.addCustom')}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="flex-1 text-muted-foreground hover:text-foreground"
-          onClick={() => {
-            onChange(rules.map((rule) => {
-              const def = DEFAULT_KEYWORD_HIGHLIGHT_RULES.find((r) => r.id === rule.id);
-              return def ? { ...rule, color: def.color } : rule;
-            }));
-          }}
-        >
-          <RotateCcw size={14} className="mr-1.5" />
-          {t("settings.terminal.keywordHighlight.resetColors")}
-        </Button>
-      </div>
-
-      <AddCustomRuleDialog
-        open={addDialogOpen}
-        onOpenChange={(v) => { setAddDialogOpen(v); if (!v) setEditingRule(null); }}
-        editRule={editingRule}
-        onAdd={(rule) => {
-          if (editingRule) {
-            onChange(rules.map((r) => r.id === editingRule.id ? rule : r));
-          } else {
-            onChange([...rules, rule]);
-          }
-          setEditingRule(null);
-        }}
-      />
-    </div>
-  );
-};
-
-// Theme preview button component
-const ThemePreviewButton: React.FC<{
-  theme: (typeof TERMINAL_THEMES)[0];
-  onClick: () => void;
-  buttonLabel: string;
-}> = ({ theme, onClick, buttonLabel }) => {
-  const c = theme.colors;
-  return (
-    <button
-      onClick={onClick}
-      className={cn(
-        "w-full flex items-center gap-4 p-3 rounded-lg border bg-card hover:bg-accent/50 transition-all text-left",
-      )}
-    >
-      {/* Theme preview swatch */}
-      <div
-        className="w-20 h-14 rounded-lg flex-shrink-0 flex flex-col justify-center items-start pl-2 gap-0.5 border border-border/50"
-        style={{ backgroundColor: c.background }}
-      >
-        <div className="flex gap-1 items-center">
-          <span className="font-mono text-[8px]" style={{ color: c.green }}>$</span>
-          <span className="font-mono text-[8px]" style={{ color: c.blue }}>ls</span>
-        </div>
-        <div className="flex gap-0.5">
-          <div className="h-1 w-3 rounded-full" style={{ backgroundColor: c.cyan }} />
-          <div className="h-1 w-4 rounded-full" style={{ backgroundColor: c.magenta }} />
-        </div>
-        <div className="flex gap-1 items-center">
-          <span className="font-mono text-[8px]" style={{ color: c.green }}>$</span>
-          <span className="inline-block w-1.5 h-2 animate-pulse" style={{ backgroundColor: c.cursor }} />
-        </div>
-      </div>
-
-      {/* Theme info */}
-      <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium">{theme.name}</div>
-        <div className="text-xs text-muted-foreground capitalize">{theme.type}</div>
-      </div>
-
-      {/* Action button area */}
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <span className="text-xs">{buttonLabel}</span>
-        <ChevronRight size={16} />
-      </div>
-    </button>
-  );
-};
-
-export default function SettingsTerminalTab(props: {
+function SettingsTerminalTab(props: {
   terminalThemeId: string;
   setTerminalThemeId: (id: string) => void;
   followAppTerminalTheme: boolean;
   setFollowAppTerminalTheme: (value: boolean) => void;
+  terminalThemeDarkId: string;
+  setTerminalThemeDarkId: (id: string) => void;
+  terminalThemeLightId: string;
+  setTerminalThemeLightId: (id: string) => void;
+  lightUiThemeId: string;
+  darkUiThemeId: string;
   terminalFontFamilyId: string;
   setTerminalFontFamilyId: (id: string) => void;
   terminalFontSize: number;
@@ -283,6 +69,12 @@ export default function SettingsTerminalTab(props: {
     setTerminalThemeId,
     followAppTerminalTheme,
     setFollowAppTerminalTheme,
+    terminalThemeDarkId,
+    setTerminalThemeDarkId,
+    terminalThemeLightId,
+    setTerminalThemeLightId,
+    lightUiThemeId,
+    darkUiThemeId,
     terminalFontFamilyId,
     setTerminalFontFamilyId,
     terminalFontSize,
@@ -307,13 +99,23 @@ export default function SettingsTerminalTab(props: {
   });
   const [customShellModalOpen, setCustomShellModalOpen] = useState(false);
   const [customShellDraft, setCustomShellDraft] = useState("");
+  const [customArgsDraft, setCustomArgsDraft] = useState("");
 
   // Update showCustomShellInput once discovered shells load
   useEffect(() => {
     if (!terminalSettings.localShell) return;
     setShowCustomShellInput(!discoveredShells.some(s => s.id === terminalSettings.localShell));
   }, [discoveredShells, terminalSettings.localShell]);
+
+  // Seed the drafts from current settings and open the custom-shell editor.
+  // Used both when picking "Custom…" and when re-editing an existing custom shell.
+  const openCustomShellModal = useCallback(() => {
+    setCustomShellDraft(terminalSettings.localShell || "");
+    setCustomArgsDraft(formatShellArgs(terminalSettings.localShellArgs ?? []));
+    setCustomShellModalOpen(true);
+  }, [terminalSettings.localShell, terminalSettings.localShellArgs]);
   const [themeModalOpen, setThemeModalOpen] = useState(false);
+  const [themeModalSlot, setThemeModalSlot] = useState<'dark' | 'light' | null>(null);
 
   // Subscribe to custom theme changes so editing in-place triggers re-render
   const customThemes = useCustomThemes();
@@ -324,6 +126,45 @@ export default function SettingsTerminalTab(props: {
       || customThemes.find(t => t.id === terminalThemeId)
       || TERMINAL_THEMES[0];
   }, [terminalThemeId, customThemes]);
+
+  // Preview themes for the follow-app per-mode pickers. resolvedTheme is
+  // forced per slot so each preview reflects exactly that mode's selection.
+  const darkPreviewTheme = useMemo(() => {
+    const id = resolveFollowedTerminalThemeId({
+      resolvedTheme: 'dark',
+      terminalThemeDarkId, terminalThemeLightId,
+      lightUiThemeId, darkUiThemeId, fallbackThemeId: terminalThemeId,
+    });
+    return TERMINAL_THEMES.find(t => t.id === id)
+      || customThemes.find(t => t.id === id)
+      // Mirror the runtime fallback in useSettingsState.currentTerminalTheme:
+      // a deleted per-mode override falls back to the manual theme, not [0].
+      || TERMINAL_THEMES.find(t => t.id === terminalThemeId)
+      || customThemes.find(t => t.id === terminalThemeId)
+      || TERMINAL_THEMES[0];
+  }, [terminalThemeDarkId, terminalThemeLightId, lightUiThemeId, darkUiThemeId, terminalThemeId, customThemes]);
+
+  const lightPreviewTheme = useMemo(() => {
+    const id = resolveFollowedTerminalThemeId({
+      resolvedTheme: 'light',
+      terminalThemeDarkId, terminalThemeLightId,
+      lightUiThemeId, darkUiThemeId, fallbackThemeId: terminalThemeId,
+    });
+    return TERMINAL_THEMES.find(t => t.id === id)
+      || customThemes.find(t => t.id === id)
+      // Mirror the runtime fallback in useSettingsState.currentTerminalTheme:
+      // a deleted per-mode override falls back to the manual theme, not [0].
+      || TERMINAL_THEMES.find(t => t.id === terminalThemeId)
+      || customThemes.find(t => t.id === terminalThemeId)
+      || TERMINAL_THEMES[0];
+  }, [terminalThemeDarkId, terminalThemeLightId, lightUiThemeId, darkUiThemeId, terminalThemeId, customThemes]);
+
+  const fontWeightOptions = useMemo(() => (
+    FONT_WEIGHT_OPTIONS.map((option) => ({
+      value: option.value,
+      label: `${option.value} - ${t(option.labelKey)}`,
+    }))
+  ), [t]);
 
   const handleAutocompleteGhostTextChange = useCallback((enabled: boolean) => {
     updateTerminalSetting("autocompleteGhostText", enabled);
@@ -506,19 +347,65 @@ export default function SettingsTerminalTab(props: {
           />
         </SettingRow>
       </div>
-      {!followAppTerminalTheme && (
-        <ThemePreviewButton
-          theme={currentTheme}
-          onClick={() => setThemeModalOpen(true)}
-          buttonLabel={t("settings.terminal.theme.selectButton")}
-        />
-      )}
+      <div className="space-y-2">
+        {followAppTerminalTheme && (
+          <>
+          <div>
+            <div className="text-xs text-muted-foreground mb-1.5 px-1">
+              {t("settings.terminal.theme.darkTheme")}
+            </div>
+            <ThemePreviewButton
+              theme={darkPreviewTheme}
+              onClick={() => setThemeModalSlot('dark')}
+              buttonLabel={terminalThemeDarkId === TERMINAL_THEME_AUTO
+                ? t("settings.terminal.theme.auto")
+                : t("settings.terminal.theme.selectButton")}
+            />
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground mb-1.5 px-1">
+              {t("settings.terminal.theme.lightTheme")}
+            </div>
+            <ThemePreviewButton
+              theme={lightPreviewTheme}
+              onClick={() => setThemeModalSlot('light')}
+              buttonLabel={terminalThemeLightId === TERMINAL_THEME_AUTO
+                ? t("settings.terminal.theme.auto")
+                : t("settings.terminal.theme.selectButton")}
+            />
+          </div>
+          </>
+        )}
+        {!followAppTerminalTheme && (
+          <div>
+            <div className="text-xs text-muted-foreground mb-1.5 px-1">
+              {t("terminal.themeModal.globalTheme")}
+            </div>
+            <ThemePreviewButton
+              theme={currentTheme}
+              onClick={() => setThemeModalOpen(true)}
+              buttonLabel={t("settings.terminal.theme.selectButton")}
+            />
+          </div>
+        )}
+      </div>
 
       <ThemeSelectModal
         open={themeModalOpen}
         onClose={() => setThemeModalOpen(false)}
         selectedThemeId={terminalThemeId}
         onSelect={setTerminalThemeId}
+      />
+      <ThemeSelectModal
+        open={themeModalSlot !== null}
+        onClose={() => setThemeModalSlot(null)}
+        selectedThemeId={themeModalSlot === 'dark' ? terminalThemeDarkId : terminalThemeLightId}
+        onSelect={(id) => {
+          if (themeModalSlot === 'dark') setTerminalThemeDarkId(id);
+          else if (themeModalSlot === 'light') setTerminalThemeLightId(id);
+        }}
+        filterType={themeModalSlot === 'light' ? 'light' : 'dark'}
+        showAutoOption
       />
 
       {/* Theme action buttons */}
@@ -616,6 +503,17 @@ export default function SettingsTerminalTab(props: {
         </SettingRow>
 
         <SettingRow
+          label={t("settings.terminal.font.cjk")}
+          description={t("settings.terminal.font.cjk.desc")}
+        >
+          <TerminalCjkFontSelect
+            value={terminalSettings.fallbackFont ?? ""}
+            onChange={(next) => updateTerminalSetting("fallbackFont", next)}
+            className="w-48"
+          />
+        </SettingRow>
+
+        <SettingRow
           label={t("settings.terminal.font.size")}
           description={t("settings.terminal.font.size.desc")}
         >
@@ -646,17 +544,7 @@ export default function SettingsTerminalTab(props: {
         >
           <Select
             value={String(terminalSettings.fontWeight)}
-            options={[
-              { value: "100", label: "100 - Thin" },
-              { value: "200", label: "200 - Extra Light" },
-              { value: "300", label: "300 - Light" },
-              { value: "400", label: "400 - Normal" },
-              { value: "500", label: "500 - Medium" },
-              { value: "600", label: "600 - Semi Bold" },
-              { value: "700", label: "700 - Bold" },
-              { value: "800", label: "800 - Extra Bold" },
-              { value: "900", label: "900 - Black" },
-            ]}
+            options={fontWeightOptions}
             onChange={(v) => updateTerminalSetting("fontWeight", parseInt(v))}
             className="w-40"
           />
@@ -668,19 +556,19 @@ export default function SettingsTerminalTab(props: {
         >
           <Select
             value={String(terminalSettings.fontWeightBold)}
-            options={[
-              { value: "100", label: "100 - Thin" },
-              { value: "200", label: "200 - Extra Light" },
-              { value: "300", label: "300 - Light" },
-              { value: "400", label: "400 - Normal" },
-              { value: "500", label: "500 - Medium" },
-              { value: "600", label: "600 - Semi Bold" },
-              { value: "700", label: "700 - Bold" },
-              { value: "800", label: "800 - Extra Bold" },
-              { value: "900", label: "900 - Black" },
-            ]}
+            options={fontWeightOptions}
             onChange={(v) => updateTerminalSetting("fontWeightBold", parseInt(v))}
             className="w-40"
+          />
+        </SettingRow>
+
+        <SettingRow
+          label={t("settings.terminal.font.smoothing")}
+          description={t("settings.terminal.font.smoothing.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.fontSmoothing}
+            onChange={(v) => updateTerminalSetting("fontSmoothing", v)}
           />
         </SettingRow>
 
@@ -749,6 +637,12 @@ export default function SettingsTerminalTab(props: {
         >
           <Toggle checked={terminalSettings.altAsMeta} onChange={(v) => updateTerminalSetting("altAsMeta", v)} />
         </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.keyboard.optionArrowWordJump")}
+          description={t("settings.terminal.keyboard.optionArrowWordJump.desc")}
+        >
+          <Toggle checked={terminalSettings.optionArrowWordJump} onChange={(v) => updateTerminalSetting("optionArrowWordJump", v)} />
+        </SettingRow>
       </div>
 
       <SectionHeader title={t("settings.terminal.section.accessibility")} />
@@ -776,137 +670,11 @@ export default function SettingsTerminalTab(props: {
         </SettingRow>
       </div>
 
-      <SectionHeader title={t("settings.terminal.section.behavior")} />
-      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
-        <SettingRow
-          label={t("settings.terminal.behavior.rightClick")}
-          description={t("settings.terminal.behavior.rightClick.desc")}
-        >
-          <Select
-            value={terminalSettings.rightClickBehavior}
-            options={[
-              { value: "context-menu", label: t("settings.terminal.behavior.rightClick.menu") },
-              { value: "paste", label: t("settings.terminal.behavior.rightClick.paste") },
-              { value: "select-word", label: t("settings.terminal.behavior.rightClick.selectWord") },
-            ]}
-            onChange={(v) => updateTerminalSetting("rightClickBehavior", v as RightClickBehavior)}
-            className="w-36"
-          />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.copyOnSelect")}
-          description={t("settings.terminal.behavior.copyOnSelect.desc")}
-        >
-          <Toggle checked={terminalSettings.copyOnSelect} onChange={(v) => updateTerminalSetting("copyOnSelect", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.middleClickPaste")}
-          description={t("settings.terminal.behavior.middleClickPaste.desc")}
-        >
-          <Toggle checked={terminalSettings.middleClickPaste} onChange={(v) => updateTerminalSetting("middleClickPaste", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.bracketedPaste")}
-          description={t("settings.terminal.behavior.bracketedPaste.desc")}
-        >
-          <Toggle checked={!terminalSettings.disableBracketedPaste} onChange={(v) => updateTerminalSetting("disableBracketedPaste", !v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.osc52Clipboard")}
-          description={t("settings.terminal.behavior.osc52Clipboard.desc")}
-        >
-          <Select
-            value={terminalSettings.osc52Clipboard ?? 'write-only'}
-            options={[
-              { value: "off", label: t("settings.terminal.behavior.osc52Clipboard.off") },
-              { value: "write-only", label: t("settings.terminal.behavior.osc52Clipboard.writeOnly") },
-              { value: "read-write", label: t("settings.terminal.behavior.osc52Clipboard.readWrite") },
-              { value: "prompt", label: t("settings.terminal.behavior.osc52Clipboard.prompt") },
-            ]}
-            onChange={(v) => updateTerminalSetting("osc52Clipboard", v as "off" | "write-only" | "read-write" | "prompt")}
-            className="w-40"
-          />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.scrollOnInput")}
-          description={t("settings.terminal.behavior.scrollOnInput.desc")}
-        >
-          <Toggle checked={terminalSettings.scrollOnInput} onChange={(v) => updateTerminalSetting("scrollOnInput", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.scrollOnOutput")}
-          description={t("settings.terminal.behavior.scrollOnOutput.desc")}
-        >
-          <Toggle checked={terminalSettings.scrollOnOutput} onChange={(v) => updateTerminalSetting("scrollOnOutput", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.scrollOnKeyPress")}
-          description={t("settings.terminal.behavior.scrollOnKeyPress.desc")}
-        >
-          <Toggle checked={terminalSettings.scrollOnKeyPress} onChange={(v) => updateTerminalSetting("scrollOnKeyPress", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.scrollOnPaste")}
-          description={t("settings.terminal.behavior.scrollOnPaste.desc")}
-        >
-          <Toggle checked={terminalSettings.scrollOnPaste} onChange={(v) => updateTerminalSetting("scrollOnPaste", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.smoothScrolling")}
-          description={t("settings.terminal.behavior.smoothScrolling.desc")}
-        >
-          <Toggle checked={terminalSettings.smoothScrolling} onChange={(v) => updateTerminalSetting("smoothScrolling", v)} />
-        </SettingRow>
-
-        <SettingRow
-          label={t("settings.terminal.behavior.linkModifier")}
-          description={t("settings.terminal.behavior.linkModifier.desc")}
-        >
-          <Select
-            value={terminalSettings.linkModifier}
-            options={[
-              { value: "none", label: t("settings.terminal.behavior.linkModifier.none") },
-              { value: "ctrl", label: t("settings.terminal.behavior.linkModifier.ctrl") },
-              { value: "alt", label: t("settings.terminal.behavior.linkModifier.alt") },
-              { value: "meta", label: t("settings.terminal.behavior.linkModifier.meta") },
-            ]}
-            onChange={(v) => updateTerminalSetting("linkModifier", v as LinkModifier)}
-            className="w-48"
-          />
-        </SettingRow>
-      </div>
-
-      <SectionHeader title={t("settings.terminal.section.scrollback")} />
-      <div className="rounded-lg border bg-card p-4">
-        <p className="text-sm text-muted-foreground mb-3">
-          {t("settings.terminal.scrollback.desc")}
-        </p>
-        <div className="space-y-1">
-          <Label className="text-xs">{t("settings.terminal.scrollback.rows")}</Label>
-          <Input
-            type="number"
-            min={0}
-            max={100000}
-            value={terminalSettings.scrollback}
-            onChange={(e) => {
-              const val = parseInt(e.target.value);
-              if (!isNaN(val) && val >= 0 && val <= 100000) {
-                updateTerminalSetting("scrollback", val);
-              }
-            }}
-            className="w-full"
-          />
-        </div>
-      </div>
+      <TerminalBehaviorSettings
+        t={t}
+        terminalSettings={terminalSettings}
+        updateTerminalSetting={updateTerminalSetting}
+      />
 
       <SectionHeader title={t("settings.terminal.section.keywordHighlight")} />
       <div className="rounded-lg border bg-card p-4">
@@ -934,39 +702,57 @@ export default function SettingsTerminalTab(props: {
           description={t("settings.terminal.localShell.shell.desc")}
         >
           <div className="flex flex-col gap-1 items-end">
-            <select
-              className="h-9 w-48 rounded-md border border-input bg-background px-3 text-sm"
+            <ShadcnSelect
               value={
                 showCustomShellInput
                   ? "__custom__"
-                  : terminalSettings.localShell || ""
+                  : (terminalSettings.localShell || "__default__")
               }
-              onChange={(e) => {
-                const value = e.target.value;
+              onValueChange={(value) => {
                 if (value === "__custom__") {
-                  setCustomShellDraft(terminalSettings.localShell || "");
-                  setCustomShellModalOpen(true);
+                  openCustomShellModal();
+                } else if (value === "__default__") {
+                  setShowCustomShellInput(false);
+                  updateTerminalSetting("localShell", "");
+                  // Custom args only apply to a custom path; clear them so a stale
+                  // value can't leak into a discovered/default shell launch (#1221).
+                  updateTerminalSetting("localShellArgs", []);
                 } else {
                   setShowCustomShellInput(false);
                   updateTerminalSetting("localShell", value);
+                  updateTerminalSetting("localShellArgs", []);
                 }
               }}
             >
-              <option value="">
-                {t("settings.terminal.localShell.shell.default")}
-                {defaultShell ? ` (${defaultShell.split(/[/\\]/).pop()})` : ""}
-              </option>
-              {discoveredShells.map((shell) => (
-                <option key={shell.id} value={shell.id}>
-                  {shell.name}
-                </option>
-              ))}
-              <option value="__custom__">{t("settings.terminal.localShell.shell.custom")}</option>
-            </select>
+              <SelectTrigger className="h-9 w-48 text-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default__">
+                  {t("settings.terminal.localShell.shell.default")}
+                  {defaultShell ? ` (${defaultShell.split(/[/\\]/).pop()})` : ""}
+                </SelectItem>
+                {discoveredShells.map((shell) => (
+                  <SelectItem key={shell.id} value={shell.id}>
+                    {shell.name}
+                  </SelectItem>
+                ))}
+                <SelectItem value="__custom__">{t("settings.terminal.localShell.shell.custom")}</SelectItem>
+              </SelectContent>
+            </ShadcnSelect>
             {showCustomShellInput && (
-              <span className="text-xs text-muted-foreground truncate max-w-48">
-                {terminalSettings.localShell}
-              </span>
+              <button
+                type="button"
+                onClick={openCustomShellModal}
+                title={t("common.edit")}
+                className="flex items-center gap-1 text-xs text-muted-foreground max-w-48 hover:text-foreground"
+              >
+                <Pencil size={11} className="shrink-0" />
+                <span className="truncate">
+                  {terminalSettings.localShell}
+                  {terminalSettings.localShellArgs?.length ? ` ${formatShellArgs(terminalSettings.localShellArgs)}` : ""}
+                </span>
+              </button>
             )}
             {!showCustomShellInput && defaultShell && !terminalSettings.localShell && (
               <span className="text-xs text-muted-foreground">
@@ -1020,6 +806,35 @@ export default function SettingsTerminalTab(props: {
             className="w-24"
           />
         </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.connection.keepaliveCountMax")}
+          description={t("settings.terminal.connection.keepaliveCountMax.desc")}
+        >
+          <Input
+            type="number"
+            min={1}
+            max={100}
+            value={terminalSettings.keepaliveCountMax}
+            onChange={(e) => {
+              const val = parseInt(e.target.value) || 1;
+              if (val >= 1 && val <= 100) {
+                updateTerminalSetting("keepaliveCountMax", val);
+              }
+            }}
+            className="w-24"
+          />
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.connection.x11Display")}
+          description={t("settings.terminal.connection.x11Display.desc")}
+        >
+          <Input
+            value={terminalSettings.x11Display}
+            onChange={(e) => updateTerminalSetting("x11Display", e.target.value)}
+            placeholder={t("settings.terminal.connection.x11Display.placeholder")}
+            className="w-48"
+          />
+        </SettingRow>
       </div>
 
       <SectionHeader title={t("settings.terminal.section.serverStats")} />
@@ -1059,6 +874,94 @@ export default function SettingsTerminalTab(props: {
         )}
       </div>
 
+      <SectionHeader title={t("settings.terminal.section.systemManager")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          label={t("settings.terminal.systemManager.processRefreshInterval")}
+          description={t("settings.terminal.systemManager.processRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerProcessRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerProcessRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.tmuxRefreshInterval")}
+          description={t("settings.terminal.systemManager.tmuxRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerTmuxRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerTmuxRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.dockerListRefreshInterval")}
+          description={t("settings.terminal.systemManager.dockerListRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={3}
+              max={120}
+              value={terminalSettings.systemManagerDockerListRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 5;
+                if (val >= 3 && val <= 120) {
+                  updateTerminalSetting("systemManagerDockerListRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+        <SettingRow
+          label={t("settings.terminal.systemManager.dockerStatsRefreshInterval")}
+          description={t("settings.terminal.systemManager.dockerStatsRefreshInterval.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={2}
+              max={60}
+              value={terminalSettings.systemManagerDockerStatsRefreshInterval}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10) || 3;
+                if (val >= 2 && val <= 60) {
+                  updateTerminalSetting("systemManagerDockerStatsRefreshInterval", val);
+                }
+              }}
+              className="w-20"
+            />
+            <span className="text-sm text-muted-foreground">{t("settings.terminal.serverStats.seconds")}</span>
+          </div>
+        </SettingRow>
+      </div>
+
       <SectionHeader title={t("settings.terminal.section.rendering")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
@@ -1079,7 +982,7 @@ export default function SettingsTerminalTab(props: {
       </div>
       {/* Autocomplete */}
       <SectionHeader title={t("settings.terminal.section.workspaceFocus")} />
-      <div className="space-y-1">
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
         <SettingRow
           label={t("settings.terminal.workspaceFocus.style")}
           description={t("settings.terminal.workspaceFocus.style.desc")}
@@ -1091,6 +994,7 @@ export default function SettingsTerminalTab(props: {
               { value: 'dim', label: t("settings.terminal.workspaceFocus.dim") },
               { value: 'border', label: t("settings.terminal.workspaceFocus.border") },
             ]}
+            className="w-40"
           />
         </SettingRow>
       </div>
@@ -1155,6 +1059,16 @@ export default function SettingsTerminalTab(props: {
                 </span>
               )}
             </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">{t("settings.terminal.localShell.shell.customArgs")}</label>
+              <Input
+                value={customArgsDraft}
+                placeholder={t("settings.terminal.localShell.shell.customArgs.placeholder")}
+                onChange={(e) => setCustomArgsDraft(e.target.value)}
+                className="w-full"
+              />
+              <span className="text-xs text-muted-foreground">{t("settings.terminal.localShell.shell.customArgs.desc")}</span>
+            </div>
             <div className="space-y-1.5">
               <label className="text-xs text-muted-foreground">{t("settings.terminal.localShell.shell.commonPaths")}</label>
               <div className="flex flex-wrap gap-1.5">
@@ -1183,6 +1097,7 @@ export default function SettingsTerminalTab(props: {
               type="button"
               onClick={() => {
                 updateTerminalSetting("localShell", customShellDraft);
+                updateTerminalSetting("localShellArgs", parseShellArgs(customArgsDraft));
                 setShowCustomShellInput(true);
                 setCustomShellModalOpen(false);
               }}
@@ -1197,3 +1112,5 @@ export default function SettingsTerminalTab(props: {
     </SettingsTabContent>
   );
 }
+
+export default React.memo(SettingsTerminalTab);

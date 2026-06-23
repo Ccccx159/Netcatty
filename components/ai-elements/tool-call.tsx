@@ -1,9 +1,98 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { HTMLAttributes } from 'react';
 import { cn } from '../../lib/utils';
 import { Check, ChevronDown, ChevronRight, CheckCircle2, Loader2, ShieldAlert, X, XCircle, Slash } from 'lucide-react';
-import React, { useCallback, useEffect, useRef, useState, type HTMLAttributes } from 'react';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { useI18n } from '../../application/i18n/I18nProvider';
+
+/**
+ * Pull the user-meaningful shell command out of the tool-call args.
+ *
+ * Different tool surfaces hand us different shapes:
+ *   - Netcatty's own `terminal_execute` MCP tool → `{command: "<string>"}`
+ *   - Codex `local_shell`                      → `{command: ["zsh","-lc","<full>"]}`
+ *   - Codex command_execution (SDK)             → `{command: "/bin/zsh -lc '<full>'"}`
+ *   - Claude `Bash`                             → `{command: "<string>"}`
+ *
+ * The SDK form is a STRING that wraps the real command in `<shell> -lc '<full>'`,
+ * so we unwrap that wrapper too (the array branch already did the equivalent) —
+ * otherwise the outer shell quotes leak into the title.
+ *
+ * And under the "Skill + CLI" integration, the agent's shell tool wraps a
+ * call to our internal `netcatty-tool-cli` binary, so the real intent is one
+ * level deeper:
+ *
+ *   netcatty-tool-cli exec --session <id> --chat-session <id> -- <real-cmd>
+ *
+ * We unwrap both layers so the chat panel shows what the user actually
+ * cares about (the remote command), not Codex's wrapper title which is
+ * just the local path to the CLI binary.
+ */
+export function extractDisplayCommand(args: Record<string, unknown> | undefined): string | null {
+  if (!args) return null;
+  const raw = (args as { command?: unknown }).command;
+
+  let cmdString: string;
+  if (typeof raw === 'string') {
+    if (!raw) return null;
+    cmdString = raw;
+  } else if (Array.isArray(raw) && raw.length > 0) {
+    const isShellWrap =
+      raw.length >= 3 &&
+      /(?:^|\/)(sh|bash|zsh|fish|ash|dash)$/.test(String(raw[0] ?? '')) &&
+      /^-l?c$/.test(String(raw[1] ?? ''));
+    cmdString = isShellWrap
+      ? String(raw[raw.length - 1] ?? '')
+      : raw.map((p) => String(p)).join(' ');
+  } else {
+    return null;
+  }
+
+  // Unwrap a STRING shell wrapper, e.g. Codex SDK's `/bin/zsh -lc '<full>'`.
+  // The array branch above already extracts the inner command; the string form
+  // (codex command_execution) does not, so strip `<shell> -l?c <quote>…<quote>`
+  // here. Without this the outer quote leaks into the netcatty-cli title below.
+  const strWrap = cmdString.match(
+    /^(?:\S*\/)?(?:sh|bash|zsh|fish|ash|dash)\s+-l?c\s+(['"])([\s\S]*)\1\s*$/,
+  );
+  if (strWrap) cmdString = strWrap[2];
+
+  // Netcatty CLI wrapper extraction.
+  const cliIdx = cmdString.indexOf('netcatty-tool-cli');
+  if (cliIdx >= 0) {
+    const afterCli = cmdString
+      .slice(cliIdx + 'netcatty-tool-cli'.length)
+      .replace(/^["']?\s*/, '');
+    const subMatch = afterCli.match(/^(\S+)/);
+    const sub = subMatch ? subMatch[1] : '';
+
+    if (sub === 'exec' || sub === 'job-start') {
+      // Pull out the command after the ` -- ` separator.
+      const dashIdx = afterCli.indexOf(' -- ');
+      if (dashIdx >= 0) {
+        let inner = afterCli.slice(dashIdx + 4).trim();
+        if (
+          inner.length >= 2 &&
+          ((inner[0] === '"' && inner.endsWith('"')) ||
+            (inner[0] === "'" && inner.endsWith("'")))
+        ) {
+          inner = inner.slice(1, -1);
+        }
+        return inner;
+      }
+    }
+    if (sub === 'job-poll') return 'netcatty: poll job';
+    if (sub === 'job-stop') return 'netcatty: stop job';
+    if (sub === 'session') return 'netcatty: inspect session';
+    if (sub === 'env') return 'netcatty: list sessions';
+    if (sub === 'status') return 'netcatty: status';
+    if (sub) return `netcatty: ${sub}`;
+  }
+
+  return cmdString;
+}
 
 /**
  * Format tool result for display. Extracts stdout/stderr from structured
@@ -40,6 +129,7 @@ function formatToolResult(result: unknown): string {
 
 export interface ToolCallProps extends HTMLAttributes<HTMLDivElement> {
   name: string;
+  className?: string;
   args?: Record<string, unknown>;
   result?: unknown;
   isError?: boolean;
@@ -139,13 +229,22 @@ export const ToolCall = ({
           ? <ChevronDown size={12} className="text-muted-foreground/40 shrink-0" />
           : <ChevronRight size={12} className="text-muted-foreground/40 shrink-0" />
         }
-        {name === 'terminal_execute' && args?.command ? (
-          <span className="font-mono text-muted-foreground/70 truncate" title={String(args.command)}>
-            <span className="text-muted-foreground/40">$ </span>{String(args.command)}
-          </span>
-        ) : (
-          <span className="font-mono text-muted-foreground/70 truncate">{name}</span>
-        )}
+        {(() => {
+          const displayCmd = extractDisplayCommand(args);
+          if (displayCmd) {
+            return (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="font-mono text-muted-foreground/70 truncate cursor-default">
+                    <span className="text-muted-foreground/40">$ </span>{displayCmd}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{displayCmd}</TooltipContent>
+              </Tooltip>
+            );
+          }
+          return <span className="font-mono text-muted-foreground/70 truncate">{name}</span>;
+        })()}
         <span className="flex-1" />
         {/* Approval badge for resolved approvals */}
         {approvalStatus === 'approved' && (

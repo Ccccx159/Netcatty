@@ -10,6 +10,7 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { cn } from '../../lib/utils';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import {
+  getExternalAgentSdkBackend,
   isSettingsManagedDiscoveredAgent,
   matchesManagedAgentConfig,
 } from '../../infrastructure/ai/managedAgents';
@@ -20,6 +21,7 @@ import {
   DropdownContent,
   DropdownTrigger,
 } from '../ui/dropdown';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 interface AgentSelectorProps {
   currentAgentId: string;
@@ -80,6 +82,7 @@ const DiscoveredAgentRow: React.FC<{
   agent: DiscoveredAgent;
   onEnable: () => void;
 }> = ({ agent, onEnable }) => {
+  const { t } = useI18n();
   const agentLike: AgentInfo = {
     id: `discovered_${agent.command}`,
     name: agent.name,
@@ -98,13 +101,17 @@ const DiscoveredAgentRow: React.FC<{
           {agent.version || agent.path}
         </span>
       </div>
-      <button
-        onClick={onEnable}
-        className="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors cursor-pointer"
-        title={`Enable ${agent.name}`}
-      >
-        <Plus size={12} />
-      </button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={onEnable}
+            className="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors cursor-pointer"
+          >
+            <Plus size={12} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{t('ai.chat.enableAgent', { name: agent.name })}</TooltipContent>
+      </Tooltip>
     </div>
   );
 };
@@ -125,7 +132,7 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
   const enabledExternalAgents = useMemo(
     () =>
       externalAgents
-        .filter((agent) => agent.enabled)
+        .filter((agent) => agent.enabled && Boolean(getExternalAgentSdkBackend(agent)))
         .map(
           (agent): AgentInfo => ({
             id: agent.id,
@@ -217,7 +224,7 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
       <DropdownContent
         align="start"
         sideOffset={6}
-        className="w-[288px] overflow-hidden rounded-2xl border border-border/50 bg-popover p-0 text-foreground shadow-lg supports-[backdrop-filter]:backdrop-blur-xl"
+        className="w-[288px] overflow-hidden rounded-2xl border border-border/50 bg-popover p-0 text-foreground shadow-lg supports-[backdrop-filter]:backdrop-blur-sm"
       >
         {BUILTIN_AGENTS.map((agent) => (
           <AgentMenuRow
@@ -250,14 +257,18 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
             <SectionLabel
               action={
                 onRediscover && (
-                  <button
-                    onClick={onRediscover}
-                    disabled={isDiscovering}
-                    className="text-[10px] text-muted-foreground/40 hover:text-muted-foreground/70 transition-colors cursor-pointer disabled:opacity-50"
-                    title={t('ai.chat.rescan')}
-                  >
-                    <RefreshCw size={10} className={cn(isDiscovering && 'animate-spin')} />
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        onClick={onRediscover}
+                        disabled={isDiscovering}
+                        className="text-[10px] text-muted-foreground/40 hover:text-muted-foreground/70 transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw size={10} className={cn(isDiscovering && 'animate-spin')} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>{t('ai.chat.rescan')}</TooltipContent>
+                  </Tooltip>
                 )
               }
             >

@@ -1,3 +1,6 @@
+const { moshExtraResources } = require('./scripts/mosh-extra-resources.cjs');
+const { etExtraResources } = require('./scripts/et-extra-resources.cjs');
+
 /**
  * @type {import('electron-builder').Configuration}
  */
@@ -5,6 +8,30 @@ module.exports = {
     appId: 'com.netcatty.app',
     productName: 'Netcatty',
     artifactName: '${productName}-${version}-${os}-${arch}.${ext}',
+    protocols: [
+        {
+            name: 'SSH URL',
+            schemes: ['ssh']
+        }
+    ],
+    electronLanguages: ['en', 'en-US', 'zh_CN', 'zh-CN', 'ru'],
+    // Give the macOS build a unique Mach-O LC_UUID before signing, so macOS
+    // Local Network privacy treats Netcatty distinctly from every other
+    // Electron app (which all share Electron's prebuilt LC_UUID) — see #1040
+    // and scripts/afterPackMacUuid.cjs. No-op on Windows/Linux.
+    beforePack: './scripts/beforePackCursorSdk.cjs',
+    afterPack: './scripts/afterPackMacUuid.cjs',
+    // Platform-split icons (#813):
+    //   - public/icon.png keeps Apple's HIG grid margin so the rendered
+    //     squircle sits at ~88% of the PNG canvas. macOS needs this —
+    //     the dock renders icons with its own rounding/shadow and most
+    //     third-party apps (#803) leave that grid margin alone so the
+    //     squircle lines up with neighbors.
+    //   - public/icon-win.png uses a tight-crop viewBox so the squircle
+    //     fills 100% of the PNG. Windows / Linux taskbars render icons
+    //     full-bleed, so the Apple margin showed up as visible padding,
+    //     making the app icon look smaller than other apps in taskbar /
+    //     Start menu / desktop shortcuts.
     icon: 'public/icon.png',
     // npmRebuild must stay enabled for macOS and Windows builds — without it,
     // node-pty's native module is not recompiled for the Electron ABI, causing
@@ -20,21 +47,93 @@ module.exports = {
         'dist/**/*',
         'electron/**/*',
         'lib/**/*.cjs',
+        'lib/**/*.json',
         '!electron/.dev-config.json',
         'skills/**/*',
-        'public/**/*',
-        'node_modules/**/*'
+        '!public/**/*',
+        '!**/*.map',
+        '!**/*.d.ts',
+        '!**/*.d.mts',
+        '!**/*.d.cts',
+        '!**/*.ts',
+        '!**/*.tsx',
+        '!**/*.test.*',
+        '!**/*.spec.*',
+        '!**/__tests__/**/*',
+        '!**/test/**/*',
+        '!**/tests/**/*',
+        '!**/example/**/*',
+        '!**/examples/**/*',
+        '!node_modules/**/docs/**/*',
+        '!node_modules/**/doc/**/*',
+        '!node_modules/**/benchmark/**/*',
+        '!node_modules/**/benchmarks/**/*',
+        // Renderer-only packages are compiled into dist by Vite. Keep them
+        // installed for npm run dev/build, but do not ship the duplicate source
+        // packages in release artifacts.
+        '!node_modules/@fontsource/**/*',
+        '!node_modules/@monaco-editor/**/*',
+        '!node_modules/@radix-ui/**/*',
+        '!node_modules/@xterm/**/*',
+        '!node_modules/lucide-react/**/*',
+        '!node_modules/monaco-editor/**/*',
+        '!node_modules/react/**/*',
+        '!node_modules/react-dom/**/*',
+        // Heavy cloud completion specs are intentionally not bundled. The main
+        // process filters the same prefixes so dev and packaged builds behave
+        // consistently.
+        '!node_modules/@withfig/autocomplete/build/aws.js',
+        '!node_modules/@withfig/autocomplete/build/aws/**/*',
+        '!node_modules/@withfig/autocomplete/build/gcloud.js',
+        '!node_modules/@withfig/autocomplete/build/gcloud/**/*',
+        '!node_modules/@withfig/autocomplete/build/az/**/*',
+        // Fig specs are already compiled JavaScript; TypeScript is only pulled
+        // in by Fig helper packages as build tooling and is not needed at app
+        // runtime.
+        '!node_modules/typescript/**/*',
+        // ── Exclude per-platform native agent binaries (~100s of MB each). ──
+        // Netcatty is "bring your own CLI": each SDK is pointed at the user's
+        // system-installed CLI via an absolute path override (claude
+        // pathToClaudeCodeExecutable / codex codexPathOverride / copilot cliPath).
+        // Only the SDKs' JS is bundled; the heavy per-arch binaries are dropped.
+        // NOTE: claude-agent-sdk vendors the `claude` binary as a NESTED package
+        // (claude-agent-sdk/node_modules/@anthropic-ai/claude-agent-sdk-<arch>),
+        // so this exclusion must match at any depth (**/), not just top-level.
+        // The codex/copilot exclusions target only the per-arch binary packages
+        // (codex-<arch> / copilot-<arch>) — NOT @openai/codex-sdk / copilot-sdk,
+        // whose JS we DO bundle. @github/copilot is the full ~288MB CLI (with
+        // per-platform prebuilds); netcatty uses the user's copilot via cliPath,
+        // so it is excluded entirely.
+        '!**/@anthropic-ai/claude-agent-sdk-*/**/*',
+        '!node_modules/@anthropic-ai/claude-code-*/**/*',
+        '!node_modules/@openai/codex-{darwin,linux,linuxmusl,win32}-*/**/*',
+        '!node_modules/@github/copilot-{darwin,linux,linuxmusl,win32}-*/**/*',
+        '!node_modules/@github/copilot/**/*',
+        // CodeBuddy follows the same first-party integration model as the
+        // other coding agents: Netcatty discovers and passes the user's
+        // installed CLI path to the SDK. Keep the small SDK wrapper, but do not
+        // bundle the full CodeBuddy CLI payload (rg vendors + web UI).
+        '!node_modules/@tencent-ai/agent-sdk/cli/**/*',
+        // Netcatty loads Cursor SDK through ESM dynamic import, so the duplicate
+        // CommonJS build and type metadata are not needed at runtime.
+        '!node_modules/@cursor/sdk/dist/cjs/**/*',
+        '!node_modules/@cursor/sdk/dist/**/*.d.ts',
+        '!node_modules/@cursor/sdk/dist/**/*.d.ts.map',
+        // sqlite3 rebuilds a native module for Electron; its upstream source
+        // tarball is build-time payload only.
+        '!node_modules/sqlite3/deps/**/*'
     ],
     asarUnpack: [
         'node_modules/node-pty/**/*',
         'node_modules/ssh2/**/*',
         'node_modules/cpu-features/**/*',
-        'node_modules/@zed-industries/claude-agent-acp/**/*',
-        'node_modules/@agentclientprotocol/sdk/**/*',
+        'node_modules/@vscode/windows-process-tree/**/*',
         'node_modules/@anthropic-ai/claude-agent-sdk/**/*',
-        'node_modules/@zed-industries/codex-acp/**/*',
-        'node_modules/@zed-industries/codex-acp-*/**/*',
+        'node_modules/@cursor/sdk-*/**/*',
+        'node_modules/sqlite3/**/*',
         'node_modules/@modelcontextprotocol/sdk/**/*',
+        'lib/**/*.cjs',
+        'lib/**/*.json',
         'node_modules/zod/**/*',
         'node_modules/zod-to-json-schema/**/*',
         'node_modules/ajv/**/*',
@@ -67,7 +166,8 @@ module.exports = {
             NSCameraUsageDescription: 'Netcatty may use the camera for video calls',
             NSMicrophoneUsageDescription: 'Netcatty may use the microphone for audio',
             NSLocalNetworkUsageDescription: 'Netcatty needs local network access for SSH connections'
-        }
+        },
+        extraResources: [...moshExtraResources('darwin'), ...etExtraResources('darwin')]
     },
     dmg: {
         title: '${productName}',
@@ -83,6 +183,7 @@ module.exports = {
         ]
     },
     win: {
+        icon: 'public/icon-win.png',
         target: [
             {
                 target: 'nsis',
@@ -92,7 +193,8 @@ module.exports = {
                 target: 'portable',
                 arch: ['x64', 'arm64']
             }
-        ]
+        ],
+        extraResources: [...moshExtraResources('win32'), ...etExtraResources('win32')]
     },
     portable: {
         artifactName: '${productName}-${version}-portable-${os}-${arch}.${ext}',
@@ -107,13 +209,28 @@ module.exports = {
         shortcutName: 'Netcatty'
     },
     linux: {
-        target: ['AppImage', 'deb', 'rpm'],
-        category: 'Development'
+        // Linux .deb/.rpm/AppImage icons come from build/icons/* (see
+        // scripts/generate-linux-icons.sh). Point at the icons directory
+        // under buildResources — electron-builder still falls back to the
+        // top-level icon (public/icon.png) when linux.icon is unset, which
+        // installs only hicolor/1024x1024 and launchers miss the icon (#274,
+        // #1340). Do NOT set linux.icon to a single 1024px PNG either.
+        icon: 'icons',
+        target: ['AppImage', 'deb', 'rpm', 'pacman'],
+        category: 'Development',
+        extraResources: [...moshExtraResources('linux'), ...etExtraResources('linux')]
     },
     deb: {
         // Use gzip instead of default xz(lzma) for better compatibility with
         // Deepin OS and other distros that have issues with lzma decompression
         compression: 'gz'
+    },
+    pacman: {
+        // FPM-generated .pacman packages bypass Arch's alpm hooks that
+        // normally refresh the hicolor icon cache. Without this, KDE cannot
+        // resolve Icon=netcatty and shows a generic placeholder (#1358).
+        afterInstall: 'scripts/linux/after-install.tpl',
+        afterRemove: 'scripts/linux/after-remove.tpl',
     },
     publish: [
         {

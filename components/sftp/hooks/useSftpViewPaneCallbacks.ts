@@ -46,6 +46,9 @@ interface UseSftpViewPaneCallbacksParams {
   ) => Promise<{ transferId: string; totalBytes?: number; error?: string }>;
   getSftpIdForConnection?: (connectionId: string) => string | undefined;
   listLocalFiles: (path: string) => Promise<RemoteFile[]>;
+  mkdirLocal?: (path: string) => Promise<void>;
+  deleteLocalFile?: (path: string) => Promise<void>;
+  listDrives: () => Promise<string[]>;
 }
 
 export const useSftpViewPaneCallbacks = ({
@@ -61,6 +64,7 @@ export const useSftpViewPaneCallbacks = ({
   startStreamTransfer,
   getSftpIdForConnection,
   listLocalFiles,
+  listDrives,
 }: UseSftpViewPaneCallbacksParams) => {
   const paneActions = useSftpViewPaneActions({ sftpRef });
   const fileOps = useSftpViewFileOps({
@@ -165,10 +169,15 @@ export const useSftpViewPaneCallbacks = ({
       onEditPermissions: fileOps.onEditPermissionsLeft,
       onEditFile: fileOps.onEditFileLeft,
       onOpenFile: fileOps.onOpenFileLeft,
+      onOpenFileWithSystemDefault: fileOps.onOpenFileWithSystemDefaultLeft,
       onOpenFileWith: fileOps.onOpenFileWithLeft,
       onDownloadFile: fileOps.onDownloadFileLeft,
+      onDownloadFiles: fileOps.onDownloadFilesLeft,
       onUploadExternalFiles: fileOps.onUploadExternalFilesLeft,
+      onUploadExternalFileList: fileOps.onUploadExternalFileListLeft,
+      onUploadExternalFolder: fileOps.onUploadExternalFolderLeft,
       onListDirectory: makeListDirectory("left", () => sftpRef.current.leftPane),
+      onListDrives: listDrives,
     }),
     [],
   );
@@ -202,10 +211,15 @@ export const useSftpViewPaneCallbacks = ({
       onEditPermissions: fileOps.onEditPermissionsRight,
       onEditFile: fileOps.onEditFileRight,
       onOpenFile: fileOps.onOpenFileRight,
+      onOpenFileWithSystemDefault: fileOps.onOpenFileWithSystemDefaultRight,
       onOpenFileWith: fileOps.onOpenFileWithRight,
       onDownloadFile: fileOps.onDownloadFileRight,
+      onDownloadFiles: fileOps.onDownloadFilesRight,
       onUploadExternalFiles: fileOps.onUploadExternalFilesRight,
+      onUploadExternalFileList: fileOps.onUploadExternalFileListRight,
+      onUploadExternalFolder: fileOps.onUploadExternalFolderRight,
       onListDirectory: makeListDirectory("right", () => sftpRef.current.rightPane),
+      onListDrives: listDrives,
     }),
     [],
   );
@@ -230,6 +244,7 @@ export const useSftpViewPaneCallbacks = ({
     fileOpenerTarget: fileOps.fileOpenerTarget,
     setFileOpenerTarget: fileOps.setFileOpenerTarget,
     handleSaveTextFile: fileOps.handleSaveTextFile,
+    onPromoteToTab: fileOps.onPromoteToTab,
     handleFileOpenerSelect: fileOps.handleFileOpenerSelect,
     handleSelectSystemApp: fileOps.handleSelectSystemApp,
   };

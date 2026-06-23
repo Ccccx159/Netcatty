@@ -1,8 +1,8 @@
 /**
  * Context-aware completion engine.
  * Combines multiple data sources:
- * 1. Command history (highest priority)
- * 2. @withfig/autocomplete specs (subcommands, options, args)
+ * 1. Context-aware path completions and @withfig/autocomplete specs
+ * 2. Command history
  * 3. Fuzzy history matching (fallback)
  *
  * Parses the current command line to determine context (command, subcommand,
@@ -30,9 +30,12 @@ import {
   getPathSuggestions,
   resolvePathComponents,
 } from "./remotePathCompleter";
+import { getSnippetSuggestions } from "./snippetCompleter";
+import type { Snippet } from "../../../domain/models";
+import type { AutocompleteCwdSource } from "./terminalAutocompleteLayout";
 
 /** Source indicator for where a suggestion came from */
-export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path";
+export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path" | "snippet";
 
 export interface CompletionSuggestion {
   /** The text to insert */
@@ -49,6 +52,8 @@ export interface CompletionSuggestion {
   frequency?: number;
   /** For path suggestions: file type */
   fileType?: "file" | "directory" | "symlink";
+  /** For snippet suggestions: the source snippet (used by the accept path). */
+  snippet?: Snippet;
 }
 
 export interface CompletionContext {
@@ -64,6 +69,19 @@ export interface CompletionContext {
   commandName: string;
   /** Whether the current position is after a recognized option that expects an argument */
   isOptionArg: boolean;
+}
+
+interface SpecSuggestionResult {
+  suggestions: CompletionSuggestion[];
+  pathArgs?: FigSubcommand["args"];
+}
+
+export function shellEscape(name: string): string {
+  if (!name) return name;
+  if (/[\\$'"|!<>;#~` ]/.test(name)) {
+    return `'${name.replace(/'/g, "'\\''")}'`;
+  }
+  return name;
 }
 
 /**
@@ -155,6 +173,9 @@ export async function getCompletions(
     protocol?: string;
     /** Current working directory (from OSC 7) */
     cwd?: string;
+    cwdSource?: AutocompleteCwdSource;
+    /** Custom snippets to surface at the command position */
+    snippets?: Snippet[];
   } = {},
 ): Promise<CompletionSuggestion[]> {
   const { hostId, maxResults = 15 } = options;
@@ -162,10 +183,13 @@ export async function getCompletions(
   if (!input || input.trim().length === 0) return [];
 
   const ctx = parseCommandLine(input);
+  const specResult: SpecSuggestionResult = ctx.commandName && ctx.wordIndex >= 0
+    ? await getSpecSuggestions(ctx)
+    : { suggestions: [] };
   const suggestions: CompletionSuggestion[] = [];
   const seenSuggestionTexts = new Set<string>();
   const pathCheck = ctx.commandName && ctx.wordIndex >= 1
-    ? shouldDoPathCompletion(ctx, undefined)
+    ? shouldDoPathCompletion(ctx, specResult.pathArgs)
     : { shouldComplete: false, foldersOnly: false };
   const preferPathSuggestions = pathCheck.shouldComplete;
   const resultLimit = preferPathSuggestions ? Math.max(maxResults, 24) : maxResults;
@@ -218,21 +242,18 @@ export async function getCompletions(
 
   const canQueryPaths = options.protocol === "local" || options.sessionId !== undefined;
 
-  const specPromise = ctx.commandName && ctx.wordIndex >= 0
-    ? getSpecSuggestions(ctx)
-    : Promise.resolve([]);
-  const pathPromise = canQueryPaths && pathCheck.shouldComplete
-    ? getPathSuggestions(ctx, {
+  const pathEntries = canQueryPaths && pathCheck.shouldComplete
+    ? await getPathSuggestions(ctx, {
       sessionId: options.sessionId,
       protocol: options.protocol,
+      os: options.os,
       cwd: options.cwd,
+      cwdSource: options.cwdSource,
       foldersOnly: pathCheck.foldersOnly,
     })
-    : Promise.resolve([]);
+    : [];
 
-  const [specSugs, pathEntries] = await Promise.all([specPromise, pathPromise]);
-
-  for (const suggestion of specSugs) {
+  for (const suggestion of specResult.suggestions) {
     suggestions.push(suggestion);
     seenSuggestionTexts.add(suggestion.text);
   }
@@ -241,9 +262,9 @@ export async function getCompletions(
     const { pathPrefix, quoteSuffix } = resolvePathComponents(ctx.currentWord, options.cwd);
     const isQuotedPath = ctx.currentWord.startsWith('"') || ctx.currentWord.startsWith("'");
     for (const entry of pathEntries) {
-      const insertName = isQuotedPath || !entry.name.includes(" ")
+      const insertName = isQuotedPath || !/[\\$'"|!<>;#~` ]/.test(entry.name)
         ? entry.name
-        : entry.name.replace(/ /g, "\\ ");
+        : shellEscape(entry.name);
       const suffix = entry.type === "directory" ? "/" : "";
       const fullPath = pathPrefix + insertName + suffix + quoteSuffix;
       const suggestion = {
@@ -278,6 +299,16 @@ export async function getCompletions(
     }
   }
 
+  // Snippets: only at the command position (typing the command name).
+  // Push without the early seen-text skip: snippets score above history, so if
+  // a snippet's label collides with an existing history entry's text, the
+  // score-sort + final dedup below keeps the snippet (the higher-scored one).
+  if (options.snippets && options.snippets.length > 0 && ctx.wordIndex === 0) {
+    for (const snippetSuggestion of getSnippetSuggestions(input, options.snippets, { hostId })) {
+      suggestions.push(snippetSuggestion);
+    }
+  }
+
   // Sort by score descending
   suggestions.sort((a, b) => b.score - a.score);
 
@@ -305,26 +336,26 @@ function normalizeHistoryPathPrefix(token: string): string {
 /**
  * Get suggestions from Fig spec + return resolved args (for path detection reuse).
  */
-async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSuggestion[]> {
+async function getSpecSuggestions(ctx: CompletionContext): Promise<SpecSuggestionResult> {
   const suggestions: CompletionSuggestion[] = [];
 
   const specAvailable = await hasSpec(ctx.commandName);
   if (!specAvailable) {
     if (ctx.wordIndex === 0 && ctx.currentWord.length >= 1) {
-      return await getCommandNameSuggestions(ctx.currentWord);
+      return { suggestions: await getCommandNameSuggestions(ctx.currentWord) };
     }
-    return [];
+    return { suggestions };
   }
 
   const spec = await loadSpec(ctx.commandName);
-  if (!spec) return [];
+  if (!spec) return { suggestions };
 
   // If we're still typing the command name (partial match, not yet complete)
   if (ctx.wordIndex === 0) {
     const typedLower = ctx.currentWord.toLowerCase();
     const specNames = resolveNames(spec.name);
     const isExactMatch = specNames.some((n) => n.toLowerCase() === typedLower);
-    if (!isExactMatch) return [];
+    if (!isExactMatch) return { suggestions };
 
     // Show subcommands as preview (user typed full command but no space yet)
     if (spec.subcommands) {
@@ -340,11 +371,11 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
         if (suggestions.length >= 10) break;
       }
     }
-    return suggestions;
+    return { suggestions };
   }
 
   // Navigate the spec tree based on typed tokens
-  let resolved = resolveSpecContext(spec, ctx.tokens.slice(1, ctx.wordIndex));
+  const resolved = resolveSpecContext(spec, ctx.tokens.slice(1, ctx.wordIndex));
   const currentToken = ctx.currentWord;
 
   // Check if currentToken exactly matches a subcommand — if so, navigate into it
@@ -379,7 +410,7 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
         childResolved.options?.length ? childResolved.options : childResolved.fallbackOptions,
         15,
       );
-      return suggestions;
+      return { suggestions };
     }
   }
 
@@ -434,7 +465,10 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
     }
   }
 
-  return suggestions;
+  return {
+    suggestions,
+    pathArgs: resolved.args,
+  };
 }
 
 /**

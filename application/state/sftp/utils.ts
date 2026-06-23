@@ -1,4 +1,4 @@
-import { SftpFileEntry } from "../../../domain/models";
+import { SftpFileEntry, TransferTask } from "../../../domain/models";
 
 export const formatFileSize = (bytes: number): string => {
   if (bytes === 0) return "--";
@@ -76,7 +76,48 @@ export const getParentPath = (path: string): string => {
   return result;
 };
 
+export const isConcreteTransferTargetPath = (task: Pick<TransferTask, "targetPath">): boolean => {
+  const targetPath = task.targetPath.trim();
+  return targetPath.length > 0 && targetPath !== "(temp)";
+};
+
 export const getFileName = (path: string): string => {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || "";
+};
+
+export const normalizeSftpPathForCompare = (path: string): string => {
+  if (isWindowsRoot(path)) return path.replace(/\//g, "\\").toLowerCase();
+  if (/^[A-Za-z]:/.test(path)) {
+    return path.replace(/\//g, "\\").replace(/[\\]+$/, "").toLowerCase();
+  }
+  if (path === "/") return "/";
+  return path.replace(/\/+$/, "");
+};
+
+export const isSameSftpPath = (a: string, b: string): boolean => {
+  return normalizeSftpPathForCompare(a) === normalizeSftpPathForCompare(b);
+};
+
+export const shouldClearSftpFilterForPathChange = (
+  currentPath: string,
+  nextPath: string,
+): boolean => {
+  return !isSameSftpPath(currentPath, nextPath);
+};
+
+export const getSftpFilterAfterPathChange = (
+  currentPath: string,
+  nextPath: string,
+  currentFilter: string,
+): string => {
+  return shouldClearSftpFilterForPathChange(currentPath, nextPath) ? "" : currentFilter;
+};
+
+export const getSftpFilterAfterPathChangeError = (
+  clearFilterForPathChange: boolean,
+  previousFilter: string,
+  currentFilter: string,
+): string => {
+  return clearFilterForPathChange ? previousFilter : currentFilter;
 };

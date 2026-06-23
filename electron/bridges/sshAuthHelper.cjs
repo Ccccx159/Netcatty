@@ -7,12 +7,42 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const { exec } = require("node:child_process");
+const { utils: sshUtils } = require("ssh2");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
+const {
+  normalizePrivateKeyForSsh2,
+  repairMalformedPem,
+  PrivateKeyPassphraseError,
+} = require("./privateKeyNormalizer.cjs");
 
 // Default SSH key names in priority order
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
+
+class PassphraseCancelledError extends Error {
+  constructor(keyPath) {
+    super(`Passphrase entry cancelled for ${keyPath}`);
+    this.name = "PassphraseCancelledError";
+    this.code = "ERR_PASSPHRASE_CANCELLED";
+    this.cancelled = true;
+  }
+}
+
+function isPassphraseCancelledError(err) {
+  return Boolean(err?.cancelled || err?.code === "ERR_PASSPHRASE_CANCELLED");
+}
+
+async function readFileNoFollow(filePath) {
+  const lstat = await fs.promises.lstat(filePath);
+  if (!lstat.isFile() && !lstat.isSymbolicLink()) return null;
+  const fd = await fs.promises.open(filePath, "r", 0o0);
+  try {
+    return await fs.promises.readFile(fd, { encoding: "utf8" });
+  } finally {
+    await fd.close();
+  }
+}
 
 /**
  * Quick check if file content looks like an SSH private key.
@@ -57,8 +87,11 @@ function isKeyEncrypted(keyContent) {
   // Check for OpenSSH format keys
   if (keyContent.includes("-----BEGIN OPENSSH PRIVATE KEY-----")) {
     try {
+      // Repair mangled framing (lost or escaped newlines) first, so the cipher
+      // name can be read from the base64 blob even when the key was flattened.
+      const source = repairMalformedPem(keyContent) || keyContent;
       // Extract the base64 content between the markers
-      const base64Match = keyContent.match(
+      const base64Match = source.match(
         /-----BEGIN OPENSSH PRIVATE KEY-----\s*([\s\S]*?)\s*-----END OPENSSH PRIVATE KEY-----/
       );
       if (base64Match) {
@@ -86,6 +119,214 @@ function isKeyEncrypted(keyContent) {
   return false;
 }
 
+function expandIdentityFilePath(keyPath) {
+  return keyPath.startsWith("~/")
+    ? path.join(os.homedir(), keyPath.slice(2))
+    : keyPath;
+}
+
+function notifyPassphraseAuthFailed(sender, keyPath, resolvedPath, keyIds) {
+  const keyPaths = resolvedPath && resolvedPath !== keyPath
+    ? [keyPath, resolvedPath]
+    : [keyPath];
+  try {
+    if (typeof sender?.isDestroyed === "function" && sender.isDestroyed()) return;
+    const payload = { keyPaths };
+    if (Array.isArray(keyIds) && keyIds.length > 0) {
+      payload.keyIds = keyIds;
+    }
+    sender?.send?.("netcatty:passphrase-auth-failed", payload);
+  } catch {
+    // Sender may have gone away while authentication was in progress.
+  }
+}
+
+/**
+ * Resolve a private key (and optional passphrase) into a form ssh2 can parse.
+ * PKCS#8 keys, which ssh2 rejects, are transparently converted to a legacy PEM
+ * (see privateKeyNormalizer.cjs).
+ *
+ * @returns {{ privateKey: string, passphrase: string|undefined } | null}
+ *   The usable key, or null when the passphrase is wrong / the key can't be parsed.
+ * @throws {UnsupportedPrivateKeyError} When a PKCS#8 key has no convertible legacy form.
+ */
+function resolveKeyForAuth(privateKey, passphrase) {
+  let normalized;
+  try {
+    normalized = normalizePrivateKeyForSsh2(privateKey, passphrase);
+  } catch (err) {
+    if (err instanceof PrivateKeyPassphraseError) return null;
+    throw err;
+  }
+  const parsed = sshUtils.parseKey(normalized.privateKey, normalized.passphrase);
+  if (parsed && !(parsed instanceof Error)) {
+    return { privateKey: normalized.privateKey, passphrase: normalized.passphrase };
+  }
+  return null;
+}
+
+async function preparePrivateKeyForAuth({
+  sender,
+  privateKey,
+  keyPath,
+  keyId,
+  keyName,
+  hostname,
+  initialPassphrase,
+  passphraseSignal,
+  logPrefix = "[SSHAuth]",
+}) {
+  if (!privateKey) return null;
+
+  if (!isKeyEncrypted(privateKey)) {
+    const resolved = resolveKeyForAuth(privateKey, undefined);
+    return { privateKey: resolved ? resolved.privateKey : privateKey, keyPath, keyName };
+  }
+
+  const promptKeyPath = keyPath || `SSH key for ${keyName || hostname || "connection"}`;
+  const promptKeyName = keyName || path.basename(promptKeyPath);
+  let passphraseInvalid = false;
+
+  if (initialPassphrase) {
+    const resolved = resolveKeyForAuth(privateKey, initialPassphrase);
+    if (resolved) {
+      return { privateKey: resolved.privateKey, keyPath, keyName, passphrase: resolved.passphrase };
+    }
+    console.log(`${logPrefix} Stored passphrase failed for private key`, { keyPath: promptKeyPath });
+    notifyPassphraseAuthFailed(sender, promptKeyPath, undefined, keyId ? [keyId] : undefined);
+    passphraseInvalid = true;
+  }
+
+  while (true) {
+    console.log(`${logPrefix} Private key is encrypted, requesting passphrase`, {
+      keyPath: promptKeyPath,
+      passphraseInvalid,
+    });
+    const result = await passphraseHandler.requestPassphrase(
+      sender,
+      promptKeyPath,
+      promptKeyName,
+      hostname,
+      passphraseInvalid,
+      { signal: passphraseSignal }
+    );
+    if (result?.cancelled) {
+      throw new PassphraseCancelledError(promptKeyPath);
+    }
+    if (!result?.passphrase) {
+      return null;
+    }
+
+    const resolved = resolveKeyForAuth(privateKey, result.passphrase);
+    if (resolved) {
+      return { privateKey: resolved.privateKey, keyPath, keyName, passphrase: resolved.passphrase };
+    }
+
+    console.log(`${logPrefix} Entered passphrase failed for private key`, { keyPath: promptKeyPath });
+    notifyPassphraseAuthFailed(sender, promptKeyPath, undefined, keyId ? [keyId] : undefined);
+    passphraseInvalid = true;
+  }
+}
+
+async function loadIdentityFileForAuth({
+  sender,
+  keyPath,
+  hostname,
+  initialPassphrase,
+  passphraseSignal,
+  logPrefix = "[SSHAuth]",
+}) {
+  const resolvedPath = expandIdentityFilePath(keyPath);
+  const privateKey = await fs.promises.readFile(resolvedPath, "utf8");
+  const keyName = path.basename(resolvedPath);
+
+  if (!isKeyEncrypted(privateKey)) {
+    const resolved = resolveKeyForAuth(privateKey, undefined);
+    return { privateKey: resolved ? resolved.privateKey : privateKey, keyPath: resolvedPath, keyName };
+  }
+
+  let passphraseInvalid = false;
+  if (initialPassphrase) {
+    const resolved = resolveKeyForAuth(privateKey, initialPassphrase);
+    if (resolved) {
+      return { privateKey: resolved.privateKey, keyPath: resolvedPath, keyName, passphrase: resolved.passphrase };
+    }
+    console.log(`${logPrefix} Stored passphrase failed for identity file`, { keyPath: resolvedPath });
+    notifyPassphraseAuthFailed(sender, keyPath, resolvedPath);
+    passphraseInvalid = true;
+  }
+
+  while (true) {
+    console.log(`${logPrefix} Identity file is encrypted, requesting passphrase`, {
+      keyPath: resolvedPath,
+      passphraseInvalid,
+    });
+    const result = await passphraseHandler.requestPassphrase(
+      sender,
+      resolvedPath,
+      keyName,
+      hostname,
+      passphraseInvalid,
+      { signal: passphraseSignal }
+    );
+    if (result?.cancelled) {
+      throw new PassphraseCancelledError(resolvedPath);
+    }
+    if (!result?.passphrase) {
+      return null;
+    }
+
+    const resolved = resolveKeyForAuth(privateKey, result.passphrase);
+    if (resolved) {
+      return { privateKey: resolved.privateKey, keyPath: resolvedPath, keyName, passphrase: resolved.passphrase };
+    }
+
+    console.log(`${logPrefix} Entered passphrase failed for identity file`, { keyPath: resolvedPath });
+    notifyPassphraseAuthFailed(sender, keyPath, resolvedPath);
+    passphraseInvalid = true;
+  }
+}
+
+async function loadFirstIdentityFileForAuth({
+  sender,
+  identityFilePaths,
+  hostname,
+  initialPassphrase,
+  passphraseSignal,
+  logPrefix = "[SSHAuth]",
+  onLoaded,
+  onError,
+}) {
+  if (!Array.isArray(identityFilePaths) || identityFilePaths.length === 0) {
+    return null;
+  }
+
+  for (const keyPath of identityFilePaths) {
+    try {
+      const identityFile = await loadIdentityFileForAuth({
+        sender,
+        keyPath,
+        hostname,
+        initialPassphrase,
+        passphraseSignal,
+        logPrefix,
+      });
+      if (!identityFile) {
+        continue;
+      }
+      onLoaded?.(identityFile);
+      return identityFile;
+    } catch (err) {
+      if (isPassphraseCancelledError(err)) {
+        throw err;
+      }
+      onError?.(err, keyPath);
+    }
+  }
+
+  return null;
+}
+
 /**
  * Find default SSH private key from user's ~/.ssh directory
  * Skips encrypted keys that require a passphrase
@@ -107,9 +348,8 @@ async function findDefaultPrivateKey() {
   for (const name of sorted) {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) continue; // Skip directories, FIFOs, sockets, etc.
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) continue;
       if (!looksLikePrivateKey(privateKey)) continue;
       if (isKeyEncrypted(privateKey)) continue;
       return { privateKey, keyPath, keyName: name };
@@ -144,9 +384,8 @@ async function findAllDefaultPrivateKeys(options = {}) {
   const promises = sorted.map(async (name) => {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) return null;
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) return null;
       if (!looksLikePrivateKey(privateKey)) return null;
       const encrypted = isKeyEncrypted(privateKey);
       if (encrypted && !includeEncrypted) {
@@ -512,18 +751,115 @@ function buildAuthHandler(options) {
   };
 }
 
+// OTP / MFA / token vocabulary. Matched FIRST — any hit here disqualifies the
+// challenge from auto-fill even if it also contains a "password" keyword.
+// Catches phrases like "One-time password", "动态密码", "动态口令",
+// "一次性密码", "Verification code", "Duo passcode", "two-factor", etc.
+// — all single-prompt shapes that look like password fields on the surface
+// but actually want an OTP. Submitting the saved password into any of these
+// burns an auth attempt and risks `pam_faillock` / `pam_tally2` lockout.
+// (#969 PR review, second round.)
+const OTP_PROMPT_PATTERN = new RegExp(
+  [
+    "one[\\s-]?time",
+    "\\botp\\b",
+    "verification",
+    "passcode",
+    "\\btoken\\b",
+    "2fa",
+    "two[\\s-]?factor",
+    "multi[\\s-]?factor",
+    "\\bmfa\\b",
+    "second\\s+factor",
+    "duo",
+    // CJK — no word boundaries; substring match is intentional
+    "动态",
+    "一次性",
+    "验证码",
+    "验证信息",
+    "令牌",
+    "双因素",
+    "多因素",
+    "短信验证",
+    "手机验证",
+  ].join("|"),
+  "i",
+);
+
+// Latin-script + CJK keywords for "this prompt is asking for a reusable
+// password". Only consulted AFTER OTP_PROMPT_PATTERN clears, so phrases like
+// "One-time password" or "动态密码" never reach this step.
+//
+// Custom-localized prompts that don't match these keywords fall through to
+// the modal, which is the same behavior as before the auto-fill optimization
+// — strictly no worse than the old "always prompt" baseline.
+const PASSWORD_PROMPT_PATTERN = /passw(or)?d|密\s*码|口\s*令/i;
+
+/**
+ * Decide whether a keyboard-interactive challenge is "just a PAM-wrapped
+ * password prompt" that we can answer with the saved host password without
+ * bothering the user. PAM-based Linux servers commonly advertise only
+ * `keyboard-interactive` (not `password`), so without this shortcut every
+ * connection pops a second password dialog even when the host already has a
+ * saved credential — see #969.
+ *
+ * Conservative criteria, matching OpenSSH and Tabby behavior:
+ *   - exactly one prompt (multi-prompt is almost certainly real 2FA / MFA)
+ *   - the prompt has `echo === false`
+ *   - the prompt text does NOT contain any OTP / MFA vocabulary
+ *   - the prompt text DOES contain a recognized password keyword (Latin
+ *     "password" / "passwd", CJK "密码" / "口令")
+ *   - we have a non-empty saved password
+ *
+ * Anything else falls through to the modal so the user can answer in person.
+ */
+function isAutoFillablePasswordChallenge(prompts, password) {
+  if (typeof password !== "string" || password.length === 0) return false;
+  if (!Array.isArray(prompts) || prompts.length !== 1) return false;
+  const prompt = prompts[0];
+  if (!prompt || prompt.echo !== false) return false;
+  const promptText = typeof prompt.prompt === "string" ? prompt.prompt : "";
+  if (OTP_PROMPT_PATTERN.test(promptText)) return false;
+  return PASSWORD_PROMPT_PATTERN.test(promptText);
+}
+
 /**
  * Create a keyboard-interactive event handler
  * @param {Object} options
  * @param {Object} options.sender - Electron webContents sender
  * @param {string} options.sessionId - Session/connection ID
  * @param {string} options.hostname - Host being connected to
- * @param {string} [options.password] - Saved password for fill button
+ * @param {string} [options.password] - Saved password; used both as the
+ *   one-click fill button payload and as the auto-fill for the single-
+ *   password-prompt fast path (#969).
  * @param {string} [options.logPrefix] - Log prefix for debugging
+ * @param {"terminal"|"external"} [options.scope] - Renderer-side routing scope
+ * @param {Function} [options.onAutoFill] - Called when the saved password is
+ *   auto-filled into the challenge (no modal shown). Lets callers emit a
+ *   different progress message than the user-prompt flow.
+ * @param {Function} [options.onPromptShown] - Called right before the modal
+ *   IPC is sent to the renderer.
+ * @param {Function} [options.onUserResponded] - Called when the renderer
+ *   sends a response back (after the modal closed).
  * @returns {Function} - Event handler for 'keyboard-interactive' event
  */
 function createKeyboardInteractiveHandler(options) {
-  const { sender, sessionId, hostname, password, logPrefix = "[SSH]" } = options;
+  const {
+    sender,
+    sessionId,
+    hostname,
+    password,
+    logPrefix = "[SSH]",
+    scope = "external",
+    onAutoFill,
+    onPromptShown,
+    onUserResponded,
+  } = options;
+  // ssh2 may re-invoke the keyboard-interactive event on auth failure with a
+  // fresh challenge. If our first auto-fill attempt was wrong, falling back
+  // to the modal on the retry lets the user correct it — and prevents a
+  // tight loop where we keep submitting the same wrong password.
+  let autoFilledOnce = false;
 
   return (name, instructions, instructionsLang, prompts, finish) => {
     console.log(`${logPrefix} ${hostname} keyboard-interactive auth requested`, {
@@ -539,10 +875,19 @@ function createKeyboardInteractiveHandler(options) {
       return;
     }
 
+    if (!autoFilledOnce && isAutoFillablePasswordChallenge(prompts, password)) {
+      autoFilledOnce = true;
+      console.log(`${logPrefix} Auto-filling saved password into single keyboard-interactive prompt`);
+      try { onAutoFill?.(); } catch (err) { console.warn(`${logPrefix} onAutoFill callback threw`, err); }
+      finish([password]);
+      return;
+    }
+
     // Forward prompts to user via IPC
     const requestId = keyboardInteractiveHandler.generateRequestId('ssh');
     keyboardInteractiveHandler.storeRequest(requestId, (userResponses) => {
       console.log(`${logPrefix} Received user responses, finishing keyboard-interactive`);
+      try { onUserResponded?.(); } catch (err) { console.warn(`${logPrefix} onUserResponded callback threw`, err); }
       finish(userResponses);
     }, sender.id, sessionId);
 
@@ -552,6 +897,7 @@ function createKeyboardInteractiveHandler(options) {
     }));
 
     console.log(`${logPrefix} Showing modal for ${promptsData.length} prompts`);
+    try { onPromptShown?.(); } catch (err) { console.warn(`${logPrefix} onPromptShown callback threw`, err); }
 
     safeSend(sender, "netcatty:keyboard-interactive", {
       requestId,
@@ -561,6 +907,7 @@ function createKeyboardInteractiveHandler(options) {
       prompts: promptsData,
       hostname: hostname,
       savedPassword: password || null,
+      scope,
     });
   };
 }
@@ -656,7 +1003,15 @@ module.exports = {
   getAvailableAgentSocket,
   buildAuthHandler,
   createKeyboardInteractiveHandler,
+  isAutoFillablePasswordChallenge,
   applyAuthToConnOpts,
   safeSend,
   requestPassphrasesForEncryptedKeys,
+  readFileNoFollow,
+  expandIdentityFilePath,
+  preparePrivateKeyForAuth,
+  loadIdentityFileForAuth,
+  loadFirstIdentityFileForAuth,
+  PassphraseCancelledError,
+  isPassphraseCancelledError,
 };

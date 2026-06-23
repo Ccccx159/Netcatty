@@ -1,24 +1,41 @@
-import { Check, ChevronDown, Clock, Copy, Edit2, FileCode, FolderPlus, Keyboard, LayoutGrid, List as ListIcon, Loader2, Package, Play, Plus, RotateCcw, Search, Trash2 } from 'lucide-react';
+import { ChevronDown, Clock, Copy, Edit2, FileCode, FolderPlus, LayoutGrid, List as ListIcon, Package, Play, Plus, Search, Trash2 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useStoredViewMode } from '../application/state/useStoredViewMode';
 import { STORAGE_KEY_VAULT_SNIPPETS_VIEW_MODE } from '../infrastructure/config/storageKeys';
 import { cn, isMacPlatform } from '../lib/utils';
-import { Host, ShellHistoryEntry, Snippet, SSHKey } from '../types';
+import { Host, ProxyProfile, ShellHistoryEntry, Snippet, SSHKey } from '../types';
 import { HotkeyScheme, KeyBinding, keyEventToString, ManagedSource, matchesKeyBinding, parseKeyCombo } from '../domain/models';
-import { DistroAvatar } from './DistroAvatar';
-import SelectHostPanel from './SelectHostPanel';
-import { AsidePanel, AsidePanelContent, AsidePanelFooter } from './ui/aside-panel';
+import { reorderVaultItems, reorderVaultStrings, sortByVaultOrder } from '../domain/vaultOrder';
 import { Button } from './ui/button';
-import { Card } from './ui/card';
-import { Combobox, ComboboxOption } from './ui/combobox';
+import { ComboboxOption } from './ui/combobox';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from './ui/context-menu';
 import { Dropdown, DropdownContent, DropdownTrigger } from './ui/dropdown';
-import { Input } from './ui/input';
-import { Label } from './ui/label';
 import { SortDropdown, SortMode } from './ui/sort-dropdown';
-import { Textarea } from './ui/textarea';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip';
+import { SnippetsRightPanel } from './SnippetsRightPanel';
+import { SnippetsPackageDialogs } from './SnippetsPackageDialogs';
+import {
+  VaultHeaderSearch,
+  VaultPageHeader,
+  vaultHeaderIconButtonClass,
+  vaultHeaderSecondaryButtonClass,
+  vaultSectionTitleClass,
+} from './vault/VaultPageHeader';
+import {
+  VaultEntityIcon,
+  vaultPrimaryIconClass,
+  vaultSnippetIconClass,
+} from './vault/VaultEntityIcon';
+import {
+  clearVaultDropIndicator as clearSnippetDropIndicator,
+  getVaultDropIntent as getPackageDropIntent,
+  getVaultDropPosition as getDropPosition,
+  hasVaultDragType as hasDragType,
+  markVaultDropIndicator as markSnippetDropIndicator,
+  markVaultInsideDropIndicator as markSnippetInsideIndicator,
+  useVaultGridLayoutAnimation,
+} from './vault/vaultReorderDrag';
 
 interface SnippetsManagerProps {
   snippets: Snippet[];
@@ -33,8 +50,8 @@ interface SnippetsManagerProps {
   onDelete: (id: string) => void;
   onPackagesChange: (packages: string[]) => void;
   onRunSnippet?: (snippet: Snippet, targetHosts: Host[]) => void;
-  // Props for inline host creation
   availableKeys?: SSHKey[];
+  proxyProfiles?: ProxyProfile[];
   managedSources?: ManagedSource[];
   onSaveHost?: (host: Host) => void;
   onCreateGroup?: (groupPath: string) => void;
@@ -58,12 +75,12 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
   onPackagesChange,
   onRunSnippet,
   availableKeys = [],
+  proxyProfiles = [],
   managedSources = [],
   onSaveHost,
   onCreateGroup,
 }) => {
   const { t } = useI18n();
-  // Panel state
   const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>('none');
   const [editingSnippet, setEditingSnippet] = useState<Partial<Snippet>>({
     label: '',
@@ -77,26 +94,29 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
   const [newPackageName, setNewPackageName] = useState('');
   const [isPackageDialogOpen, setIsPackageDialogOpen] = useState(false);
 
-  // Rename package state
   const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
   const [renamingPackagePath, setRenamingPackagePath] = useState<string | null>(null);
   const [renamePackageName, setRenamePackageName] = useState('');
   const [renameError, setRenameError] = useState('');
 
-  // Search, sort, and view mode state
   const [search, setSearch] = useState('');
   const [viewMode, setViewMode] = useStoredViewMode(
     STORAGE_KEY_VAULT_SNIPPETS_VIEW_MODE,
     'grid',
   );
-  const [sortMode, setSortMode] = useState<SortMode>('az');
+  const [sortMode, setSortMode] = useState<SortMode>('manual');
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const lastPreviewReorderRef = useRef<string | null>(null);
+  const draggingSnippetIdRef = useRef<string | null>(null);
+  const draggingPackagePathRef = useRef<string | null>(null);
+  const [draggingSnippetId, setDraggingSnippetId] = useState<string | null>(null);
+  const [draggingPackagePath, setDraggingPackagePath] = useState<string | null>(null);
+  const prepareGridLayoutAnimation = useVaultGridLayoutAnimation(listRef);
 
-  // Shell history lazy loading state
   const [historyVisibleCount, setHistoryVisibleCount] = useState(HISTORY_PAGE_SIZE);
   const historyScrollRef = useRef<HTMLDivElement>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
 
-  // Shortkey recording state
   const [isRecordingShortkey, setIsRecordingShortkey] = useState(false);
   const [shortkeyError, setShortkeyError] = useState<string | null>(null);
 
@@ -180,7 +200,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     });
   }, []);
 
-  // Validate shortkey for conflicts (case-insensitive comparison)
   const normalizeKeyString = useCallback((value: string) => (
     value.toLowerCase().replace(/\s+/g, '')
   ), []);
@@ -198,7 +217,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       }
     }
     
-    // Check other snippet shortcuts
     if (syntheticEvent) {
       for (const snippet of existingShortkeys) {
         if (snippet.shortkey && matchesKeyBinding(syntheticEvent, snippet.shortkey, isMac)) {
@@ -225,7 +243,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     t,
   ]);
 
-  // Handle shortkey recording
   useEffect(() => {
     if (!isRecordingShortkey) return;
 
@@ -233,23 +250,19 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       e.preventDefault();
       e.stopPropagation();
 
-      // Escape cancels recording
       if (e.key === 'Escape') {
         setIsRecordingShortkey(false);
         setShortkeyError(null);
         return;
       }
 
-      // Skip pure modifier keys
       if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return;
 
       const keyString = keyEventToString(e, isMac);
       
-      // Validate the new shortkey
       const error = validateShortkey(keyString);
       if (error) {
         setShortkeyError(error);
-        // Don't stop recording, let user try again
         return;
       }
       
@@ -263,8 +276,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       setShortkeyError(null);
     };
 
-    // Delay adding click handler by 100ms to prevent the button click that
-    // initiated recording from immediately triggering the click handler
     const timer = setTimeout(() => {
       window.addEventListener('click', handleClick, true);
     }, 100);
@@ -304,6 +315,7 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
         targets: targetSelection,
         shortkey: editingSnippet.shortkey,
         noAutoRun: editingSnippet.noAutoRun,
+        order: editingSnippet.order,
       });
       setRightPanelMode('none');
     }
@@ -321,11 +333,15 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     setTargetSelection([]);
   };
 
+  const hostById = useMemo(() => (
+    new Map(hosts.map((host) => [host.id, host]))
+  ), [hosts]);
+
   const targetHosts = useMemo(() => {
     return targetSelection
-      .map((id) => hosts.find((h) => h.id === id))
+      .map((id) => hostById.get(id))
       .filter((h): h is Host => Boolean(h));
-  }, [targetSelection, hosts]);
+  }, [targetSelection, hostById]);
 
   const openTargetPicker = () => {
     setRightPanelMode('select-targets');
@@ -341,29 +357,64 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     setRightPanelMode('edit-snippet');
   };
 
+  const snippetPackageDescendantCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    snippets.forEach((snippet) => {
+      const pkg = snippet.package || '';
+      if (!pkg) return;
+
+      if (pkg.startsWith('/')) {
+        const parts = pkg.substring(1).split('/').filter(Boolean);
+        for (let index = 0; index < parts.length; index += 1) {
+          const path = `/${parts.slice(0, index + 1).join('/')}`;
+          counts.set(path, (counts.get(path) ?? 0) + 1);
+        }
+        return;
+      }
+
+      const parts = pkg.split('/').filter(Boolean);
+      for (let index = 0; index < parts.length; index += 1) {
+        const path = parts.slice(0, index + 1).join('/');
+        counts.set(path, (counts.get(path) ?? 0) + 1);
+      }
+    });
+    return counts;
+  }, [snippets]);
+
   const displayedPackages = useMemo(() => {
+    const packageIndexByPath = new Map(packages.map((pkg, index) => [pkg, index]));
+    const getPackageDisplayOrder = (path: string) => {
+      const exactIndex = packageIndexByPath.get(path);
+      if (typeof exactIndex === 'number') return exactIndex;
+      const childIndex = packages.findIndex((pkg) => pkg.startsWith(path + '/'));
+      return childIndex >= 0 ? childIndex : Number.MAX_SAFE_INTEGER;
+    };
+    const sortBySavedPackageOrder = (
+      items: { name: string; path: string; count: number }[],
+    ) => {
+      return [...items].sort((a, b) => {
+        const orderDiff = getPackageDisplayOrder(a.path) - getPackageDisplayOrder(b.path);
+        if (orderDiff !== 0) return orderDiff;
+        return a.name.localeCompare(b.name);
+      });
+    };
+
     if (!selectedPackage) {
-      // Separate absolute paths (starting with /) from relative paths
       const absolutePaths = packages.filter(p => p.startsWith('/'));
       const relativePaths = packages.filter(p => !p.startsWith('/'));
       
       const results: { name: string; path: string; count: number }[] = [];
       
-      // Process relative paths (traditional behavior)
       const relativeRoots = relativePaths
         .map((p) => p.split('/')[0])
         .filter((name): name is string => Boolean(name) && name.length > 0);
       
       Array.from(new Set(relativeRoots)).forEach((name: string) => {
         const path: string = name;
-        const count = snippets.filter((s) => {
-          const pkg = s.package || '';
-          return pkg === path || pkg.startsWith(path + '/');
-        }).length;
+        const count = snippetPackageDescendantCounts.get(path) ?? 0;
         results.push({ name, path, count });
       });
       
-      // Process absolute paths - show them as separate roots with "/" prefix
       const absoluteRoots = absolutePaths
         .map((p) => {
           const cleanPath = p.substring(1); // Remove leading slash
@@ -375,14 +426,11 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       Array.from(new Set(absoluteRoots)).forEach((name: string) => {
         const path: string = `/${name}`;
         const displayName: string = `/${name}`; // Show with leading slash to distinguish
-        const count = snippets.filter((s) => {
-          const pkg = s.package || '';
-          return pkg === path || pkg.startsWith(path + '/');
-        }).length;
+        const count = snippetPackageDescendantCounts.get(path) ?? 0;
         results.push({ name: displayName, path, count });
       });
       
-      return results;
+      return sortBySavedPackageOrder(results);
     }
     
     const prefix = selectedPackage + '/';
@@ -390,40 +438,41 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       .filter((p) => p.startsWith(prefix))
       .map((p) => p.replace(prefix, '').split('/')[0])
       .filter((name): name is string => Boolean(name) && name.length > 0);
-    return Array.from(new Set(children)).map((name) => {
+    return sortBySavedPackageOrder(Array.from(new Set<string>(children)).map((name) => {
       const path = `${selectedPackage}/${name}`;
-      // Count snippets in this package AND all nested packages
-      const count = snippets.filter((s) => {
-        const pkg = s.package || '';
-        return pkg === path || pkg.startsWith(path + '/');
-      }).length;
+      const count = snippetPackageDescendantCounts.get(path) ?? 0;
       return { name, path, count };
-    });
-  }, [packages, selectedPackage, snippets]);
+    }));
+  }, [packages, selectedPackage, snippetPackageDescendantCounts]);
 
   const displayedSnippets = useMemo(() => {
-    let result = snippets.filter((s) => (s.package || '') === (selectedPackage || ''));
-    // Apply search filter
-    if (search.trim()) {
+    const hasSearch = search.trim().length > 0;
+    let result = hasSearch
+      ? snippets
+      : snippets.filter((s) => (s.package || '') === (selectedPackage || ''));
+    if (hasSearch) {
       const s = search.toLowerCase();
       result = result.filter(sn =>
         sn.label.toLowerCase().includes(s) ||
         sn.command.toLowerCase().includes(s)
       );
     }
-    // Apply sorting
     result = [...result].sort((a, b) => {
       switch (sortMode) {
         case 'az':
           return a.label.localeCompare(b.label);
         case 'za':
           return b.label.localeCompare(a.label);
+        case 'manual':
+          return 0;
         default:
           return 0;
       }
     });
-    return result;
+    return sortMode === 'manual' ? sortByVaultOrder(result) : result;
   }, [snippets, selectedPackage, search, sortMode]);
+
+  const isSearchActive = search.trim().length > 0;
 
   const breadcrumb = useMemo(() => {
     if (!selectedPackage) return [];
@@ -440,32 +489,24 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     const name = newPackageName.trim();
     if (!name) return;
     
-    // Allow leading slash and validate the rest - allow hyphens and Unicode letters/numbers
     if (!/^\/?([\w\p{L}\p{N}-]+(\/[\w\p{L}\p{N}-]+)*)\/?$/u.test(name)) {
-      // Could add toast notification here for invalid characters
       return;
     }
     
-    // Normalize path construction to avoid double slashes
     let full: string;
     if (selectedPackage) {
-      // Strip leading slash from name when we're inside a package to avoid double slashes
       const normalizedName = name.startsWith('/') ? name.substring(1) : name;
       full = `${selectedPackage}/${normalizedName}`;
     } else {
-      // At root level, preserve the leading slash if user intended it
       full = name;
     }
 
-    // Strip trailing slash to ensure consistent path handling
     if (full.endsWith('/')) {
       full = full.slice(0, -1);
     }
     
-    // Check for duplicate package names (case-insensitive)
     const existingPackage = packages.find(p => p.toLowerCase() === full.toLowerCase());
     if (existingPackage) {
-      // Could add toast notification here for duplicate package
       return;
     }
     
@@ -475,10 +516,8 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
   };
 
   const deletePackage = (path: string) => {
-    // Remove the package and all its children
     const keep = packages.filter((p) => !(p === path || p.startsWith(path + '/')));
     
-    // Move all snippets from deleted packages to root
     const updatedSnippets = snippets.map((s) => {
       if (!s.package) return s;
       if (s.package === path || s.package.startsWith(path + '/')) {
@@ -487,13 +526,10 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       return s;
     });
     
-    // Update packages first, then save snippets
     onPackagesChange(keep);
     
-    // Bulk-save all snippets to avoid stale-closure overwrites
     onBulkSave(updatedSnippets);
     
-    // Reset selected package if it was deleted
     if (selectedPackage && (selectedPackage === path || selectedPackage.startsWith(path + '/'))) {
       setSelectedPackage(null);
     }
@@ -505,12 +541,10 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     const newPath = target ? `${target}/${name}` : (isAbsolute ? `/${name}` : name);
     if (newPath === source || newPath.startsWith(source + '/')) return;
 
-    // Check if target path already exists
     if (packages.includes(newPath)) return;
 
     const updatedPackages = packages.map((p) => {
       if (p === source) return newPath;
-      // Use more precise replacement to avoid substring issues
       if (p.startsWith(source + '/')) {
         return newPath + p.substring(source.length);
       }
@@ -520,7 +554,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     const updatedSnippets = snippets.map((s) => {
       if (!s.package) return s;
       if (s.package === source) return { ...s, package: newPath };
-      // Use more precise replacement to avoid substring issues
       if (s.package.startsWith(source + '/')) {
         return { ...s, package: newPath + s.package.substring(source.length) };
       }
@@ -545,38 +578,31 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
 
     const newName = renamePackageName.trim();
 
-    // Validate: empty name
     if (!newName) {
       setRenameError(t('snippets.renameDialog.error.empty'));
       return;
     }
 
-    // Validate: same rules as createPackage - allow Unicode letters, numbers, hyphens, underscores
-    // Since we're renaming a single segment (no slashes allowed), use the segment-level pattern
     if (!/^[\w\p{L}\p{N}-]+$/u.test(newName)) {
       setRenameError(t('snippets.renameDialog.error.invalidChars'));
       return;
     }
 
-    // Build new path
     const parts = renamingPackagePath.split('/');
     parts[parts.length - 1] = newName;
     const newPath = parts.join('/');
 
-    // Validate: same name
     if (newPath === renamingPackagePath) {
       setIsRenameDialogOpen(false);
       return;
     }
 
-    // Validate: duplicate (case-insensitive), excluding the package being renamed
     const existingPackage = packages.find(p => p !== renamingPackagePath && p.toLowerCase() === newPath.toLowerCase());
     if (existingPackage) {
       setRenameError(t('snippets.renameDialog.error.duplicate'));
       return;
     }
 
-    // Update all packages with this path or nested under it
     const updatedPackages = packages.map((p) => {
       if (p === renamingPackagePath) return newPath;
       if (p.startsWith(renamingPackagePath + '/')) {
@@ -585,7 +611,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       return p;
     });
 
-    // Update all snippets with this package or nested under it
     const updatedSnippets = snippets.map((s) => {
       if (!s.package) return s;
       if (s.package === renamingPackagePath) return { ...s, package: newPath };
@@ -598,14 +623,12 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     onPackagesChange(Array.from(new Set(updatedPackages)));
     onBulkSave(updatedSnippets);
 
-    // Update selected package if it was renamed
     if (selectedPackage === renamingPackagePath) {
       setSelectedPackage(newPath);
     } else if (selectedPackage?.startsWith(renamingPackagePath + '/')) {
       setSelectedPackage(newPath + selectedPackage.substring(renamingPackagePath.length));
     }
 
-    // Update editingSnippet.package if it's in the renamed package (fixes stale state when editing)
     if (editingSnippet.package) {
       if (editingSnippet.package === renamingPackagePath) {
         setEditingSnippet(prev => ({ ...prev, package: newPath }));
@@ -626,16 +649,184 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     onSave({ ...sn, package: pkg || '' });
   };
 
-  // Package options for Combobox
+  const parentOfPackage = useCallback((path: string) => {
+    const parts = path.split('/').filter(Boolean);
+    const prefix = path.startsWith('/') ? '/' : '';
+    return prefix + parts.slice(0, -1).join('/');
+  }, []);
+
+  const resetSnippetDragState = useCallback(() => {
+    clearSnippetDropIndicator();
+    lastPreviewReorderRef.current = null;
+    draggingSnippetIdRef.current = null;
+    draggingPackagePathRef.current = null;
+    setDraggingSnippetId(null);
+    setDraggingPackagePath(null);
+  }, []);
+
+  const handleReorderDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    const target = (event.target as Element | null)?.closest('[data-snippet-id], [data-pkg-path]');
+    if (!(target instanceof HTMLElement)) return;
+
+    const isGrid = viewMode === 'grid';
+    const targetSnippetId = target.getAttribute('data-snippet-id');
+    const targetPackage = target.getAttribute('data-pkg-path');
+    const isDraggingSnippet = Boolean(draggingSnippetIdRef.current) || hasDragType(event.dataTransfer, 'snippet-id');
+    const isDraggingPackage = Boolean(draggingPackagePathRef.current) || hasDragType(event.dataTransfer, 'pkg-path');
+    if (targetSnippetId && isDraggingSnippet) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      const sourceSnippetId = draggingSnippetIdRef.current || event.dataTransfer.getData('snippet-id');
+      const position = getDropPosition(target, event.clientX, event.clientY, isGrid);
+      if (isGrid && sourceSnippetId && sourceSnippetId !== targetSnippetId) {
+        const targetSnippet = snippets.find((snippet) => snippet.id === targetSnippetId);
+        const sourceSnippet = snippets.find((snippet) => snippet.id === sourceSnippetId);
+        if (!targetSnippet || !sourceSnippet) return;
+        const previewKey = `${sourceSnippetId}:${targetSnippetId}:${position}`;
+        if (lastPreviewReorderRef.current === previewKey) return;
+        prepareGridLayoutAnimation();
+        lastPreviewReorderRef.current = previewKey;
+        const movedSnippets = snippets.map((snippet) =>
+          snippet.id === sourceSnippetId
+            ? { ...snippet, package: targetSnippet.package || '' }
+            : snippet,
+        );
+        onBulkSave(reorderVaultItems(movedSnippets, sourceSnippetId, targetSnippetId, position));
+        setSortMode('manual');
+        return;
+      }
+      markSnippetDropIndicator(target, position, isGrid ? 'x' : 'y');
+      return;
+    }
+    if (targetPackage && isDraggingSnippet) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      markSnippetInsideIndicator(target);
+      return;
+    }
+    if (targetPackage && isDraggingPackage) {
+      const sourcePackage = draggingPackagePathRef.current || event.dataTransfer.getData('pkg-path');
+      if (
+        sourcePackage &&
+        targetPackage.startsWith(`${sourcePackage}/`)
+      ) {
+        event.dataTransfer.dropEffect = 'none';
+        clearSnippetDropIndicator();
+        return;
+      }
+      const intent = getPackageDropIntent(target, event.clientX, event.clientY, isGrid);
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      if (intent === 'inside') {
+        markSnippetInsideIndicator(target);
+        return;
+      }
+      if (
+        isGrid &&
+        sourcePackage &&
+        parentOfPackage(sourcePackage) === parentOfPackage(targetPackage)
+      ) {
+        const previewKey = `package:${sourcePackage}:${targetPackage}:${intent}`;
+        if (lastPreviewReorderRef.current !== previewKey) {
+          prepareGridLayoutAnimation();
+          lastPreviewReorderRef.current = previewKey;
+          const sortablePackages = Array.from(new Set([...packages, sourcePackage, targetPackage]));
+          onPackagesChange(reorderVaultStrings(sortablePackages, sourcePackage, targetPackage, intent));
+          setSortMode('manual');
+        }
+        return;
+      }
+      markSnippetDropIndicator(target, intent, isGrid ? 'x' : 'y');
+      return;
+    }
+    event.dataTransfer.dropEffect = 'none';
+    clearSnippetDropIndicator();
+  }, [
+    onBulkSave,
+    onPackagesChange,
+    packages,
+    parentOfPackage,
+    prepareGridLayoutAnimation,
+    snippets,
+    viewMode,
+  ]);
+
+  const handleReorderDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    const target = (event.target as Element | null)?.closest('[data-snippet-id], [data-pkg-path]');
+    clearSnippetDropIndicator();
+    if (!(target instanceof HTMLElement)) return;
+    const isGrid = viewMode === 'grid';
+
+    const sourceSnippetId = draggingSnippetIdRef.current || event.dataTransfer.getData('snippet-id');
+    const targetSnippetId = target.getAttribute('data-snippet-id');
+    if (sourceSnippetId && targetSnippetId) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (sourceSnippetId === targetSnippetId) {
+        lastPreviewReorderRef.current = null;
+        return;
+      }
+      const targetSnippet = snippets.find((snippet) => snippet.id === targetSnippetId);
+      const sourceSnippet = snippets.find((snippet) => snippet.id === sourceSnippetId);
+      if (!targetSnippet || !sourceSnippet) return;
+      const movedSnippets = snippets.map((snippet) =>
+        snippet.id === sourceSnippetId
+          ? { ...snippet, package: targetSnippet.package || '' }
+          : snippet,
+      );
+      const position = getDropPosition(target, event.clientX, event.clientY, isGrid);
+      const previewKey = `${sourceSnippetId}:${targetSnippetId}:${position}`;
+      if (!isGrid || lastPreviewReorderRef.current !== previewKey) {
+        prepareGridLayoutAnimation();
+        onBulkSave(reorderVaultItems(
+          movedSnippets,
+          sourceSnippetId,
+          targetSnippetId,
+          position,
+        ));
+      }
+      lastPreviewReorderRef.current = null;
+      setSortMode('manual');
+      return;
+    }
+
+    const sourcePackage = draggingPackagePathRef.current || event.dataTransfer.getData('pkg-path');
+    const targetPackage = target.getAttribute('data-pkg-path');
+    if (sourcePackage && targetPackage) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (sourcePackage === targetPackage) {
+        lastPreviewReorderRef.current = null;
+        return;
+      }
+      const intent = getPackageDropIntent(target, event.clientX, event.clientY, isGrid);
+      if (intent === 'inside') return;
+      if (parentOfPackage(sourcePackage) !== parentOfPackage(targetPackage)) return;
+      const sortablePackages = Array.from(new Set([...packages, sourcePackage, targetPackage]));
+      const previewKey = `package:${sourcePackage}:${targetPackage}:${intent}`;
+      if (!isGrid || lastPreviewReorderRef.current !== previewKey) {
+        prepareGridLayoutAnimation();
+        onPackagesChange(reorderVaultStrings(sortablePackages, sourcePackage, targetPackage, intent));
+      }
+      lastPreviewReorderRef.current = null;
+      setSortMode('manual');
+    }
+  }, [
+    onBulkSave,
+    onPackagesChange,
+    packages,
+    parentOfPackage,
+    prepareGridLayoutAnimation,
+    snippets,
+    viewMode,
+  ]);
+
   const packageOptions: ComboboxOption[] = useMemo(() => {
-    // Generate all possible parent paths for each package
     const allPaths = new Set<string>();
     
     packages.forEach(pkg => {
-      // Add the full package path
       allPaths.add(pkg);
       
-      // Add all parent paths
       const parts = pkg.split('/').filter(Boolean);
       const isAbsolute = pkg.startsWith('/');
       
@@ -647,7 +838,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     
     return Array.from(allPaths)
       .sort((a, b) => {
-        // Sort by depth first (shorter paths first), then alphabetically
         const depthA = (a.match(/\//g) || []).length;
         const depthB = (b.match(/\//g) || []).length;
         if (depthA !== depthB) return depthA - depthB;
@@ -660,7 +850,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
       }));
   }, [packages]);
 
-  // Shell history lazy loading
   const visibleHistory = useMemo(() => {
     return shellHistory.slice(0, historyVisibleCount);
   }, [shellHistory, historyVisibleCount]);
@@ -670,14 +859,12 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
   const loadMoreHistory = useCallback(() => {
     if (isLoadingMore || !hasMoreHistory) return;
     setIsLoadingMore(true);
-    // Simulate loading delay for smooth UX
     setTimeout(() => {
       setHistoryVisibleCount((prev) => Math.min(prev + HISTORY_PAGE_SIZE, shellHistory.length));
       setIsLoadingMore(false);
     }, 200);
   }, [isLoadingMore, hasMoreHistory, shellHistory.length]);
 
-  // Scroll handler for lazy loading
   const handleHistoryScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     const target = e.target as HTMLDivElement;
     const scrollBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
@@ -686,7 +873,6 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     }
   }, [hasMoreHistory, isLoadingMore, loadMoreHistory]);
 
-  // Reset visible count when history panel opens
   useEffect(() => {
     if (rightPanelMode === 'history') {
       setHistoryVisibleCount(HISTORY_PAGE_SIZE);
@@ -704,273 +890,60 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
     });
   };
 
-  // Render right panel based on mode
-  const renderRightPanel = () => {
-    if (rightPanelMode === 'select-targets') {
-      return (
-        <SelectHostPanel
-          hosts={hosts}
-          customGroups={customGroups}
-          selectedHostIds={targetSelection}
-          multiSelect={true}
-          onSelect={handleTargetSelect}
-          onBack={handleTargetPickerBack}
-          onContinue={handleTargetPickerBack}
-          availableKeys={availableKeys}
-          managedSources={managedSources}
-          onSaveHost={onSaveHost}
-          onCreateGroup={onCreateGroup}
-          title={t('snippets.targets.add')}
-          layout="inline"
-        />
-      );
-    }
-
-    if (rightPanelMode === 'edit-snippet') {
-      return (
-        <AsidePanel
-          open={true}
-          onClose={handleClosePanel}
-          title={editingSnippet.id ? t('snippets.panel.editTitle') : t('snippets.panel.newTitle')}
-          layout="inline"
-          actions={
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={handleSubmit}
-              disabled={!editingSnippet.label || !editingSnippet.command}
-              aria-label={t('common.save')}
-            >
-              <Check size={16} />
-            </Button>
-          }
-        >
-          <AsidePanelContent>
-            {/* Action Description */}
-            <Card className="p-3 space-y-2 bg-card border-border/80">
-              <p className="text-xs font-semibold text-muted-foreground">{t('snippets.field.description')}</p>
-              <Input
-                placeholder={t('snippets.field.descriptionPlaceholder')}
-                value={editingSnippet.label || ''}
-                onChange={(e) => setEditingSnippet({ ...editingSnippet, label: e.target.value })}
-                className="h-10"
-              />
-            </Card>
-
-            {/* Package */}
-            <Card className="p-3 space-y-2 bg-card border-border/80">
-              <p className="text-xs font-semibold text-muted-foreground">{t('snippets.field.package')}</p>
-              <Combobox
-                options={packageOptions}
-                value={editingSnippet.package || selectedPackage || ''}
-                onValueChange={(val) => {
-                  setEditingSnippet({ ...editingSnippet, package: val });
-                  // If selecting an implicit parent path, persist it to packages
-                  if (val && !packages.includes(val)) {
-                    onPackagesChange([...packages, val]);
-                  }
-                }}
-                placeholder={t('snippets.field.packagePlaceholder')}
-                allowCreate={true}
-                onCreateNew={(val) => {
-                  if (!packages.includes(val)) {
-                    onPackagesChange([...packages, val]);
-                  }
-                }}
-                createText={t('snippets.field.createPackage')}
-                icon={<Package size={16} />}
-                triggerClassName="h-10"
-              />
-            </Card>
-
-            {/* Script */}
-            <Card className="p-3 space-y-2 bg-card border-border/80">
-              <p className="text-xs font-semibold text-muted-foreground">{t('snippets.field.scriptRequired')}</p>
-              <Textarea
-                placeholder="ls -l"
-                className="min-h-[120px] font-mono text-xs"
-                value={editingSnippet.command || ''}
-                onChange={(e) => setEditingSnippet({ ...editingSnippet, command: e.target.value })}
-              />
-            </Card>
-
-            {/* No Auto Run */}
-            <label className="flex items-center gap-2 cursor-pointer px-1">
-              <input
-                type="checkbox"
-                checked={editingSnippet.noAutoRun ?? false}
-                onChange={(e) => setEditingSnippet({ ...editingSnippet, noAutoRun: e.target.checked || undefined })}
-                className="rounded border-input"
-              />
-              <span className="text-xs text-muted-foreground">{t('snippets.field.noAutoRun')}</span>
-            </label>
-
-            {/* Shortkey */}
-            <Card className="p-3 space-y-2 bg-card border-border/80">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold text-muted-foreground">{t('snippets.field.shortkey')}</p>
-                {editingSnippet.shortkey && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 px-2 text-xs"
-                    onClick={() => {
-                      setEditingSnippet(prev => ({ ...prev, shortkey: undefined }));
-                      setShortkeyError(null);
-                    }}
-                    title={t('snippets.shortkey.clear')}
-                  >
-                    <RotateCcw size={12} />
-                  </Button>
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setIsRecordingShortkey(true);
-                  setShortkeyError(null);
-                }}
-                className={cn(
-                  "w-full h-10 px-3 text-sm font-mono rounded-lg border transition-colors flex items-center justify-center gap-2",
-                  isRecordingShortkey
-                    ? "border-primary bg-primary/10 animate-pulse"
-                    : "border-border hover:border-primary/50 bg-background"
-                )}
-              >
-                <Keyboard size={14} className="text-muted-foreground" />
-                {isRecordingShortkey
-                  ? t('snippets.shortkey.recording')
-                  : editingSnippet.shortkey || t('snippets.shortkey.placeholder')}
-              </button>
-              {shortkeyError && (
-                <p className="text-xs text-destructive">{shortkeyError}</p>
-              )}
-              <p className="text-[11px] text-muted-foreground">{t('snippets.shortkey.hint')}</p>
-            </Card>
-
-            {/* Targets */}
-            <Card className="p-3 space-y-3 bg-card border-border/80">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold text-muted-foreground">{t('snippets.targets.title')}</p>
-                <Button variant="ghost" size="sm" className="h-6 px-2 text-xs text-primary" onClick={openTargetPicker}>
-                  {t('action.edit')}
-                </Button>
-              </div>
-
-              {targetHosts.length === 0 ? (
-                <Button
-                  variant="secondary"
-                  className="w-full h-10"
-                  onClick={openTargetPicker}
-                >
-                  {t('snippets.targets.add')}
-                </Button>
-              ) : (
-                <div className="space-y-2">
-                  {targetHosts.map((h) => (
-                    <div key={h.id} className="flex items-center gap-3 px-3 py-2 bg-background/60 border border-border/70 rounded-lg">
-                      <DistroAvatar host={h} fallback={h.os[0].toUpperCase()} className="h-10 w-10" />
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm font-semibold truncate">{h.hostname}</div>
-                        <div className="text-[11px] text-muted-foreground truncate">
-                          {h.protocol || 'ssh'}, {h.username}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
-          </AsidePanelContent>
-
-          {/* Footer */}
-          <AsidePanelFooter>
-            <Button
-              className="w-full"
-              onClick={handleSubmit}
-              disabled={!editingSnippet.label || !editingSnippet.command}
-            >
-              {editingSnippet.targets?.length ? t('action.run') : t('common.save')}
-            </Button>
-          </AsidePanelFooter>
-        </AsidePanel>
-      );
-    }
-
-    if (rightPanelMode === 'history') {
-      return (
-        <AsidePanel
-          open={true}
-          onClose={handleClosePanel}
-          title={t('snippets.history.title')}
-          subtitle={t('snippets.history.subtitle', { count: shellHistory.length })}
-          showBackButton={true}
-          onBack={handleClosePanel}
-          layout="inline"
-        >
-          {/* History List */}
-          <div
-            className="flex-1 overflow-y-auto p-3 space-y-2"
-            onScroll={handleHistoryScroll}
-            ref={historyScrollRef}
-          >
-            {visibleHistory.length === 0 ? (
-              <div className="text-center py-12 text-muted-foreground">
-                <Clock size={32} className="mx-auto mb-3 opacity-50" />
-                <p className="text-sm">{t('snippets.history.emptyTitle')}</p>
-                <p className="text-xs mt-1">{t('snippets.history.emptyDesc')}</p>
-              </div>
-            ) : (
-              <>
-                {visibleHistory.map((entry) => (
-                  <HistoryItem
-                    key={entry.id}
-                    entry={entry}
-                    onSaveAsSnippet={saveHistoryAsSnippet}
-                    onCopy={() => handleCopy(entry.id, entry.command)}
-                    isCopied={copiedId === entry.id}
-                  />
-                ))}
-                {hasMoreHistory && (
-                  <div className="py-4 text-center">
-                    {isLoadingMore ? (
-                      <Loader2 size={20} className="animate-spin mx-auto text-muted-foreground" />
-                    ) : (
-                      <Button variant="ghost" size="sm" onClick={loadMoreHistory}>
-                        {t('snippets.history.loadMore')}
-                      </Button>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        </AsidePanel>
-      );
-    }
-
-    return null;
-  };
+  const renderRightPanel = () => (
+    <SnippetsRightPanel
+      rightPanelMode={rightPanelMode}
+      hosts={hosts}
+      customGroups={customGroups}
+      targetSelection={targetSelection}
+      handleTargetSelect={handleTargetSelect}
+      handleTargetPickerBack={handleTargetPickerBack}
+      availableKeys={availableKeys}
+      proxyProfiles={proxyProfiles}
+      managedSources={managedSources}
+      onSaveHost={onSaveHost}
+      onCreateGroup={onCreateGroup}
+      t={t}
+      handleClosePanel={handleClosePanel}
+      editingSnippet={editingSnippet}
+      onDelete={onDelete}
+      handleSubmit={handleSubmit}
+      setEditingSnippet={setEditingSnippet}
+      packageOptions={packageOptions}
+      selectedPackage={selectedPackage}
+      packages={packages}
+      onPackagesChange={onPackagesChange}
+      shortkeyError={shortkeyError}
+      setShortkeyError={setShortkeyError}
+      isRecordingShortkey={isRecordingShortkey}
+      setIsRecordingShortkey={setIsRecordingShortkey}
+      openTargetPicker={openTargetPicker}
+      targetHosts={targetHosts}
+      shellHistory={shellHistory}
+      handleHistoryScroll={handleHistoryScroll}
+      historyScrollRef={historyScrollRef}
+      visibleHistory={visibleHistory}
+      saveHistoryAsSnippet={saveHistoryAsSnippet}
+      handleCopy={handleCopy}
+      copiedId={copiedId}
+      hasMoreHistory={hasMoreHistory}
+      isLoadingMore={isLoadingMore}
+      loadMoreHistory={loadMoreHistory}
+    />
+  );
 
   return (
     <TooltipProvider delayDuration={300}>
     <div className="h-full min-h-0 flex relative">
       <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
-        <header className="border-b border-border/50 bg-secondary/80 backdrop-blur">
-          <div className="h-14 px-4 py-2 flex items-center gap-2">
-            {/* Search box */}
-            <div className="relative w-64">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                placeholder={t('snippets.searchPlaceholder')}
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="h-10 pl-9 bg-secondary border-border/60 text-sm"
-              />
-            </div>
-            <Button onClick={() => handleEdit()} size="sm" className="h-10">
+        <VaultPageHeader>
+            <VaultHeaderSearch
+              placeholder={t('snippets.searchPlaceholder')}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-64"
+            />
+            <Button onClick={() => handleEdit()} size="sm" className="h-10 px-3">
               <Plus size={14} className="mr-2" /> {t('snippets.action.newSnippet')}
             </Button>
             <Button
@@ -980,23 +953,25 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
               }}
               size="sm"
               variant="secondary"
-              className="h-10 gap-2"
+              className={vaultHeaderSecondaryButtonClass}
             >
               <FolderPlus size={14} className="mr-1" /> {t('snippets.action.newPackage')}
             </Button>
             <Button
-              variant={rightPanelMode === 'history' ? 'secondary' : 'ghost'}
+              variant="secondary"
               size="sm"
-              className="h-10 gap-2"
+              className={cn(
+                vaultHeaderSecondaryButtonClass,
+                rightPanelMode === 'history' && "bg-foreground/10 hover:bg-foreground/15",
+              )}
               onClick={() => setRightPanelMode(rightPanelMode === 'history' ? 'none' : 'history')}
             >
               <Clock size={14} /> {t('snippets.history.title')}
             </Button>
-            {/* View mode and sort controls */}
             <div className="flex items-center gap-1 ml-auto">
               <Dropdown>
                 <DropdownTrigger asChild>
-                  <Button variant="ghost" size="icon" className="h-10 w-10">
+                  <Button variant="ghost" size="icon" className={vaultHeaderIconButtonClass}>
                     {viewMode === 'grid' ? <LayoutGrid size={16} /> : <ListIcon size={16} />}
                     <ChevronDown size={10} className="ml-0.5" />
                   </Button>
@@ -1021,11 +996,10 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
               <SortDropdown
                 value={sortMode}
                 onChange={setSortMode}
-                className="h-10 w-10"
+                className={vaultHeaderIconButtonClass}
               />
             </div>
-          </div>
-        </header>
+        </VaultPageHeader>
         <div className="flex items-center gap-2 text-sm font-semibold px-4 py-2">
           <button className="text-primary hover:underline" onClick={() => setSelectedPackage(null)}>{t('snippets.breadcrumb.allPackages')}</button>
           {breadcrumb.map((b) => (
@@ -1048,11 +1022,17 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
           </div>
         )}
 
-        <div className="flex-1 space-y-3 overflow-y-auto px-4 pb-4">
-          {displayedPackages.length > 0 && (
+        <div
+          ref={listRef}
+          className="flex-1 space-y-3 overflow-y-auto px-4 pb-4"
+          onDragOverCapture={handleReorderDragOver}
+          onDropCapture={handleReorderDrop}
+          onDragEndCapture={resetSnippetDragState}
+        >
+          {displayedPackages.length > 0 && !search.trim() && (
             <>
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-muted-foreground">{t('snippets.section.packages')}</h3>
+                <h3 className={vaultSectionTitleClass}>{t('snippets.section.packages')}</h3>
               </div>
               <div className={cn(
                 viewMode === 'grid'
@@ -1064,30 +1044,43 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
                     <ContextMenuTrigger>
                       <div
                         className={cn(
-                          "group cursor-pointer overflow-hidden",
+                          "vault-drop-indicator-row group cursor-pointer overflow-hidden",
                           viewMode === 'grid'
                             ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
                             : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors"
                         )}
+                        data-pkg-path={pkg.path}
+                        data-vault-grid-item={`snippet-package:${pkg.path}`}
+                        data-vault-reorder-grid={viewMode === 'grid' ? 'true' : undefined}
+                        data-vault-reorder-dragging={draggingPackagePath === pkg.path ? 'true' : undefined}
                         draggable
                         onDragStart={(e) => {
                           e.dataTransfer.effectAllowed = 'move';
                           e.dataTransfer.setData('pkg-path', pkg.path);
+                          draggingPackagePathRef.current = pkg.path;
+                          setDraggingPackagePath(pkg.path);
+                          lastPreviewReorderRef.current = null;
                         }}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={(e) => {
                           e.preventDefault();
-                          const sId = e.dataTransfer.getData('snippet-id');
-                          const pPath = e.dataTransfer.getData('pkg-path');
+                          const sId = draggingSnippetIdRef.current || e.dataTransfer.getData('snippet-id');
+                          const pPath = draggingPackagePathRef.current || e.dataTransfer.getData('pkg-path');
                           if (sId) moveSnippet(sId, pkg.path);
-                          if (pPath) movePackage(pPath, pkg.path);
+                          if (
+                            pPath &&
+                            getPackageDropIntent(e.currentTarget, e.clientX, e.clientY, viewMode === 'grid') === 'inside'
+                          ) {
+                            movePackage(pPath, pkg.path);
+                          }
                         }}
                         onClick={() => setSelectedPackage(pkg.path)}
                       >
                         <div className="flex items-center gap-3 h-full min-w-0">
-                          <div className="h-11 w-11 rounded-xl bg-primary/15 text-primary flex items-center justify-center flex-shrink-0">
-                            <Package size={18} />
-                          </div>
+                          <VaultEntityIcon
+                            className={vaultPrimaryIconClass}
+                            icon={<Package size={18} />}
+                          />
                           <div className="w-0 flex-1">
                             <div className="text-sm font-semibold truncate">{pkg.name}</div>
                             <div className="text-[11px] text-muted-foreground">{t('snippets.package.count', { count: pkg.count })}</div>
@@ -1108,7 +1101,7 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
 
           {displayedSnippets.length > 0 && (
             <div className="space-y-2">
-              <h3 className="text-sm font-semibold text-muted-foreground">{t('snippets.section.snippets')}</h3>
+              <h3 className={vaultSectionTitleClass}>{t('snippets.section.snippets')}</h3>
               <div className={cn(
                 viewMode === 'grid'
                   ? "grid gap-3 grid-cols-1 md:grid-cols-2 xl:grid-cols-3"
@@ -1119,22 +1112,30 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
                     <ContextMenuTrigger>
                       <div
                         className={cn(
-                          "group cursor-pointer overflow-hidden",
+                          "vault-drop-indicator-row group cursor-pointer overflow-hidden",
                           viewMode === 'grid'
                             ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
                             : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors"
                         )}
-                        draggable
+                        data-snippet-id={isSearchActive ? undefined : snippet.id}
+                        data-vault-grid-item={`snippet:${snippet.id}`}
+                        data-vault-reorder-grid={viewMode === 'grid' ? 'true' : undefined}
+                        data-vault-reorder-dragging={draggingSnippetId === snippet.id ? 'true' : undefined}
+                        draggable={!isSearchActive}
                         onDragStart={(e) => {
                           e.dataTransfer.effectAllowed = 'move';
                           e.dataTransfer.setData('snippet-id', snippet.id);
+                          draggingSnippetIdRef.current = snippet.id;
+                          setDraggingSnippetId(snippet.id);
+                          lastPreviewReorderRef.current = null;
                         }}
                         onClick={() => handleEdit(snippet)}
                       >
                         <div className="flex items-center gap-3 h-full min-w-0">
-                          <div className="h-11 w-11 rounded-xl bg-primary/15 text-primary flex items-center justify-center flex-shrink-0">
-                            <FileCode size={18} />
-                          </div>
+                          <VaultEntityIcon
+                            className={vaultSnippetIconClass}
+                            icon={<FileCode size={18} />}
+                          />
                           <div className="w-0 flex-1">
                             <div className="text-sm font-semibold truncate">{snippet.label}</div>
                             <Tooltip>
@@ -1170,7 +1171,7 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
                       <ContextMenuItem
                         onClick={() => {
                           const targetHostsList = (snippet.targets || [])
-                            .map(id => hosts.find(h => h.id === id))
+                            .map(id => hostById.get(id))
                             .filter((h): h is Host => Boolean(h));
                           if (targetHostsList.length > 0) {
                             onRunSnippet?.(snippet, targetHostsList);
@@ -1196,168 +1197,43 @@ const SnippetsManager: React.FC<SnippetsManagerProps> = ({
               </div>
             </div>
           )}
+          {search.trim() && displayedSnippets.length === 0 && (snippets.length > 0 || displayedPackages.length > 0) && (
+            <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+              <div className="h-14 w-14 rounded-2xl bg-secondary/80 flex items-center justify-center mb-3">
+                <Search size={24} className="opacity-60" />
+              </div>
+              <h3 className="text-base font-semibold text-foreground mb-1">
+                {t('snippets.search.noResults.title')}
+              </h3>
+              <p className="text-xs text-center max-w-sm">
+                {t('snippets.search.noResults.desc', { query: search.trim() })}
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* New Package Inline Form */}
-      {isPackageDialogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <Card className="w-full max-w-sm p-4 space-y-4">
-            <div>
-              <p className="text-sm font-semibold">{t('snippets.packageDialog.title')}</p>
-              <p className="text-xs text-muted-foreground">{t('snippets.packageDialog.parent', { parent: selectedPackage || t('snippets.packageDialog.root') })}</p>
-            </div>
-            <div className="space-y-2">
-              <Label>{t('field.name')}</Label>
-              <Input
-                autoFocus
-                placeholder={t('snippets.packageDialog.placeholder')}
-                value={newPackageName}
-                onChange={(e) => setNewPackageName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && createPackage()}
-                title="Package names can contain letters, numbers, hyphens, underscores, and forward slashes. Can optionally start with /"
-              />
-              <p className="text-[11px] text-muted-foreground">{t('snippets.packageDialog.hint')}</p>
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" onClick={() => setIsPackageDialogOpen(false)}>
-                {t('common.cancel')}
-              </Button>
-              <Button onClick={createPackage}>{t('common.create')}</Button>
-            </div>
-          </Card>
-        </div>
-      )}
+      <SnippetsPackageDialogs
+        isPackageDialogOpen={isPackageDialogOpen}
+        t={t}
+        selectedPackage={selectedPackage}
+        newPackageName={newPackageName}
+        setNewPackageName={setNewPackageName}
+        createPackage={createPackage}
+        setIsPackageDialogOpen={setIsPackageDialogOpen}
+        isRenameDialogOpen={isRenameDialogOpen}
+        renamingPackagePath={renamingPackagePath}
+        renamePackageName={renamePackageName}
+        setRenamePackageName={setRenamePackageName}
+        setRenameError={setRenameError}
+        renamePackage={renamePackage}
+        renameError={renameError}
+        setIsRenameDialogOpen={setIsRenameDialogOpen}
+      />
 
-      {/* Rename Package Dialog */}
-      {isRenameDialogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <Card className="w-full max-w-sm p-4 space-y-4">
-            <div>
-              <p className="text-sm font-semibold">{t('snippets.renameDialog.title')}</p>
-              <p className="text-xs text-muted-foreground">{t('snippets.renameDialog.currentPath', { path: renamingPackagePath })}</p>
-            </div>
-            <div className="space-y-2">
-              <Label>{t('field.name')}</Label>
-              <Input
-                autoFocus
-                placeholder={t('snippets.renameDialog.placeholder')}
-                value={renamePackageName}
-                onChange={(e) => {
-                  setRenamePackageName(e.target.value);
-                  setRenameError('');
-                }}
-                onKeyDown={(e) => e.key === 'Enter' && renamePackage()}
-              />
-              {renameError && (
-                <p className="text-[11px] text-destructive">{renameError}</p>
-              )}
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" onClick={() => setIsRenameDialogOpen(false)}>
-                {t('common.cancel')}
-              </Button>
-              <Button onClick={renamePackage}>{t('common.rename')}</Button>
-            </div>
-          </Card>
-        </div>
-      )}
-
-      {/* Right Panel */}
       {renderRightPanel()}
     </div>
     </TooltipProvider>
-  );
-};
-
-// History Item Component
-interface HistoryItemProps {
-  entry: ShellHistoryEntry;
-  onSaveAsSnippet: (entry: ShellHistoryEntry, label: string) => void;
-  onCopy: () => void;
-  isCopied: boolean;
-}
-
-const HistoryItem: React.FC<HistoryItemProps> = ({ entry, onSaveAsSnippet, onCopy, isCopied }) => {
-  const { t } = useI18n();
-  const [isEditing, setIsEditing] = useState(false);
-  const [label, setLabel] = useState('');
-
-  const handleSave = () => {
-    if (label.trim()) {
-      onSaveAsSnippet(entry, label);
-      setIsEditing(false);
-      setLabel('');
-    }
-  };
-
-  const formatTime = (timestamp: number) => {
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMs / 3600000);
-    const diffDays = Math.floor(diffMs / 86400000);
-
-    if (diffMins < 1) return t('snippets.history.time.justNow');
-    if (diffMins < 60) return t('snippets.history.time.minutesAgo', { count: diffMins });
-    if (diffHours < 24) return t('snippets.history.time.hoursAgo', { count: diffHours });
-    if (diffDays < 7) return t('snippets.history.time.daysAgo', { count: diffDays });
-    return date.toLocaleDateString();
-  };
-
-  return (
-    <div className="group rounded-lg bg-background/60 border border-border/50 p-3">
-      <div className="flex items-start gap-2">
-        <div className="flex-1 min-w-0">
-          <div className="font-mono text-sm truncate">{entry.command}</div>
-          <div className="flex items-center gap-2 mt-1 text-[11px] text-muted-foreground">
-            <span>{entry.hostLabel}</span>
-            <span>{t('snippets.history.separator')}</span>
-            <span>{formatTime(entry.timestamp)}</span>
-          </div>
-        </div>
-        {!isEditing && (
-          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2"
-              onClick={onCopy}
-            >
-              {isCopied ? <Check size={14} /> : <Copy size={14} />}
-            </Button>
-            <Button
-              variant="default"
-              size="sm"
-              className="h-7 px-3"
-              onClick={() => setIsEditing(true)}
-            >
-              {t('common.save')}
-            </Button>
-          </div>
-        )}
-      </div>
-      {isEditing && (
-        <div className="mt-3 space-y-2">
-          <Input
-            placeholder={t('snippets.history.labelPlaceholder')}
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSave()}
-            autoFocus
-          />
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => { setIsEditing(false); setLabel(''); }}>
-              {t('common.cancel')}
-            </Button>
-            <Button size="sm" onClick={handleSave} disabled={!label.trim()}>
-              {t('snippets.history.saveAsSnippet')}
-            </Button>
-          </div>
-        </div>
-      )}
-    </div>
   );
 };
 

@@ -1,15 +1,19 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { RotateCcw } from "lucide-react";
+import { Ban, RotateCcw } from "lucide-react";
 import type { HotkeyScheme, KeyBinding } from "../../../domain/models";
 import { keyEventToString } from "../../../domain/models";
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { cn } from "../../../lib/utils";
 import { Button } from "../../ui/button";
-import { SectionHeader, Select, SettingsTabContent, SettingRow } from "../settings-ui";
+import { SectionHeader, Select, SettingsTabContent, SettingRow, Toggle } from "../settings-ui";
 
 export default function SettingsShortcutsTab(props: {
   hotkeyScheme: HotkeyScheme;
   setHotkeyScheme: (scheme: HotkeyScheme) => void;
+  shellOnlyTabNumberShortcuts: boolean;
+  setShellOnlyTabNumberShortcuts: (enabled: boolean) => void;
+  disableTerminalFontZoom: boolean;
+  setDisableTerminalFontZoom: (enabled: boolean) => void;
   keyBindings: KeyBinding[];
   updateKeyBinding?: (bindingId: string, scheme: "mac" | "pc", newKey: string) => void;
   resetKeyBinding?: (bindingId: string, scheme?: "mac" | "pc") => void;
@@ -19,6 +23,10 @@ export default function SettingsShortcutsTab(props: {
   const {
     hotkeyScheme,
     setHotkeyScheme,
+    shellOnlyTabNumberShortcuts,
+    setShellOnlyTabNumberShortcuts,
+    disableTerminalFontZoom,
+    setDisableTerminalFontZoom,
     keyBindings,
     updateKeyBinding,
     resetKeyBinding,
@@ -136,6 +144,24 @@ export default function SettingsShortcutsTab(props: {
             className="w-32"
           />
         </SettingRow>
+        <SettingRow
+          label={t("settings.shortcuts.disableTerminalFontZoom.label")}
+          description={t("settings.shortcuts.disableTerminalFontZoom.desc")}
+        >
+          <Toggle
+            checked={disableTerminalFontZoom}
+            onChange={setDisableTerminalFontZoom}
+          />
+        </SettingRow>
+        <SettingRow
+          label={t("settings.shortcuts.shellOnlyTabNumberShortcuts.label")}
+          description={t("settings.shortcuts.shellOnlyTabNumberShortcuts.desc")}
+        >
+          <Toggle
+            checked={shellOnlyTabNumberShortcuts}
+            onChange={setShellOnlyTabNumberShortcuts}
+          />
+        </SettingRow>
       </div>
 
       {hotkeyScheme !== "disabled" && (
@@ -221,13 +247,24 @@ export default function SettingsShortcutsTab(props: {
                             >
                               {isRecordingThis
                                 ? t("settings.shortcuts.recording")
-                                : currentKey || t("settings.shortcuts.scheme.disabled")}
+                                : currentKey === "Disabled"
+                                  ? t("settings.shortcuts.scheme.disabled")
+                                  : currentKey || t("settings.shortcuts.scheme.disabled")}
+                            </button>
+                          )}
+                          {!isSpecialBinding && (
+                            <button
+                              onClick={() => updateKeyBinding?.(binding.id, scheme, "Disabled")}
+                              className="p-1 hover:bg-muted rounded"
+                              aria-label={t("settings.shortcuts.setDisabled")}
+                            >
+                              <Ban size={12} />
                             </button>
                           )}
                           <button
                             onClick={() => resetKeyBinding?.(binding.id, scheme)}
                             className="p-1 hover:bg-muted rounded"
-                            title="Reset to default"
+                            aria-label={t("settings.shortcuts.resetToDefault")}
                           >
                             <RotateCcw size={12} />
                           </button>

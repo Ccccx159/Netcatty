@@ -10,7 +10,8 @@ import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
 import { ContextMenu,ContextMenuContent,ContextMenuItem,ContextMenuSeparator,ContextMenuTrigger } from '../ui/context-menu';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
-import { getStatusColor,getTypeColor } from './utils';
+import { vaultEntityIconClass } from '../vault/VaultEntityIcon';
+import { buildRuleSummary,getStatusColor,getTypeColor } from './utils';
 
 export type ViewMode = 'grid' | 'list';
 
@@ -20,6 +21,7 @@ export interface RuleCardProps {
     viewMode: ViewMode;
     isSelected: boolean;
     isPending: boolean;
+    reorderProps?: React.HTMLAttributes<HTMLDivElement>;
     onSelect: () => void;
     onEdit: () => void;
     onDuplicate: () => void;
@@ -34,6 +36,7 @@ export const RuleCard: React.FC<RuleCardProps> = ({
     viewMode,
     isSelected,
     isPending,
+    reorderProps,
     onSelect,
     onEdit,
     onDuplicate,
@@ -49,18 +52,22 @@ export const RuleCard: React.FC<RuleCardProps> = ({
         <ContextMenu>
             <ContextMenuTrigger>
                 <div
+                    {...reorderProps}
                     className={cn(
+                        reorderProps && "vault-drop-indicator-row",
                         "group cursor-pointer",
                         viewMode === 'grid'
                             ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
                             : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors",
-                        isSelected && "ring-2 ring-primary"
+                        isSelected && "ring-2 ring-primary",
+                        reorderProps?.className,
                     )}
                     onClick={onSelect}
                 >
                     <div className="flex items-center gap-3 h-full">
                         <div className={cn(
-                            "h-11 w-11 rounded-xl flex items-center justify-center text-sm font-bold transition-colors",
+                            vaultEntityIconClass,
+                            "text-sm font-bold transition-colors",
                             getTypeColor(rule.type, isActive)
                         )}>
                             {rule.type[0].toUpperCase()}
@@ -68,23 +75,33 @@ export const RuleCard: React.FC<RuleCardProps> = ({
                         <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                                 <span className="text-sm font-semibold truncate">{rule.label}</span>
-                                <span
-                                    className={cn(
-                                        "h-2 w-2 rounded-full flex-shrink-0",
-                                        getStatusColor(rule.status)
-                                    )}
-                                    title={rule.status === 'error' && rule.error ? rule.error : undefined}
-                                />
+                                {rule.status === 'error' && rule.error ? (
+                                    <Tooltip>
+                                        <TooltipTrigger asChild>
+                                            <span
+                                                className={cn(
+                                                    "h-2 w-2 rounded-full flex-shrink-0 cursor-default",
+                                                    getStatusColor(rule.status)
+                                                )}
+                                            />
+                                        </TooltipTrigger>
+                                        <TooltipContent>{rule.error}</TooltipContent>
+                                    </Tooltip>
+                                ) : (
+                                    <span
+                                        className={cn(
+                                            "h-2 w-2 rounded-full flex-shrink-0",
+                                            getStatusColor(rule.status)
+                                        )}
+                                    />
+                                )}
                             </div>
                             <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
                                 <TooltipProvider delayDuration={300}>
                                     <Tooltip>
                                         <TooltipTrigger asChild>
                                             <span className="truncate cursor-default">
-                                                {rule.type === 'dynamic'
-                                                    ? t('pf.rule.summary.dynamic', { bindAddress: rule.bindAddress, localPort: rule.localPort })
-                                                    : t('pf.rule.summary.default', { bindAddress: rule.bindAddress, localPort: rule.localPort, remoteHost: rule.remoteHost, remotePort: rule.remotePort })
-                                                }
+                                                {buildRuleSummary(t, rule)}
                                             </span>
                                         </TooltipTrigger>
                                         <TooltipContent side="bottom" align="start" className="max-w-xs">

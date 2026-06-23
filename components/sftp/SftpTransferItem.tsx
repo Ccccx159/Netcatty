@@ -8,7 +8,9 @@ import {
     CheckCircle2,
     ChevronDown,
     ChevronUp,
+    ClipboardCopy,
     File,
+    FolderOpen,
     FolderUp,
     GripVertical,
     Loader2,
@@ -35,28 +37,45 @@ interface SftpTransferItemProps {
     onDismiss: () => void;
     canRevealTarget?: boolean;
     onRevealTarget?: () => void;
+    canCopyTargetPath?: boolean;
+    onCopyTargetPath?: () => void;
     canToggleChildren?: boolean;
     isExpanded?: boolean;
     visibleChildCount?: number;
     onToggleChildren?: () => void;
+    onSetNameColumnWidth?: (width: number) => void;
+    childNameColumnMinWidth?: number;
+    childNameColumnMaxWidth?: number;
+    childListId?: string;
+    resizeHandleTabIndex?: number;
 }
 
 const TruncatedTextWithTooltip: React.FC<{
     text: string;
     className?: string;
 }> = ({ text, className }) => (
-    <TooltipProvider delayDuration={300} skipDelayDuration={100}>
-        <Tooltip>
-            <TooltipTrigger asChild>
-                <span className={cn("truncate", className)}>
-                    {text}
-                </span>
-            </TooltipTrigger>
-            <TooltipContent side="top" align="start" className="max-w-md break-all">
+    <Tooltip>
+        <TooltipTrigger asChild>
+            <span className={cn("truncate", className)}>
                 {text}
-            </TooltipContent>
-        </Tooltip>
-    </TooltipProvider>
+            </span>
+        </TooltipTrigger>
+        <TooltipContent side="top" align="start" className="max-w-md break-all">
+            {text}
+        </TooltipContent>
+    </Tooltip>
+);
+
+const IconButtonWithTooltip: React.FC<{
+    label: string;
+    children: React.ReactElement;
+}> = ({ label, children }) => (
+    <Tooltip>
+        <TooltipTrigger asChild>
+            {children}
+        </TooltipTrigger>
+        <TooltipContent side="top">{label}</TooltipContent>
+    </Tooltip>
 );
 
 const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
@@ -69,10 +88,17 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
     onDismiss,
     canRevealTarget = false,
     onRevealTarget,
+    canCopyTargetPath = false,
+    onCopyTargetPath,
     canToggleChildren = false,
     isExpanded = false,
     visibleChildCount: _visibleChildCount = 0,
     onToggleChildren,
+    onSetNameColumnWidth,
+    childNameColumnMinWidth = 160,
+    childNameColumnMaxWidth = 480,
+    childListId,
+    resizeHandleTabIndex = 0,
 }) => {
     const { t } = useI18n();
 
@@ -139,7 +165,9 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                 : <XCircle size={12} className={task.status === 'failed' ? "text-destructive" : "text-muted-foreground"} />;
 
     const childProgressBar = (
-        <div className="relative h-full overflow-hidden border border-border/60 bg-secondary/70">
+        <div
+            className="relative h-full overflow-hidden border border-border/60 bg-secondary/70"
+        >
             <div
                 className={cn(
                     "h-full relative overflow-hidden",
@@ -184,31 +212,86 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
     const showTransferSizeCalculation = task.status === 'transferring' && !hasKnownTotal && !isDirParent;
     const showFailedError = task.status === 'failed' && !!task.error;
     const hasFooterContent = showTransferSizeCalculation || showFailedError;
+    const retryActionLabel = t('sftp.transfers.retryAction');
+    const cancelActionLabel = t('common.cancel');
+    const dismissActionLabel = t('sftp.transfers.dismissAction');
+    const resizeNameColumnLabel = t('sftp.transfers.resizeNameColumn');
+    const toggleChildrenLabel = isExpanded ? t('sftp.transfers.collapseChildList') : t('sftp.transfers.expandChildList');
+    const revealTargetLabel = t('sftp.transfers.openTargetFolder');
+    const copyTargetPathLabel = t('sftp.transfers.copyTargetPath');
+    const actionButtonClass = "h-6 w-6 focus-visible:ring-1 focus-visible:ring-primary/50";
+    const actionAriaLabel = (label: string) => `${label}: ${task.fileName}`;
+
+    const setNameColumnWidth = (width: number) => {
+        const nextWidth = Math.max(childNameColumnMinWidth, Math.min(childNameColumnMaxWidth, width));
+        onSetNameColumnWidth?.(nextWidth);
+    };
+
+    const handleResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (!onSetNameColumnWidth) return;
+
+        const step = event.shiftKey ? 40 : 10;
+        if (event.key === 'ArrowLeft') {
+            event.preventDefault();
+            setNameColumnWidth(childNameColumnWidth - step);
+        } else if (event.key === 'ArrowRight') {
+            event.preventDefault();
+            setNameColumnWidth(childNameColumnWidth + step);
+        } else if (event.key === 'Home') {
+            event.preventDefault();
+            setNameColumnWidth(childNameColumnMinWidth);
+        } else if (event.key === 'End') {
+            event.preventDefault();
+            setNameColumnWidth(childNameColumnMaxWidth);
+        }
+    };
 
     const actionButtons = (
         <div className="flex items-center gap-1 shrink-0">
+            {canRevealTarget && onRevealTarget && (
+                <IconButtonWithTooltip label={revealTargetLabel}>
+                    <Button variant="ghost" size="icon" className={actionButtonClass} onClick={onRevealTarget} aria-label={actionAriaLabel(revealTargetLabel)}>
+                        <FolderOpen size={12} />
+                    </Button>
+                </IconButtonWithTooltip>
+            )}
+            {canCopyTargetPath && onCopyTargetPath && (
+                <IconButtonWithTooltip label={copyTargetPathLabel}>
+                    <Button variant="ghost" size="icon" className={actionButtonClass} onClick={onCopyTargetPath} aria-label={actionAriaLabel(copyTargetPathLabel)}>
+                        <ClipboardCopy size={12} />
+                    </Button>
+                </IconButtonWithTooltip>
+            )}
             {task.status === 'failed' && task.retryable !== false && (
-                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onRetry} title="Retry">
-                    <RefreshCw size={12} />
-                </Button>
+                <IconButtonWithTooltip label={retryActionLabel}>
+                    <Button variant="ghost" size="icon" className={actionButtonClass} onClick={onRetry} aria-label={actionAriaLabel(retryActionLabel)}>
+                        <RefreshCw size={12} />
+                    </Button>
+                </IconButtonWithTooltip>
             )}
             {(task.status === 'pending' || task.status === 'transferring') && (
-                <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive hover:text-destructive" onClick={onCancel} title="Cancel">
-                    <X size={12} />
-                </Button>
+                <IconButtonWithTooltip label={cancelActionLabel}>
+                    <Button variant="ghost" size="icon" className={cn(actionButtonClass, "text-destructive hover:text-destructive")} onClick={onCancel} aria-label={actionAriaLabel(cancelActionLabel)}>
+                        <X size={12} />
+                    </Button>
+                </IconButtonWithTooltip>
             )}
             {(task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') && (
-                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onDismiss} title="Dismiss">
-                    <X size={12} />
-                </Button>
+                <IconButtonWithTooltip label={dismissActionLabel}>
+                    <Button variant="ghost" size="icon" className={actionButtonClass} onClick={onDismiss} aria-label={actionAriaLabel(dismissActionLabel)}>
+                        <X size={12} />
+                    </Button>
+                </IconButtonWithTooltip>
             )}
         </div>
     );
 
-    if (isChild) {
-        return (
+    const content = isChild ? (
             <div
                 className="grid h-7 items-stretch border-t border-border/20 bg-background/20 px-3"
+                data-section="terminal-sftp-transfer-row"
+                data-transfer-status={task.status}
+                data-transfer-direction={task.direction}
                 style={{
                     gridTemplateColumns: `24px ${childNameColumnWidth}px 10px minmax(0, 1fr) 24px`,
                 }}
@@ -222,13 +305,25 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                         className="min-w-0 text-[11px] font-medium text-foreground/90"
                     />
                 </div>
-                <div
-                    className="flex h-full cursor-col-resize items-center justify-center text-muted-foreground/35 hover:text-foreground/70"
-                    onMouseDown={onResizeNameColumn}
-                    title="Resize file name column"
-                >
-                    <GripVertical size={10} />
-                </div>
+                <Tooltip>
+                    <TooltipTrigger asChild>
+                        <div
+                            className="flex h-full cursor-col-resize items-center justify-center text-muted-foreground/35 hover:text-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
+                            onMouseDown={onResizeNameColumn}
+                            onKeyDown={handleResizeKeyDown}
+                            role="separator"
+                            aria-label={resizeNameColumnLabel}
+                            aria-orientation="vertical"
+                            aria-valuemin={childNameColumnMinWidth}
+                            aria-valuemax={childNameColumnMaxWidth}
+                            aria-valuenow={childNameColumnWidth}
+                            tabIndex={resizeHandleTabIndex}
+                        >
+                            <GripVertical size={10} />
+                        </div>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">{resizeNameColumnLabel}</TooltipContent>
+                </Tooltip>
                 <div className="min-w-0">
                     {childProgressBar}
                 </div>
@@ -236,12 +331,10 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                     {actionButtons}
                 </div>
             </div>
-        );
-    }
+    ) : (() => {
+        const showBelowParentProgress = task.status === 'transferring' || task.status === 'pending';
 
-    const showBelowParentProgress = task.status === 'transferring' || task.status === 'pending';
-
-    const titleBlock = (
+        const titleBlock = (
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
             <TruncatedTextWithTooltip
                 text={task.fileName}
@@ -255,22 +348,35 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                     canRevealTarget ? "text-primary/80" : "text-muted-foreground",
                 )}
             />
-            {canToggleChildren && (
-                <button
-                    type="button"
-                    className="inline-flex shrink-0 items-center gap-1 rounded border border-border/60 bg-secondary/60 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-                    onClick={onToggleChildren}
-                    title={isExpanded ? t('sftp.transfers.collapseChildList') : t('sftp.transfers.expandChildList')}
-                >
-                    {isExpanded ? t('sftp.transfers.collapseChildList') : t('sftp.transfers.expandChildList')}
-                    {isExpanded ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-                </button>
-            )}
         </div>
-    );
+        );
 
-    return (
-        <div className="border-t border-border/40 bg-background/60 px-3 py-2.5 backdrop-blur-sm">
+        const toggleChildrenButton = canToggleChildren ? (
+            <Tooltip>
+                <TooltipTrigger asChild>
+                    <button
+                        type="button"
+                        className="inline-flex shrink-0 items-center gap-1 rounded border border-border/60 bg-secondary/60 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
+                        onClick={onToggleChildren}
+                        aria-label={toggleChildrenLabel}
+                        aria-expanded={isExpanded}
+                        aria-controls={childListId}
+                    >
+                        {toggleChildrenLabel}
+                        {isExpanded ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                    </button>
+                </TooltipTrigger>
+                <TooltipContent side="top">{toggleChildrenLabel}</TooltipContent>
+            </Tooltip>
+        ) : null;
+
+        return (
+        <div
+            className="border-t border-border/40 bg-background/60 px-3 py-2.5 supports-[backdrop-filter]:backdrop-blur-sm"
+            data-section="terminal-sftp-transfer-row"
+            data-transfer-status={task.status}
+            data-transfer-direction={task.direction}
+        >
             <div className="flex items-center gap-1">
                 <div className="flex h-5 w-5 items-center justify-center shrink-0 -translate-y-px">
                     {statusIcon}
@@ -281,6 +387,7 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                         type="button"
                         className="flex min-w-0 flex-1 rounded-sm text-left transition-colors hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/50"
                         onClick={onRevealTarget}
+                        aria-label={actionAriaLabel(revealTargetLabel)}
                     >
                         {titleBlock}
                     </button>
@@ -289,6 +396,8 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                         {titleBlock}
                     </div>
                 )}
+
+                {toggleChildrenButton}
 
                 {progressSummaryText && (
                     <span className="ml-auto shrink-0 whitespace-nowrap text-[10px] text-muted-foreground font-mono">
@@ -341,6 +450,13 @@ const SftpTransferItemInner: React.FC<SftpTransferItemProps> = ({
                 </div>
             )}
         </div>
+        );
+    })();
+
+    return (
+        <TooltipProvider delayDuration={300} skipDelayDuration={100}>
+            {content}
+        </TooltipProvider>
     );
 };
 
@@ -357,11 +473,16 @@ const arePropsEqual = (
     if (prev.targetPath !== next.targetPath) return false;
     if (prev.totalBytes !== next.totalBytes) return false;
     if ((prevProps.canRevealTarget ?? false) !== (nextProps.canRevealTarget ?? false)) return false;
+    if ((prevProps.canCopyTargetPath ?? false) !== (nextProps.canCopyTargetPath ?? false)) return false;
     if ((prevProps.isChild ?? false) !== (nextProps.isChild ?? false)) return false;
     if ((prevProps.childNameColumnWidth ?? 260) !== (nextProps.childNameColumnWidth ?? 260)) return false;
     if ((prevProps.canToggleChildren ?? false) !== (nextProps.canToggleChildren ?? false)) return false;
     if ((prevProps.isExpanded ?? false) !== (nextProps.isExpanded ?? false)) return false;
     if ((prevProps.visibleChildCount ?? 0) !== (nextProps.visibleChildCount ?? 0)) return false;
+    if ((prevProps.childNameColumnMinWidth ?? 160) !== (nextProps.childNameColumnMinWidth ?? 160)) return false;
+    if ((prevProps.childNameColumnMaxWidth ?? 480) !== (nextProps.childNameColumnMaxWidth ?? 480)) return false;
+    if ((prevProps.childListId ?? '') !== (nextProps.childListId ?? '')) return false;
+    if ((prevProps.resizeHandleTabIndex ?? 0) !== (nextProps.resizeHandleTabIndex ?? 0)) return false;
 
     if (next.status === 'transferring') {
         if (next.totalBytes <= 0 && prev.transferredBytes !== next.transferredBytes) return false;

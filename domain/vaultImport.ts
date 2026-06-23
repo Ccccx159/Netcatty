@@ -1,5 +1,7 @@
 import { Host, HostChainConfig, HostProtocol } from "./models";
 import { parseQuickConnectInput } from "./quickConnect";
+import { findHeaderIndex, parseCsv } from "./vaultImport/csvUtils";
+export { exportHostsToCsvWithStats, getVaultCsvTemplate } from "./vaultImport/csvExport";
 
 interface ParsedJumpHost {
   hostname: string;
@@ -66,7 +68,6 @@ const parseJumpHostSpec = (spec: string): ParsedJumpHost | null => {
   if (!hostname) return null;
   return { hostname, username, port };
 };
-
 const parseProxyJump = (value: string): ParsedJumpHost[] => {
   if (!value || value.toLowerCase() === "none") return [];
   return value
@@ -105,10 +106,6 @@ interface VaultImportResult {
   stats: VaultImportStats;
 }
 
-interface VaultCsvTemplateOptions {
-  includeExampleRows?: boolean;
-}
-
 const DEFAULT_SSH_PORT = 22;
 
 const normalizeGroupPath = (raw: string | undefined): string | undefined => {
@@ -122,7 +119,7 @@ const normalizeGroupPath = (raw: string | undefined): string | undefined => {
 
 const normalizeProtocol = (
   raw: string | undefined,
-): Exclude<HostProtocol, "mosh"> | undefined => {
+): Exclude<HostProtocol, "mosh" | "et"> | undefined => {
   const s = raw?.trim().toLowerCase();
   if (!s) return undefined;
   if (s === "ssh" || s === "ssh2" || s === "ssh-2") return "ssh";
@@ -157,11 +154,13 @@ const createHost = (input: {
   username?: string;
   password?: string;
   port?: number;
-  protocol?: Exclude<HostProtocol, "mosh">;
+  protocol?: Exclude<HostProtocol, "mosh" | "et">;
   group?: string;
   tags?: string[];
+  notes?: string;
 }): Host => {
   const now = Date.now();
+  const notes = input.notes?.trim() || undefined;
   return {
     id: crypto.randomUUID(),
     label: input.label?.trim() || input.hostname,
@@ -174,6 +173,7 @@ const createHost = (input: {
     os: "linux",
     protocol: input.protocol ?? "ssh",
     createdAt: now,
+    ...(notes ? { notes } : {}),
   };
 };
 
@@ -210,7 +210,7 @@ const looksLikeHostnameToken = (token: string): boolean => {
 
 const parseTarget = (
   raw: string,
-): { hostname: string; username?: string; port?: number; protocol?: Exclude<HostProtocol, "mosh"> } | null => {
+): { hostname: string; username?: string; port?: number; protocol?: Exclude<HostProtocol, "mosh" | "et"> } | null => {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
@@ -243,76 +243,6 @@ const parseTarget = (
   return null;
 };
 
-const parseCsv = (text: string): string[][] => {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        const next = text[i + 1];
-        if (next === '"') {
-          field += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        field += ch;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      inQuotes = true;
-      continue;
-    }
-
-    if (ch === ",") {
-      row.push(field);
-      field = "";
-      continue;
-    }
-
-    if (ch === "\r" || ch === "\n") {
-      if (ch === "\r" && text[i + 1] === "\n") i++;
-      row.push(field);
-      field = "";
-      rows.push(row);
-      row = [];
-      continue;
-    }
-
-    field += ch;
-  }
-
-  row.push(field);
-  rows.push(row);
-  return rows;
-};
-
-const normalizeHeaderKey = (raw: string): string => {
-  return raw
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_-]+/g, "")
-    .replace(/[^\p{L}\p{N}]/gu, "");
-};
-
-const findHeaderIndex = (headers: string[], candidates: string[]): number => {
-  const normalized = headers.map((h) => normalizeHeaderKey(h));
-  for (const cand of candidates) {
-    const c = cand.toLowerCase();
-    for (let i = 0; i < normalized.length; i++) {
-      const h = normalized[i];
-      if (h === c || h.startsWith(c)) return i;
-    }
-  }
-  return -1;
-};
 
 const importFromCsv = (text: string): VaultImportResult => {
   const issues: VaultImportIssue[] = [];
@@ -332,6 +262,7 @@ const importFromCsv = (text: string): VaultImportResult => {
   const groupsIdx = findHeaderIndex(header, ["groups", "group", "folder", "path"]);
   const labelIdx = findHeaderIndex(header, ["label", "name"]);
   const tagsIdx = findHeaderIndex(header, ["tags", "tag"]);
+  const notesIdx = findHeaderIndex(header, ["notes", "note", "remark", "description", "memo"]);
   const hostnameIdx = findHeaderIndex(header, ["hostname", "host", "server"]);
   const protocolIdx = findHeaderIndex(header, ["protocol", "proto", "scheme"]);
   const portIdx = findHeaderIndex(header, ["port"]);
@@ -376,6 +307,8 @@ const importFromCsv = (text: string): VaultImportResult => {
     const group = groupsIdx >= 0 ? normalizeGroupPath(row[groupsIdx]) : undefined;
     const label = labelIdx >= 0 ? row[labelIdx] : undefined;
     const tags = tagsIdx >= 0 ? splitTags(row[tagsIdx]) : [];
+    const notesRaw = notesIdx >= 0 ? row[notesIdx] : undefined;
+    const notes = notesRaw?.trim() || undefined;
     const protocol =
       normalizeProtocol(protocolIdx >= 0 ? row[protocolIdx] : undefined) ??
       target.protocol ??
@@ -394,6 +327,7 @@ const importFromCsv = (text: string): VaultImportResult => {
         protocol,
         group,
         tags,
+        notes,
       }),
     );
   }
@@ -446,7 +380,7 @@ const importFromPuttyReg = (text: string): VaultImportResult => {
     hostname?: string;
     username?: string;
     port?: number;
-    protocol?: Exclude<HostProtocol, "mosh">;
+    protocol?: Exclude<HostProtocol, "mosh" | "et">;
   };
 
   const sessions: Session[] = [];
@@ -526,6 +460,7 @@ const importFromSshConfig = (text: string): VaultImportResult => {
     port?: number;
     proxyJump?: string;
     identityFiles?: string[];
+    forwardX11?: boolean;
   };
 
   const blocks: Block[] = [];
@@ -564,6 +499,7 @@ const importFromSshConfig = (text: string): VaultImportResult => {
     else if (keyword === "user") current.username = value;
     else if (keyword === "port") current.port = parsePort(value);
     else if (keyword === "proxyjump") current.proxyJump = value;
+    else if (keyword === "forwardx11") current.forwardX11 = value.toLowerCase() === "yes";
     else if (keyword === "identityfile") {
       if (!current.identityFiles) current.identityFiles = [];
       // Remove surrounding quotes (ssh_config allows quoted paths with spaces)
@@ -613,6 +549,9 @@ const importFromSshConfig = (text: string): VaultImportResult => {
       // Attach IdentityFile paths if present
       if (block.identityFiles && block.identityFiles.length > 0) {
         host.identityFilePaths = [...block.identityFiles];
+      }
+      if (block.forwardX11 !== undefined) {
+        host.x11Forwarding = block.forwardX11;
       }
 
       parsedHosts.push(host);
@@ -759,7 +698,7 @@ const importFromSecureCrt = (text: string, fileName?: string): VaultImportResult
     hostname?: string;
     username?: string;
     port?: number;
-    protocol?: Exclude<HostProtocol, "mosh">;
+    protocol?: Exclude<HostProtocol, "mosh" | "et">;
   };
 
   const sessions: Session[] = [];
@@ -893,7 +832,7 @@ const importFromMobaXterm = (text: string): VaultImportResult => {
     const group =
       keyParts.length > 1 ? keyParts.slice(0, -1).join("/") : undefined;
 
-    let protocol: Exclude<HostProtocol, "mosh"> | undefined;
+    let protocol: Exclude<HostProtocol, "mosh" | "et"> | undefined;
     let hostname: string | undefined;
     let username: string | undefined;
     let port: number | undefined;
@@ -994,102 +933,3 @@ export const importVaultHostsFromText = (
     }
   }
 };
-
-export const getVaultCsvTemplate = (
-  opts: VaultCsvTemplateOptions = {},
-): string => {
-  const includeExampleRows = opts.includeExampleRows !== false;
-  const header = ["Groups", "Label", "Tags", "Hostname/IP", "Protocol", "Port", "Username", "Password"];
-  const rows: string[][] = [header];
-  if (includeExampleRows) {
-    rows.push(["Project/Dev", "Web Server (dev)", "dev,web", "192.168.1.10", "ssh", "22", "root", ""]);
-    rows.push(["Project/Prod", "Web Server (prod)", "prod,web", "server-a.example.com", "ssh", "22", "ubuntu", ""]);
-    rows.push(["Database", "DB", "db,mysql", "db.example.com", "ssh", "4567", "admin", ""]);
-  }
-
-  const escapeCsv = (value: string) => {
-    if (value.includes('"')) value = value.replace(/"/g, '""');
-    if (/[",\r\n]/.test(value)) return `"${value}"`;
-    return value;
-  };
-
-  return rows.map((r) => r.map((c) => escapeCsv(c)).join(",")).join("\r\n") + "\r\n";
-};
-
-const exportHostsToCsv = (hosts: Host[]): string => {
-  const header = ["Groups", "Label", "Tags", "Hostname/IP", "Protocol", "Port", "Username", "Password"];
-  const rows: string[][] = [header];
-
-  const escapeCsv = (value: string, skipFormulaGuard = false) => {
-    // Prevent CSV formula injection by prefixing dangerous characters with a single quote
-    // These characters can be interpreted as formulas by spreadsheet applications
-    // Skip for password fields to preserve credentials verbatim for round-trip
-    if (!skipFormulaGuard && /^[=+\-@\t\r]/.test(value)) {
-      value = "'" + value;
-    }
-    if (value.includes('"')) value = value.replace(/"/g, '""');
-    if (/[",\r\n]/.test(value)) return `"${value}"`;
-    return value;
-  };
-
-  // Filter out serial hosts - CSV format doesn't support serial port configuration
-  // Note: mosh-enabled hosts are exported as SSH (losing mosh flag) rather than being skipped,
-  // since exporting partial data is better than losing the entire host entry
-  const isUnsupported = (h: Host) => h.protocol === "serial";
-  const exportableHosts = hosts.filter((h) => !isUnsupported(h));
-
-  // Helper to bracket IPv6 addresses for CSV export
-  // IPv6 addresses contain colons which would be misinterpreted as port separators on import
-  const formatHostname = (hostname: string): string => {
-    // Check if it looks like an IPv6 address (contains colons but not already bracketed)
-    if (hostname.includes(":") && !hostname.startsWith("[")) {
-      return `[${hostname}]`;
-    }
-    return hostname;
-  };
-
-  for (const host of exportableHosts) {
-    // For telnet hosts, use telnet-specific port and username
-    const isTelnet = host.protocol === "telnet";
-    const effectivePort = isTelnet
-      ? (host.telnetPort ?? host.port ?? 23)
-      : (host.port ?? 22);
-    const effectiveUsername = isTelnet
-      ? (host.telnetUsername ?? host.username ?? "")
-      : (host.username ?? "");
-
-    rows.push([
-      host.group ?? "",
-      host.label ?? "",
-      (host.tags ?? []).join(","),
-      formatHostname(host.hostname),
-      host.protocol ?? "ssh",
-      String(effectivePort),
-      effectiveUsername,
-      host.password ?? "",
-    ]);
-  }
-
-  const passwordColIdx = header.indexOf("Password");
-  return rows.map((r, rowIdx) => r.map((c, i) => escapeCsv(c, rowIdx > 0 && i === passwordColIdx)).join(",")).join("\r\n") + "\r\n";
-};
-
-interface ExportHostsResult {
-  csv: string;
-  exportedCount: number;
-  skippedCount: number;
-}
-
-export const exportHostsToCsvWithStats = (hosts: Host[]): ExportHostsResult => {
-  // Only serial hosts are truly unsupported - mosh hosts are exported as SSH
-  const isUnsupported = (h: Host) => h.protocol === "serial";
-  const skippedHosts = hosts.filter((h) => isUnsupported(h));
-  const exportableHosts = hosts.filter((h) => !isUnsupported(h));
-
-  return {
-    csv: exportHostsToCsv(hosts),
-    exportedCount: exportableHosts.length,
-    skippedCount: skippedHosts.length,
-  };
-};
-

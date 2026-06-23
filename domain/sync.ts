@@ -1,9 +1,11 @@
 /**
  * Cloud Sync Domain Types & Interfaces
- * 
+ *
  * Zero-Knowledge Encrypted Multi-Cloud Sync System
  * Supports: GitHub Gist, Google Drive, Microsoft OneDrive, WebDAV, S3 Compatible
  */
+
+import type { ShrinkFinding } from './syncGuards';
 
 // ============================================================================
 // Security State Machine
@@ -22,10 +24,11 @@ export type SecurityState =
  * Sync Operation State Machine
  * Tracks the current sync operation status
  */
-export type SyncState = 
+export type SyncState =
   | 'IDLE'       // Waiting for sync trigger
   | 'SYNCING'    // Active sync operation in progress
   | 'CONFLICT'   // Version conflict detected - needs resolution
+  | 'BLOCKED'    // Outgoing payload would delete too much — user must choose restore or force-push
   | 'ERROR';     // Operation failed - needs attention
 
 /**
@@ -87,6 +90,38 @@ export interface OAuthTokens {
   tokenType: string;
   scope?: string;
 }
+
+/**
+ * Marker prefixed onto OneDrive refresh errors when Microsoft reports the
+ * refresh token can no longer be used (expired / revoked / consent withdrawn).
+ * Only an error's `message` survives the Electron IPC boundary, so the marker is
+ * the stable signal that the OneDrive session must be re-authorized. It is added
+ * in the bridge (electron/bridges/onedriveAuthBridge.cjs) and detected/cleaned
+ * here so the same logic is shared by infrastructure and UI layers.
+ */
+export const ONEDRIVE_REAUTH_REQUIRED_MARKER = 'ONEDRIVE_REAUTH_REQUIRED';
+
+/**
+ * True when an error indicates the OneDrive refresh token is dead and the user
+ * must reconnect. Robust to the error being re-wrapped (e.g. `new
+ * Error(String(err))`) as it bubbles through the provider-agnostic pipeline.
+ */
+export const isOneDriveReauthRequiredMessage = (message: string): boolean =>
+  message.includes(ONEDRIVE_REAUTH_REQUIRED_MARKER);
+
+/**
+ * Produce a clean, user-facing message from a (possibly multiply-wrapped) error
+ * string by dropping everything up to and including the internal reauth marker,
+ * e.g. "Error: OneDriveReauthRequiredError: ONEDRIVE_REAUTH_REQUIRED: OneDrive
+ * session expired..." -> "OneDrive session expired...". Returns the original
+ * string unchanged when the marker is absent.
+ */
+export const cleanOneDriveErrorMessage = (message: string): string => {
+  const token = `${ONEDRIVE_REAUTH_REQUIRED_MARKER}:`;
+  const markerIndex = message.lastIndexOf(token);
+  if (markerIndex === -1) return message;
+  return message.slice(markerIndex + token.length).trim();
+};
 
 /**
  * Provider account information
@@ -161,9 +196,12 @@ export interface SyncPayload {
   hosts: import('./models').Host[];
   keys: import('./models').SSHKey[];
   identities?: import('./models').Identity[];
+  proxyProfiles?: import('./models').ProxyProfile[];
   snippets: import('./models').Snippet[];
   customGroups: string[];
   snippetPackages?: string[];
+  notes?: import('./models').VaultNote[];
+  noteGroups?: string[];
 
   // Group configs (connection defaults per host group)
   groupConfigs?: import('./models').GroupConfig[];
@@ -187,6 +225,9 @@ export interface SyncPayload {
     customCSS?: string;
     // Terminal
     terminalTheme?: string;
+    followAppTerminalTheme?: boolean;
+    terminalThemeDark?: string;
+    terminalThemeLight?: string;
     terminalFontFamily?: string;
     terminalFontSize?: number;
     terminalSettings?: Record<string, unknown>;
@@ -201,15 +242,141 @@ export interface SyncPayload {
     sftpShowHiddenFiles?: boolean;
     sftpUseCompressedUpload?: boolean;
     sftpAutoOpenSidebar?: boolean;
+    sftpFollowTerminalCwd?: boolean;
+    sftpDefaultViewMode?: 'list' | 'tree';
     sftpGlobalBookmarks?: import('./models').SftpBookmark[];
-    // Immersive mode
-    immersiveMode?: boolean;
     // Vault: show recently connected hosts
     showRecentHosts?: boolean;
+    // Vault: root list shows only ungrouped hosts
+    showOnlyUngroupedHostsInRoot?: boolean;
+    // Top tabs: show standalone SFTP view tab
+    showSftpTab?: boolean;
+    // Shortcuts: Cmd/Ctrl+[1...9] skip pinned Vault/SFTP tabs
+    shellOnlyTabNumberShortcuts?: boolean;
+    // Shortcuts: disable terminal font zoom shortcuts
+    disableTerminalFontZoom?: boolean;
+    // Terminal/editor tabs: show left host list sidebar
+    showHostTreeSidebar?: boolean;
+    // Workspace focus indicator style
+    workspaceFocusStyle?: 'dim' | 'border';
+    // AI configuration
+    ai?: {
+      providers?: Array<Record<string, unknown>>;
+      activeProviderId?: string;
+      activeModelId?: string;
+      globalPermissionMode?: 'observer' | 'confirm' | 'autonomous';
+      toolIntegrationMode?: 'mcp' | 'skills';
+      hostPermissions?: Array<Record<string, unknown>>;
+      // externalAgents intentionally omitted: command/args/env are device-local
+      // (binary paths, OS-specific values) and don't survive cross-device sync.
+      defaultAgentId?: string;
+      commandBlocklist?: string[];
+      commandTimeout?: number;
+      maxIterations?: number;
+      agentModelMap?: Record<string, string>;
+      agentProviderMap?: Record<string, string>;
+      webSearchConfig?: Record<string, unknown> | null;
+      quickMessages?: Array<Record<string, unknown>>;
+      showTerminalSelectionAction?: boolean;
+    };
   };
 
   // Sync metadata
   syncedAt: number;         // When this payload was created
+
+  // Reliability metadata used to make sync decisions auditable across devices.
+  syncMeta?: SyncReliabilityMeta;
+}
+
+export const SYNC_PAYLOAD_ENTITY_KEYS = [
+  'hosts',
+  'keys',
+  'identities',
+  'proxyProfiles',
+  'snippets',
+  'customGroups',
+  'snippetPackages',
+  'notes',
+  'noteGroups',
+  'portForwardingRules',
+  'knownHosts',
+  'groupConfigs',
+] as const;
+
+export const CLOUD_SYNC_PAYLOAD_ENTITY_KEYS = [
+  'hosts',
+  'keys',
+  'identities',
+  'proxyProfiles',
+  'snippets',
+  'customGroups',
+  'snippetPackages',
+  'notes',
+  'noteGroups',
+  'portForwardingRules',
+  'groupConfigs',
+] as const;
+
+export type SyncPayloadEntityKey = typeof SYNC_PAYLOAD_ENTITY_KEYS[number];
+export type CloudSyncPayloadEntityKey = typeof CLOUD_SYNC_PAYLOAD_ENTITY_KEYS[number];
+export type SyncChangeEntityKey = CloudSyncPayloadEntityKey | 'settings';
+
+export interface SyncEntityChangeCounts {
+  added: { local: number; remote: number };
+  modified: { local: number; remote: number };
+  deleted: { local: number; remote: number };
+}
+
+export interface SyncConflictDetail {
+  entityType: SyncChangeEntityKey;
+  id?: string;
+  kind:
+    | 'both-added'
+    | 'both-modified'
+    | 'local-deleted-remote-modified'
+    | 'remote-deleted-local-modified';
+}
+
+export interface SyncChangeSummary {
+  hasLocalChanges: boolean;
+  hasRemoteChanges: boolean;
+  hasConflicts: boolean;
+  byEntity: Partial<Record<SyncChangeEntityKey, SyncEntityChangeCounts>>;
+  conflicts: SyncConflictDetail[];
+}
+
+export interface SyncDeletionRecord {
+  entityType: CloudSyncPayloadEntityKey;
+  id: string;
+  deletedAt: number;
+  deviceId?: string;
+}
+
+export interface SyncReliabilityMeta {
+  schemaVersion: 1;
+  generatedAt: number;
+  deviceId?: string;
+  baseSyncedAt?: number;
+  localChanged: boolean;
+  deletions: SyncDeletionRecord[];
+  changeSummary: SyncChangeSummary;
+}
+
+export interface SyncSnapshotEntry {
+  id: string;
+  timestamp: number;
+  provider?: CloudProvider;
+  payload: SyncPayload;
+}
+
+export function hasSyncPayloadEntityData(
+  payload: SyncPayload,
+  keys: readonly SyncPayloadEntityKey[] = SYNC_PAYLOAD_ENTITY_KEYS,
+): boolean {
+  return keys.some((key) => {
+    const value = payload[key];
+    return Array.isArray(value) && value.length > 0;
+  });
 }
 
 // ============================================================================
@@ -278,8 +445,20 @@ export interface SyncResult {
   version?: number;
   error?: string;
   conflictDetected?: boolean;
-  /** Present when action === 'merge'; caller should apply this to update local state */
+  /** Present when sync produced or selected a payload that caller should apply locally */
   mergedPayload?: import('./sync').SyncPayload;
+  /** Present with a downloaded payload so callers can commit the remote anchor after local apply succeeds. */
+  remoteFile?: SyncedFile;
+  /** True when a shrink-detection guard blocked the upload */
+  shrinkBlocked?: boolean;
+  /** The finding that triggered the shrink block or force-push */
+  finding?: ShrinkFinding;
+}
+
+export interface RemoteSyncPayload {
+  provider: CloudProvider;
+  payload: SyncPayload;
+  remoteFile: SyncedFile;
 }
 
 /**
@@ -293,6 +472,7 @@ export interface ConflictInfo {
   remoteVersion: number;
   remoteUpdatedAt: number;
   remoteDeviceName?: string;
+  changeSummary?: SyncChangeSummary;
 }
 
 /**
@@ -347,10 +527,22 @@ export type SyncEvent =
   | { type: 'SYNC_COMPLETED'; provider: CloudProvider; result: SyncResult }
   | { type: 'SYNC_ERROR'; provider: CloudProvider; error: string }
   | { type: 'CONFLICT_DETECTED'; conflict: ConflictInfo }
+  | { type: 'SYNC_BLOCKED_SHRINK'; provider: CloudProvider; finding: ShrinkFinding }
+  | { type: 'SYNC_FORCED'; provider: CloudProvider; finding: ShrinkFinding }
   | { type: 'CONFLICT_RESOLVED'; resolution: ConflictResolution }
   | { type: 'AUTH_REQUIRED'; provider: CloudProvider }
   | { type: 'AUTH_COMPLETED'; provider: CloudProvider; account: ProviderAccount }
-  | { type: 'SECURITY_STATE_CHANGED'; state: SecurityState };
+  | { type: 'SECURITY_STATE_CHANGED'; state: SecurityState }
+  | { type: 'SYNC_BLOCKED_CLEARED' }
+  | {
+      type: 'PROVIDERS_DIVERGED';
+      summaries: Array<{
+        provider: CloudProvider;
+        hosts: number;
+        keys: number;
+        snippets: number;
+      }>;
+    };
 
 // ============================================================================
 // Storage Keys

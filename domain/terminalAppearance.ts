@@ -1,4 +1,6 @@
-import { Host } from './models';
+import { Host, TerminalSession, TerminalTheme } from './models';
+
+export type TerminalHostUpdate = Pick<Host, 'id'> & Partial<Host>;
 
 const hasLegacyStringValue = (value: string | undefined): boolean =>
   typeof value === 'string' && value.trim().length > 0;
@@ -38,6 +40,26 @@ export const clearHostFontSizeOverride = (host: Host): Host => ({
   fontSizeOverride: false,
 });
 
+export const mergeTerminalHostUpdate = (
+  savedHost: Host,
+  terminalHostUpdate: TerminalHostUpdate,
+): Host => {
+  const nextHost: Host = {
+    ...savedHost,
+    ...terminalHostUpdate,
+    id: savedHost.id,
+    protocol: savedHost.protocol,
+    port: savedHost.port,
+    moshEnabled: savedHost.moshEnabled,
+  };
+
+  if (!Object.prototype.hasOwnProperty.call(savedHost, 'protocol')) delete nextHost.protocol;
+  if (!Object.prototype.hasOwnProperty.call(savedHost, 'port')) delete nextHost.port;
+  if (!Object.prototype.hasOwnProperty.call(savedHost, 'moshEnabled')) delete nextHost.moshEnabled;
+
+  return nextHost;
+};
+
 export const resolveHostTerminalThemeId = (host: Host | null | undefined, defaultThemeId: string): string =>
   hasHostThemeOverride(host) && host?.theme ? host.theme : defaultThemeId;
 
@@ -69,11 +91,160 @@ const UI_TO_TERMINAL_THEME: Record<string, string> = {
 export const getTerminalThemeForUiTheme = (uiThemeId: string): string | undefined =>
   UI_TO_TERMINAL_THEME[uiThemeId];
 
+/**
+ * Sentinel stored in the per-mode follow-theme settings meaning "let the
+ * terminal theme follow the active UI theme preset" (the legacy
+ * auto-matching behavior), as opposed to a concrete terminal theme id.
+ */
+export const TERMINAL_THEME_AUTO = 'auto';
+
+/**
+ * Resolve which terminal theme id to use while "Follow Application Theme" is
+ * enabled, honoring the user's per-mode override.
+ *
+ * - A concrete theme id in the active mode's setting is used as-is.
+ * - `TERMINAL_THEME_AUTO` (the default) keeps the legacy behavior: match the
+ *   active UI theme preset, then `fallbackThemeId` when no UI match exists.
+ */
+export const resolveFollowedTerminalThemeId = (args: {
+  resolvedTheme: 'light' | 'dark';
+  terminalThemeDarkId: string;
+  terminalThemeLightId: string;
+  lightUiThemeId: string;
+  darkUiThemeId: string;
+  fallbackThemeId: string;
+}): string => {
+  const selected = args.resolvedTheme === 'dark'
+    ? args.terminalThemeDarkId
+    : args.terminalThemeLightId;
+  if (selected && selected !== TERMINAL_THEME_AUTO) return selected;
+  const activeUiThemeId = args.resolvedTheme === 'dark'
+    ? args.darkUiThemeId
+    : args.lightUiThemeId;
+  return getTerminalThemeForUiTheme(activeUiThemeId) ?? args.fallbackThemeId;
+};
+
+export const getFollowAppTerminalThemeSelectionUpdate = (
+  theme: Pick<TerminalTheme, 'id' | 'type'>,
+): {
+  appTheme: TerminalTheme['type'];
+  terminalThemeDarkId?: string;
+  terminalThemeLightId?: string;
+} => theme.type === 'dark'
+  ? { appTheme: 'dark', terminalThemeDarkId: theme.id }
+  : { appTheme: 'light', terminalThemeLightId: theme.id };
+
+type ParsedHslToken = {
+  hue: number;
+  saturation: number;
+  lightness: number;
+};
+
+const parseHslToken = (value: string): ParsedHslToken | null => {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)%\s+(\d+(?:\.\d+)?)%$/);
+  if (!match) return null;
+
+  const hue = Number(match[1]);
+  const saturation = Number(match[2]);
+  const lightness = Number(match[3]);
+  if (!Number.isFinite(hue) || !Number.isFinite(saturation) || !Number.isFinite(lightness)) return null;
+  if (saturation < 0 || saturation > 100 || lightness < 0 || lightness > 100) return null;
+
+  return {
+    hue: ((hue % 360) + 360) % 360,
+    saturation,
+    lightness,
+  };
+};
+
+const toHexChannel = (value: number): string =>
+  Math.round(Math.max(0, Math.min(255, value)))
+    .toString(16)
+    .padStart(2, '0');
+
+const hslToHex = ({ hue, saturation, lightness }: ParsedHslToken): string => {
+  const s = saturation / 100;
+  const l = lightness / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = hue / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+
+  if (hp < 1) {
+    r = c;
+    g = x;
+  } else if (hp < 2) {
+    r = x;
+    g = c;
+  } else if (hp < 3) {
+    g = c;
+    b = x;
+  } else if (hp < 4) {
+    g = x;
+    b = c;
+  } else if (hp < 5) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+
+  const m = l - c / 2;
+  return `#${toHexChannel((r + m) * 255)}${toHexChannel((g + m) * 255)}${toHexChannel((b + m) * 255)}`;
+};
+
+const terminalSelectionFromAccent = (accent: ParsedHslToken, type: TerminalTheme['type']): ParsedHslToken => ({
+  ...accent,
+  lightness: type === 'dark'
+    ? Math.max(18, Math.min(32, accent.lightness * 0.55))
+    : Math.max(72, Math.min(88, accent.lightness + 42)),
+});
+
+export const applyCustomAccentToTerminalTheme = (
+  theme: TerminalTheme,
+  accentMode: 'theme' | 'custom',
+  customAccent: string,
+): TerminalTheme => {
+  if (accentMode !== 'custom') return theme;
+
+  const accent = parseHslToken(customAccent);
+  if (!accent) return theme;
+
+  return {
+    ...theme,
+    colors: {
+      ...theme.colors,
+      cursor: hslToHex(accent),
+      selection: hslToHex(terminalSelectionFromAccent(accent, theme.type)),
+    },
+  };
+};
+
 export const resolveHostTerminalFontFamilyId = (host: Host | null | undefined, defaultFontFamilyId: string): string =>
   hasHostFontFamilyOverride(host) && host?.fontFamily ? host.fontFamily : defaultFontFamilyId;
 
 export const resolveHostTerminalFontSize = (host: Host | null | undefined, defaultFontSize: number): number =>
   hasHostFontSizeOverride(host) && host?.fontSize != null ? host.fontSize : defaultFontSize;
+
+export const hasSessionFontSizeOverride = (
+  session?: Pick<TerminalSession, 'fontSizeOverride' | 'fontSize'> | null,
+): boolean => hasHostFontSizeOverride(session);
+
+export const applySessionFontSizeToHost = (host: Host, session?: TerminalSession): Host => {
+  if (!session || !hasSessionFontSizeOverride(session) || session.fontSize == null) {
+    return host;
+  }
+  return { ...host, fontSize: session.fontSize, fontSizeOverride: true };
+};
+
+export const clearSessionFontSizeOverride = (session: TerminalSession): TerminalSession => ({
+  ...session,
+  fontSize: undefined,
+  fontSizeOverride: false,
+});
 
 export const hasHostFontWeightOverride = (host?: Pick<Host, 'fontWeightOverride' | 'fontWeight'> | null): boolean =>
   hasEffectiveOverride(host?.fontWeightOverride, hasLegacyNumberValue(host?.fontWeight));
@@ -86,4 +257,3 @@ export const clearHostFontWeightOverride = (host: Host): Host => ({
 
 export const resolveHostTerminalFontWeight = (host: Host | null | undefined, defaultFontWeight: number): number =>
   hasHostFontWeightOverride(host) && host?.fontWeight != null ? host.fontWeight : defaultFontWeight;
-
