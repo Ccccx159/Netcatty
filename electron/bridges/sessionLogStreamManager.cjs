@@ -27,7 +27,8 @@ const SUDO_AUTOFILL_REWRITE_PATTERN =
 function formatLogTimestamp(timestamp = Date.now()) {
   const date = new Date(timestamp);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const padMs = (n) => String(n).padStart(3, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${padMs(date.getMilliseconds())}`;
 }
 
 function createRenderedLineTimestampPrefixer(opts = {}) {

@@ -382,9 +382,9 @@ test("txt stream timestamps complete lines without duplicating split chunks", as
   const directory = path.join(TEMP_ROOT, `stream-timestamps-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const times = [
-    new Date(2026, 0, 2, 3, 4, 5).getTime(),
-    new Date(2026, 0, 2, 3, 4, 6).getTime(),
-    new Date(2026, 0, 2, 3, 4, 7).getTime(),
+    new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
+    new Date(2026, 0, 2, 3, 4, 6, 45).getTime(),
+    new Date(2026, 0, 2, 3, 4, 7, 8).getTime(),
   ];
 
   try {
@@ -404,7 +404,7 @@ test("txt stream timestamps complete lines without duplicating split chunks", as
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:05] first line\n[2026-01-02 03:04:06] second line\n[2026-01-02 03:04:07] partial",
+      "[2026-01-02 03:04:05.123] first line\n[2026-01-02 03:04:06.045] second line\n[2026-01-02 03:04:07.008] partial",
     );
   } finally {
     await stopStream(sessionId);
@@ -424,7 +424,7 @@ test("txt stream timestamps rendered lines after carriage-return rewrites", asyn
       format: "txt",
       startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
       timestampsEnabled: true,
-      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
     });
     appendData(sessionId, "old prompt\rdocker denied\n");
 
@@ -432,7 +432,7 @@ test("txt stream timestamps rendered lines after carriage-return rewrites", asyn
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:05] docker denied",
+      "[2026-01-02 03:04:05.123] docker denied",
     );
   } finally {
     await stopStream(sessionId);
@@ -444,8 +444,8 @@ test("txt stream updates a line timestamp when a later snapshot rewrites that li
   const directory = path.join(TEMP_ROOT, `stream-timestamps-live-cr-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const times = [
-    new Date(2026, 0, 2, 3, 4, 5).getTime(),
-    new Date(2026, 0, 2, 3, 4, 6).getTime(),
+    new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
+    new Date(2026, 0, 2, 3, 4, 6, 45).getTime(),
   ];
 
   try {
@@ -459,14 +459,14 @@ test("txt stream updates a line timestamp when a later snapshot rewrites that li
       timestampProvider: () => times.shift(),
     });
     appendData(sessionId, "old prompt");
-    await waitForFileContent(directory, "[2026-01-02 03:04:05] old prompt");
+    await waitForFileContent(directory, "[2026-01-02 03:04:05.123] old prompt");
     appendData(sessionId, "\rdocker denied");
 
     const filePath = await stopStream(sessionId);
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:06] docker denied",
+      "[2026-01-02 03:04:06.045] docker denied",
     );
   } finally {
     await stopStream(sessionId);
@@ -486,14 +486,14 @@ test("html stream includes line timestamps in rendered content", async () => {
       format: "html",
       startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
       timestampsEnabled: true,
-      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
     });
     appendData(sessionId, "line\n");
 
     const filePath = await stopStream(sessionId);
     const html = fs.readFileSync(filePath, "utf8");
 
-    assert.match(html, /\[2026-01-02 03:04:05\] line/);
+    assert.match(html, /\[2026-01-02 03:04:05\.123\] line/);
   } finally {
     await stopStream(sessionId);
     fs.rmSync(directory, { recursive: true, force: true });
@@ -512,14 +512,14 @@ test("html stream timestamps rendered lines after carriage-return rewrites", asy
       format: "html",
       startTime: Date.UTC(2026, 0, 2, 3, 4, 5),
       timestampsEnabled: true,
-      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5).getTime(),
+      timestampProvider: () => new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
     });
     appendData(sessionId, "old prompt\rdocker denied\n");
 
     const filePath = await stopStream(sessionId);
     const html = fs.readFileSync(filePath, "utf8");
 
-    assert.match(html, /\[2026-01-02 03:04:05\] docker denied/);
+    assert.match(html, /\[2026-01-02 03:04:05\.123\] docker denied/);
     assert.doesNotMatch(html, /old prompt/);
   } finally {
     await stopStream(sessionId);
