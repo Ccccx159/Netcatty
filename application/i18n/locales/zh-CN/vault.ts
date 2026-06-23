@@ -329,7 +329,7 @@ export const zhCNVaultMessages: Messages = {
   'terminal.composeBar.noMatchingSnippets': '没有匹配的代码片段',
   'terminal.composeBar.pinnedCount': '已固定 {count} 个',
   'terminal.composeBar.unpinSnippet': '从快捷栏移除 {label}',
-  'terminal.composeBar.snippetClickHint': '单击插入 · Shift+单击直接发送',
+  'terminal.composeBar.snippetClickHint': '单击直接发送 · Shift+单击插入',
   'terminal.toolbar.focus': '聚焦',
   'terminal.toolbar.focusMode': '聚焦模式',
   'terminal.toolbar.detach': '移出到独立标签',

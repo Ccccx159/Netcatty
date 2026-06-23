@@ -82,7 +82,6 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
     findSplitNode,
     focusedSessionId,
     handleComposeSend,
-    handleSnippetFromPanel,
     refocusTerminalSession,
     setIsComposeBarOpen,
     setResizing,
@@ -259,7 +258,6 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
       {activeWorkspace && isComposeBarOpen && (
         <TerminalComposeBar
           onSend={handleComposeSend}
-          onSnippetClick={(snippet) => void handleSnippetFromPanel(snippet)}
           snippets={snippets}
           onClose={() => {
             setIsComposeBarOpen(false);

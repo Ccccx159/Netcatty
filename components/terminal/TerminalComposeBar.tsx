@@ -84,7 +84,7 @@ const ComposeBarSnippetChip = memo(function ComposeBarSnippetChip({
           <button
             type="button"
             className="flex-1 min-w-0 px-2 text-[10px] font-mono truncate text-left"
-            onClick={(e) => { void onActivate(snippet, e.shiftKey); }}
+            onClick={(e) => { void onActivate(snippet, !e.shiftKey); }}
           >
             {snippet.label}
           </button>
@@ -269,7 +269,6 @@ const ComposeBarSnippetManagePopover = memo(function ComposeBarSnippetManagePopo
 export interface TerminalComposeBarProps {
   onSend: (text: string) => void;
   onClose: () => void;
-  onSnippetClick?: (snippet: Snippet) => void;
   snippets?: Snippet[];
   isBroadcastEnabled?: boolean;
   themeColors?: {
@@ -281,7 +280,6 @@ export interface TerminalComposeBarProps {
 export const TerminalComposeBar: React.FC<TerminalComposeBarProps> = ({
   onSend,
   onClose,
-  onSnippetClick,
   snippets = [],
   isBroadcastEnabled,
   themeColors,
@@ -352,20 +350,14 @@ export const TerminalComposeBar: React.FC<TerminalComposeBarProps> = ({
   }, []);
 
   const handleSnippetActivate = useCallback(async (snippet: Snippet, sendImmediately: boolean) => {
-    if (sendImmediately) {
-      if (onSnippetClick) {
-        onSnippetClick(snippet);
-      } else {
-        const command = await resolveSnippetCommand(snippet);
-        if (command !== null) onSend(command);
-      }
-      return;
-    }
-
     const command = await resolveSnippetCommand(snippet);
     if (command === null) return;
+    if (sendImmediately) {
+      onSend(command);
+      return;
+    }
     insertCommand(command);
-  }, [insertCommand, onSend, onSnippetClick]);
+  }, [insertCommand, onSend]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !isComposingRef.current) {

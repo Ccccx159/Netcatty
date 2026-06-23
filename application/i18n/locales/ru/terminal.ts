@@ -70,7 +70,7 @@ export const ruTerminalMessages: Messages = {
   'terminal.composeBar.noMatchingSnippets': 'Сниппеты не найдены',
   'terminal.composeBar.pinnedCount': 'Закреплено: {count}',
   'terminal.composeBar.unpinSnippet': 'Убрать {label} из панели',
-  'terminal.composeBar.snippetClickHint': 'Клик — вставить · Shift+клик — отправить',
+  'terminal.composeBar.snippetClickHint': 'Клик — отправить · Shift+клик — вставить',
   'terminal.toolbar.focus': 'Фокус',
   'terminal.toolbar.focusMode': 'Режим фокуса',
   'terminal.toolbar.detach': 'Открепить в отдельную вкладку',

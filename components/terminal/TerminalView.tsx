@@ -620,7 +620,6 @@ function TerminalViewInner({ ctx }: { ctx: TerminalViewContext }) {
                 executeSnippetCommand(text, false);
               }
             }}
-            onSnippetClick={(snippet) => void executeSnippet(snippet)}
             snippets={snippets}
             onClose={() => {
               setIsComposeBarOpen(false);

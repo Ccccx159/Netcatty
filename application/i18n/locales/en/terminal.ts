@@ -49,7 +49,7 @@ export const enTerminalMessages: Messages = {
   'terminal.composeBar.noMatchingSnippets': 'No matching snippets',
   'terminal.composeBar.pinnedCount': '{count} pinned',
   'terminal.composeBar.unpinSnippet': 'Remove {label} from quick bar',
-  'terminal.composeBar.snippetClickHint': 'Click to insert · Shift+Click to send',
+  'terminal.composeBar.snippetClickHint': 'Click to send · Shift+Click to insert',
   'terminal.toolbar.focus': 'Focus',
   'terminal.toolbar.focusMode': 'Focus Mode',
   'terminal.toolbar.detach': 'Detach to standalone tab',
